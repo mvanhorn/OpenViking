@@ -28,8 +28,26 @@ fields:
   - name: category
     type: string
     description: |
-      Category written in {{ language }}.
-      {% if language == 'en' %}Use lowercase with underscores, max 3 words.{% else %}Keep it concise and natural in {{ language }}.{% endif %}
+      Stable directory identifier. Do not follow the session language.
+
+      Before inventing a category, inspect existing category directories in the
+      destination self or peer entities scope. Use categories visible in the
+      pre-fetched context or through the available listing and search tools.
+      If a suitable category already exists, reuse that identifier exactly,
+      even when it is non-ASCII or differs from the session language.
+      An English conversation reuses an existing Chinese identifier.
+      A Chinese conversation reuses an existing English identifier.
+      Do not translate it and do not substitute a synonym for the same topic.
+
+      When updating an existing entity, preserve its existing category.
+      Do not replace it with a translation, a synonym, or a third variant.
+      Existing translated duplicates are not consolidated by choosing a new name.
+      Category reuse stays within that destination self or peer scope
+      and does not merge distinct entities that share the category.
+
+      If no suitable existing category exists, use one concise English lowercase
+      identifier with underscores and at most three words. An existing identifier
+      takes precedence over this fallback.
     merge_op: replace
 
   - name: name
