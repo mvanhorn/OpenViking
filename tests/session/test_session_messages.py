@@ -3,8 +3,11 @@
 
 """Message management tests"""
 
+import pytest
+
 from openviking.message import ContextPart, TextPart, ToolPart
 from openviking.session import Session
+from openviking_cli.exceptions import InvalidArgumentError
 
 
 class TestAddMessage:
@@ -53,14 +56,34 @@ class TestAddMessage:
         tool_part = ToolPart(
             tool_id="tool_123",
             tool_name="search_tool",
-            tool_uri="viking://session/test/tools/tool_123",
-            skill_uri="viking://agent/skills/search",
+            tool_uri=f"{session.uri}/tools/tool_123",
+            skill_uri="viking://user/skills/search",
             tool_input={"query": "test"},
             tool_status="running",
         )
         msg = session.add_message("assistant", [TextPart("Executing search..."), tool_part])
 
         assert len(msg.parts) == 2
+
+    async def test_add_message_with_peer_id(self, session: Session):
+        """Test peer_id is persisted on session messages."""
+        msg = session.add_message(
+            "user",
+            [TextPart("Message from Alice")],
+            peer_id="web-visitor-alice",
+        )
+
+        assert msg.peer_id == "web-visitor-alice"
+        assert msg.to_dict()["peer_id"] == "web-visitor-alice"
+
+    async def test_add_message_rejects_peer_id_with_path_separator(self, session: Session):
+        """Test direct session usage validates peer_id path safety."""
+        with pytest.raises(InvalidArgumentError):
+            session.add_message(
+                "user",
+                [TextPart("Message from Alice")],
+                peer_id="web/visitor/alice",
+            )
 
     async def test_messages_list_updated(self, session: Session):
         """Test message list update"""
@@ -71,37 +94,66 @@ class TestAddMessage:
 
         assert len(session.messages) == initial_count + 2
 
-
-class TestUpdateToolPart:
-    """Test update_tool_part"""
-
-    async def test_update_tool_completed(self, session_with_tool_call):
-        """Test updating tool status to completed"""
-        session, message_id, tool_id = session_with_tool_call
-
-        session.update_tool_part(
-            message_id=message_id,
-            tool_id=tool_id,
-            output="Tool execution completed successfully",
-            status="completed",
+    async def test_batch_add_messages_preserves_peer_id_created_at_and_parts(self, client):
+        session = client(session_id="batch_message_preservation_test")
+        await session.ensure_exists()
+        await session.add_messages_async(
+            [
+                {
+                    "role": "user",
+                    "peer_id": "user-123",
+                    "created_at": "2026-05-01T12:00:00Z",
+                    "parts": [
+                        TextPart("Hello batch"),
+                        ContextPart(
+                            uri="viking://resources/test-doc",
+                            context_type="resource",
+                            abstract="Test document",
+                        ),
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "peer_id": "assistant-123",
+                    "created_at": "2026-05-01T12:00:05Z",
+                    "parts": [
+                        TextPart("Executing tool"),
+                        ToolPart(
+                            tool_id="tool_123",
+                            tool_name="search_tool",
+                            tool_uri=f"{session.uri}/tools/tool_123",
+                            skill_uri="viking://user/skills/search",
+                            tool_status="completed",
+                            tool_output="Found a result",
+                        ),
+                    ],
+                },
+            ]
         )
 
-        # Verify tool status updated
-        # Need to find the corresponding message and tool part
-        msg = next((m for m in session.messages if m.id == message_id), None)
-        assert msg is not None
+        fresh = client(session_id=session.session_id)
+        await fresh.load()
+        context = await fresh.get_session_context()
+        assert [message["role"] for message in context["messages"]] == ["user", "assistant"]
+        assert context["messages"][0]["peer_id"] == "user-123"
+        assert context["messages"][0]["created_at"] == "2026-05-01T12:00:00Z"
+        assert context["messages"][0]["parts"][1]["uri"] == "viking://resources/test-doc"
+        assert context["messages"][1]["peer_id"] == "assistant-123"
+        assert context["messages"][1]["parts"][1]["tool_status"] == "completed"
+        assert context["messages"][1]["parts"][1]["tool_output"] == "Found a result"
 
-    async def test_update_tool_failed(self, session_with_tool_call):
-        """Test updating tool status to failed"""
-        session, message_id, tool_id = session_with_tool_call
+    async def test_batch_add_messages_is_atomic_when_later_message_is_invalid(self, client):
+        session = client(session_id="batch_message_atomicity_test")
+        await session.ensure_exists()
 
-        session.update_tool_part(
-            message_id=message_id,
-            tool_id=tool_id,
-            output="Tool execution failed: error message",
-            status="failed",
-        )
+        with pytest.raises(ValueError, match="missing required key 'parts'"):
+            await session.add_messages_async(
+                [
+                    {"role": "user", "parts": [TextPart("first valid message")]},
+                    {"role": "assistant"},
+                ]
+            )
 
-        # Verify tool status updated
-        msg = next((m for m in session.messages if m.id == message_id), None)
-        assert msg is not None
+        fresh = client(session_id=session.session_id)
+        await fresh.load()
+        assert fresh.messages == []

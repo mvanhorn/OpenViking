@@ -1,83 +1,237 @@
-import asyncio
-import hashlib
-import time
-from typing import Any, Dict, List, Optional
+import base64
+import json
+import re
+import uuid
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional
 
 from loguru import logger
 
 import openviking as ov
+from openviking.core.namespace import uri_parts
+from openviking.core.peer_id import normalize_peer_id
+from openviking_cli.exceptions import InvalidArgumentError
 from vikingbot.config.loader import load_config
-from vikingbot.openviking_mount.user_apikey_manager import UserApiKeyManager
+
+if TYPE_CHECKING:
+    from vikingbot.config.schema import Config
 
 viking_resource_prefix = "viking://resources/"
 
 
+def _is_session_key(agent_id: Optional[str]) -> bool:
+    return agent_id is not None and "__" in agent_id
+
+
+def _peer_id_from_external_id(peer_id: Optional[str]) -> Optional[str]:
+    if not peer_id:
+        return None
+    raw_peer_id = str(peer_id).strip()
+    if not raw_peer_id:
+        return None
+    if "/" in raw_peer_id or "\\" in raw_peer_id:
+        return None
+    try:
+        return normalize_peer_id(raw_peer_id)
+    except ValueError:
+        pass
+
+    encoded = base64.urlsafe_b64encode(raw_peer_id.encode("utf-8")).decode("ascii").rstrip("=")
+    return normalize_peer_id(f"ext-{encoded}")
+
+
 class VikingClient:
-    def __init__(self, agent_id: Optional[str] = None):
-        config = load_config()
+    _skill_snapshot: Optional[Mapping[str, Any]] = None
+
+    def __init__(
+        self,
+        workspace_id: Optional[str] = None,
+        *,
+        agent_id: Optional[str] = None,
+        connection: Optional[Mapping[str, Any]] = None,
+        actor_peer_id: Optional[str] = None,
+        config: "Config | None" = None,
+    ):
+        if agent_id is None:
+            agent_id = workspace_id
+        if agent_id and "#" in agent_id:
+            agent_id = agent_id.split("#", 1)[0]
+
+        config = config or load_config()
+        self.config = config
         openviking_config = config.ov_server
         self.openviking_config = openviking_config
+        if not str(getattr(openviking_config, "server_url", "") or "").strip():
+            raise RuntimeError("OpenViking is unavailable in VikingBot standalone mode")
+        self.workspace_id = agent_id
+        self.agent_id = agent_id
         self.ov_path = config.ov_data_path
-        if openviking_config.mode == "local":
-            self.client = ov.AsyncHTTPClient(url=openviking_config.server_url)
-            self.agent_id = "default"
+        self.auth_mode = self._resolve_auth_mode(openviking_config)
+        self.mode = "local" if self.auth_mode == "dev" else "remote"
+        self.api_key_type = self._resolve_api_key_type(openviking_config)
+
+        self._skill_snapshot = (connection or {}).get("skill_snapshot")
+        snapshot_id = (self._skill_snapshot or {}).get("snapshot_id")
+        if snapshot_id and not re.fullmatch(r"[0-9a-fA-F]{40}", snapshot_id):
+            raise ValueError("Skill snapshot_id must be a commit ID")
+        self._request_connection = self._normalize_connection(connection)
+        self._request_role: str | None = None
+
+        self.admin_user_client = None
+        self._user_clients = {}
+        connection_actor_peer_id = (
+            self._request_connection.get("actor_peer_id") if self._request_connection else None
+        )
+        self.actor_peer_id = self._peer_id(actor_peer_id) or self._peer_id(connection_actor_peer_id)
+
+        if self._is_dev_mode():
+            client_kwargs = {"url": openviking_config.server_url}
+            self._apply_actor_peer_scope(client_kwargs)
+            if agent_id is None or _is_session_key(agent_id):
+                self.client = ov.AsyncHTTPClient(**client_kwargs)
+                self.agent_id = "default"
+            else:
+                self.client = ov.AsyncHTTPClient(**client_kwargs)
             self.account_id = "default"
             self.user_id = "default"
             self.admin_user_id = "default"
-            self._apikey_manager = None
-        else:
-            if agent_id and "#" in agent_id:
-                agent_id = agent_id.split("#", 1)[0]
-            self.client = ov.AsyncHTTPClient(
-                url=openviking_config.server_url,
-                api_key=openviking_config.root_api_key,
-                account=openviking_config.account_id,
-                user=openviking_config.admin_user_id,
-                agent_id=agent_id,
-            )
-            self.agent_id = agent_id
-            self.account_id = openviking_config.account_id
-            self.admin_user_id = openviking_config.admin_user_id
-            self._apikey_manager = None
-            if self.ov_path:
-                self._apikey_manager = UserApiKeyManager(
-                    ov_path=self.ov_path,
-                    server_url=openviking_config.server_url,
-                    account_id=openviking_config.account_id,
-                )
-        self.mode = openviking_config.mode
+            return
+
+        if self._request_connection:
+            self._configure_request_connection(agent_id)
+            return
+
+        self.account_id = openviking_config.account_id
+        self.admin_user_id = openviking_config.admin_user_id
+
+        api_key = openviking_config.api_key
+        remote_client_kwargs = {
+            "url": openviking_config.server_url,
+            "api_key": api_key,
+            "profile_enabled": False,
+        }
+        if self._is_root_key_mode():
+            remote_client_kwargs["account"] = openviking_config.account_id
+            remote_client_kwargs["user"] = openviking_config.admin_user_id
+
+        self._apply_actor_peer_scope(remote_client_kwargs)
+        self.client = ov.AsyncHTTPClient(**remote_client_kwargs)
+
+    @staticmethod
+    def _normalize_auth_value(value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    def _resolve_auth_mode(self, openviking_config: Any) -> str:
+        effective_auth_mode = self._normalize_auth_value(
+            getattr(openviking_config, "effective_auth_mode", None)
+        )
+        if effective_auth_mode in {"trusted", "api_key", "dev"}:
+            return effective_auth_mode
+
+        api_key_type = self._normalize_auth_value(getattr(openviking_config, "api_key_type", None))
+        if api_key_type == "root":
+            return "trusted"
+        return "api_key"
+
+    def _resolve_api_key_type(self, openviking_config: Any) -> str:
+        api_key_type = self._normalize_auth_value(getattr(openviking_config, "api_key_type", None))
+        if self.auth_mode == "trusted":
+            api_key_type = "root"
+        elif self.auth_mode in {"api_key", "dev"}:
+            api_key_type = "user"
+        if api_key_type not in {"root", "user"}:
+            raise ValueError(f"Invalid ov_server.api_key_type: {api_key_type}")
+        return api_key_type
+
+    @staticmethod
+    def _normalize_connection(
+        connection: Optional[Mapping[str, Any]],
+    ) -> dict[str, Any] | None:
+        if not isinstance(connection, Mapping):
+            return None
+        normalized: dict[str, Any] = {}
+        for key in (
+            "api_key",
+            "account_id",
+            "user_id",
+            "agent_id",
+            "role",
+            "api_key_type",
+            "server_url",
+            "actor_peer_id",
+        ):
+            value = connection.get(key)
+            if isinstance(value, str) and value.strip():
+                normalized[key] = value.strip()
+        if not normalized.get("api_key"):
+            return None
+        return normalized
+
+    def _configure_request_connection(self, agent_id: Optional[str]) -> None:
+        connection = self._request_connection or {}
+        self.mode = "remote"
+        request_role = str(connection.get("role") or "").strip().lower()
+        self._request_role = request_role or None
+        self.api_key_type = self._normalize_auth_value(connection.get("api_key_type")) or "user"
+        self.auth_mode = "trusted" if self.api_key_type == "root" else "api_key"
+        self.agent_id = connection.get("agent_id") or agent_id
+        self.workspace_id = self.agent_id
+        self.account_id = connection.get("account_id")
+        self.admin_user_id = connection.get("user_id")
+
+        remote_client_kwargs = {
+            "url": self.openviking_config.server_url,
+            "profile_enabled": False,
+        }
+        if connection.get("api_key"):
+            remote_client_kwargs["api_key"] = connection["api_key"]
+        if self.account_id:
+            remote_client_kwargs["account"] = self.account_id
+        if self.admin_user_id:
+            remote_client_kwargs["user"] = self.admin_user_id
+
+        self._apply_actor_peer_scope(remote_client_kwargs)
+        self.client = ov.AsyncHTTPClient(**remote_client_kwargs)
 
     async def _initialize(self):
         """Initialize the client (must be called after construction)"""
         await self.client.initialize()
 
-        # 检查并初始化 admin_user_id（如果配置了）
-        if self.mode == "remote" and self.admin_user_id:
-            user_exists = await self._check_user_exists(self.admin_user_id)
-            if not user_exists:
-                await self._initialize_user(self.admin_user_id, role="admin")
-            admin_user_api_key = await self._get_or_create_user_apikey(self.admin_user_id)
-            if admin_user_api_key:
-                self.admin_user_client = ov.AsyncHTTPClient(
-                    url=self.openviking_config.server_url,
-                    api_key=admin_user_api_key,
-                    agent_id=self.agent_id,
-                )
-                await self.admin_user_client.initialize()
-
     @classmethod
-    async def create(cls, agent_id: Optional[str] = None):
-        """Factory method to create and initialize a VikingClient instance.
-
-        Args:
-            agent_id: The agent ID to use
-        """
-        instance = cls(agent_id)
+    async def create(
+        cls,
+        workspace_id: Optional[str] = None,
+        *,
+        agent_id: Optional[str] = None,
+        connection: Optional[Mapping[str, Any]] = None,
+        actor_peer_id: Optional[str] = None,
+        config: "Config | None" = None,
+    ):
+        """Factory method to create and initialize a VikingClient instance."""
+        instance = cls(
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            connection=connection,
+            actor_peer_id=actor_peer_id,
+            config=config,
+        )
         await instance._initialize()
         return instance
 
     def _matched_context_to_dict(self, matched_context: Any) -> Dict[str, Any]:
-        """将 MatchedContext 对象转换为字典"""
+        """将 MatchedContext 对象或 dict 结果转换为字典。"""
+        if isinstance(matched_context, dict):
+            return {
+                "uri": str(matched_context.get("uri", "") or ""),
+                "context_type": str(
+                    matched_context.get("context_type") or matched_context.get("type") or ""
+                ),
+                "is_leaf": bool(matched_context.get("is_leaf", False)),
+                "abstract": str(matched_context.get("abstract", "") or ""),
+                "overview": matched_context.get("overview"),
+                "category": str(matched_context.get("category", "") or ""),
+                "score": matched_context.get("score", 0.0),
+                "match_reason": str(matched_context.get("match_reason", "") or ""),
+            }
         return {
             "uri": getattr(matched_context, "uri", ""),
             "context_type": str(getattr(matched_context, "context_type", "")),
@@ -87,57 +241,554 @@ class VikingClient:
             "category": getattr(matched_context, "category", ""),
             "score": getattr(matched_context, "score", 0.0),
             "match_reason": getattr(matched_context, "match_reason", ""),
-            "relations": [
-                self._relation_to_dict(r) for r in getattr(matched_context, "relations", [])
-            ],
         }
 
-    def _relation_to_dict(self, relation: Any) -> Dict[str, Any]:
-        """将 Relation 对象转换为字典"""
+    def _matched_context_group_to_dicts(self, result: Any, group_name: str) -> List[Dict[str, Any]]:
+        if isinstance(result, dict):
+            group = result.get(group_name, [])
+        else:
+            group = getattr(result, group_name, [])
+
+        if not isinstance(group, list):
+            return []
+
+        items: List[Dict[str, Any]] = []
+        for item in group:
+            if isinstance(item, dict):
+                items.append(dict(item))
+            else:
+                items.append(self._matched_context_to_dict(item))
+        # Search snippets cannot supply live rules from the task's pinned Skill.
+        return [item for item in items if not self._skill_snapshot_ref(item.get("uri", ""))]
+
+    def _matched_context_total(
+        self,
+        result: Any,
+        memories: List[Dict[str, Any]],
+        resources: List[Dict[str, Any]],
+        skills: List[Dict[str, Any]],
+    ) -> int:
+        if isinstance(result, dict):
+            total = result.get("total")
+        else:
+            total = getattr(result, "total", None)
+        if isinstance(total, int) and not self._skill_snapshot:
+            return total
+        return len(memories) + len(resources) + len(skills)
+
+    def _is_root_key_mode(self) -> bool:
+        return (
+            self.auth_mode == "trusted"
+            and self.api_key_type == "root"
+            and not self._has_request_connection()
+        )
+
+    def _is_user_key_mode(self) -> bool:
+        return (
+            self.auth_mode == "api_key"
+            and self.api_key_type == "user"
+            and not self._has_request_connection()
+        )
+
+    def _is_dev_mode(self) -> bool:
+        return self.auth_mode == "dev" and not self._has_request_connection()
+
+    def _has_request_connection(self) -> bool:
+        return self._request_connection is not None
+
+    def should_sender_fanout(self) -> bool:
+        return self._is_root_key_mode()
+
+    def _effective_user_id(self, user_id: Optional[str]) -> str:
+        if self._has_request_connection():
+            return ""
+        if self._is_user_key_mode():
+            return ""
+        return user_id or self.admin_user_id
+
+    def _effective_session_user_id(self, user_id: Optional[str] = None) -> Optional[str]:
+        if self._has_request_connection() or self._is_dev_mode() or self._is_user_key_mode():
+            return None
+        return user_id or self.admin_user_id
+
+    def session_owner_user_id(self) -> Optional[str]:
+        """Return the explicit OpenViking user for session operations, when needed."""
+        return self._effective_session_user_id()
+
+    @staticmethod
+    def default_memory_policy() -> Dict[str, Dict[str, bool]]:
+        """Write extracted conversation memories to peers by default for bot sessions."""
         return {
-            "from_uri": getattr(relation, "from_uri", ""),
-            "to_uri": getattr(relation, "to_uri", ""),
-            "relation_type": getattr(relation, "relation_type", ""),
-            "reason": getattr(relation, "reason", ""),
+            "self": {"enabled": False},
+            "peer": {"enabled": True},
         }
 
-    def get_agent_space_name(self, user_id: str) -> str:
-        return hashlib.md5(f"{user_id}:{self.agent_id}".encode()).hexdigest()[:12]
+    @staticmethod
+    def _peer_id(value: Optional[str]) -> Optional[str]:
+        return _peer_id_from_external_id(str(value)) if value is not None else None
 
-    async def find(self, query: str, target_uri: Optional[str] = None):
+    def _apply_actor_peer_scope(self, client_kwargs: Dict[str, Any]) -> None:
+        if self.actor_peer_id:
+            client_kwargs["actor_peer_id"] = self.actor_peer_id
+
+    def _user_space_fragment(self, user_id: Optional[str]) -> str:
+        effective_user_id = self._effective_user_id(user_id)
+        if not effective_user_id:
+            return ""
+        return effective_user_id
+
+    def _memory_target_uri(self, user_id: Optional[str]) -> str:
+        user_space = self._user_space_fragment(user_id)
+        if user_space:
+            return f"viking://user/{user_space}/memories/"
+        return "viking://~/memories/"
+
+    def _owner_user_id_for_uri(self, uri: Optional[str]) -> Optional[str]:
+        if not self._is_root_key_mode():
+            return None
+        try:
+            parts = uri_parts(str(uri or ""))
+        except Exception:
+            return None
+        if len(parts) < 2 or parts[0] != "user":
+            return None
+        # Mirrors the server's reserved user-space segment set. We keep the duplicated
+        # allowlist so legacy ``viking://user/<reserved>/...`` URIs (still present in stored
+        # bot configs and occasionally produced by LLM output) are not misrouted to a user
+        # named e.g. "memories" while running in root-key mode. Home-alias URIs
+        # (``viking://~/...``) never reach this branch and return None naturally.
+        if parts[1] in {"memories", "resources", "skills", "peers", "privacy", "sessions"}:
+            return None
+        owner_user_id = parts[1]
+        if owner_user_id == self.admin_user_id:
+            return None
+        return owner_user_id
+
+    def _peer_memory_target_uri(self, user_id: Optional[str], peer_id: str) -> str:
+        user_space = self._user_space_fragment(user_id)
+        normalized_peer_id = self._peer_id(peer_id)
+        if not normalized_peer_id:
+            raise ValueError("peer_id is required for peer memory target")
+        if not user_space:
+            raise ValueError("peer memory target requires explicit user_id")
+        return f"viking://user/{user_space}/peers/{normalized_peer_id}/memories/"
+
+    def _current_user_space_fragment(self) -> str:
+        current_user_id = getattr(self, "admin_user_id", None) or getattr(self, "user_id", None)
+        if not current_user_id:
+            return ""
+        return current_user_id
+
+    def _current_peer_memory_target_uri(self, peer_id: str) -> str:
+        normalized_peer_id = self._peer_id(peer_id)
+        if not normalized_peer_id:
+            raise ValueError("peer_id is required for peer memory target")
+        if self._is_user_key_mode() or self._has_request_connection():
+            return f"viking://~/peers/{normalized_peer_id}/memories/"
+        user_space = self._current_user_space_fragment()
+        if not user_space:
+            raise ValueError("peer memory target requires current user_id")
+        return f"viking://user/{user_space}/peers/{normalized_peer_id}/memories/"
+
+    def _current_peer_profile_uri(self, peer_id: str) -> str:
+        return f"{self._current_peer_memory_target_uri(peer_id).rstrip('/')}/profile.md"
+
+    def build_current_memory_target_uris(
+        self,
+        *,
+        peer_ids: Optional[List[str]] = None,
+        include_self: bool = True,
+    ) -> List[str]:
+        uris: List[str] = []
+        if include_self:
+            uris.append(self._memory_target_uri(None))
+
+        normalized_peer_ids = self._dedupe_strings(
+            [pid for pid in (self._peer_id(peer_id) for peer_id in (peer_ids or [])) if pid]
+        )
+        for peer_id in normalized_peer_ids:
+            try:
+                uris.append(self._current_peer_memory_target_uri(peer_id))
+            except ValueError as exc:
+                logger.warning(f"Skip invalid current peer memory target peer_id={peer_id}: {exc}")
+
+        return self._dedupe_strings(uris)
+
+    @staticmethod
+    def _dedupe_strings(values: List[str]) -> List[str]:
+        deduped: List[str] = []
+        seen: set[str] = set()
+        for value in values:
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            deduped.append(value)
+        return deduped
+
+    def build_memory_search_target_uris(
+        self,
+        *,
+        user_ids: Optional[List[str]] = None,
+        owner_user_id: Optional[str] = None,
+        peer_ids: Optional[List[str]] = None,
+    ) -> List[str]:
+        target_uris: List[str] = []
+        normalized_user_ids = self._dedupe_strings(
+            [str(user_id).strip() for user_id in (user_ids or []) if str(user_id).strip()]
+        )
+        normalized_peer_ids = self._dedupe_strings(
+            [pid for pid in (self._peer_id(peer_id) for peer_id in (peer_ids or [])) if pid]
+        )
+        effective_owner_user_id = self._effective_user_id(owner_user_id) if owner_user_id else None
+
+        for user_id in normalized_user_ids:
+            target_uris.append(self._memory_target_uri(user_id))
+
+        if effective_owner_user_id and (not target_uris or normalized_peer_ids):
+            target_uris.append(self._memory_target_uri(effective_owner_user_id))
+
+        if effective_owner_user_id:
+            for peer_id in normalized_peer_ids:
+                try:
+                    target_uris.append(
+                        self._peer_memory_target_uri(effective_owner_user_id, peer_id)
+                    )
+                except ValueError as exc:
+                    logger.warning(
+                        f"Skip invalid peer memory target owner_user_id={effective_owner_user_id}, peer_id={peer_id}: {exc}"
+                    )
+        elif normalized_peer_ids:
+            for peer_id in normalized_peer_ids:
+                try:
+                    target_uris.append(self._current_peer_memory_target_uri(peer_id))
+                except ValueError as exc:
+                    logger.warning(
+                        f"Skip invalid current peer memory target peer_id={peer_id}: {exc}"
+                    )
+
+        if not target_uris:
+            target_uris.append(self._memory_target_uri(None))
+
+        deduped: List[str] = []
+        seen: set[str] = set()
+        for target_uri in target_uris:
+            target_uri = str(target_uri or "")
+            if not target_uri or target_uri in seen:
+                continue
+            seen.add(target_uri)
+            deduped.append(target_uri)
+        return deduped
+
+    def build_memory_search_targets(
+        self,
+        *,
+        user_ids: Optional[List[str]] = None,
+        owner_user_id: Optional[str] = None,
+        peer_ids: Optional[List[str]] = None,
+    ) -> List[tuple[str, Optional[str]]]:
+        target_uris = self.build_memory_search_target_uris(
+            user_ids=user_ids,
+            owner_user_id=owner_user_id,
+            peer_ids=peer_ids,
+        )
+        return [(target_uri, self._owner_user_id_for_uri(target_uri)) for target_uri in target_uris]
+
+    def _skill_memory_uri(self, skill_name: str, user_id: Optional[str] = None) -> str:
+        return f"{self._memory_target_uri(user_id)}skills/{skill_name}.md"
+
+    async def find(
+        self,
+        query: str,
+        target_uri: Optional[str] = None,
+        context_type: Optional[str | list[str]] = None,
+        filter: Optional[Dict[str, Any]] = None,
+        limit: int = 10,
+    ):
         """搜索资源"""
+        # The SDK find/search sync moved context_type/filter out of top-level
+        # find() kwargs into FindOptions. Adapt here so callers keep the stable
+        # VikingClient.find(context_type=..., filter=...) interface.
+        options: Dict[str, Any] = {}
+        if context_type is not None:
+            options["context_type"] = context_type
+        if filter is not None:
+            options["filter"] = filter
+        kwargs: Dict[str, Any] = {"limit": limit}
+        if options:
+            kwargs["options"] = options
         if target_uri:
-            return await self.client.find(query, target_uri=target_uri)
-        return await self.client.find(query)
+            return await self.client.find(query, target_uri=target_uri, **kwargs)
+        return await self.client.find(query, **kwargs)
 
-    async def add_resource(self, local_path: str, desc: str) -> Optional[Dict[str, Any]]:
+    async def add_resource(
+        self,
+        local_path: str,
+        desc: str,
+        to: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """添加资源到 Viking"""
-        result = await self.client.add_resource(path=local_path, reason=desc)
+        result = await self.client.add_resource(
+            path=local_path,
+            to=to,
+            options={"reason": desc},
+        )
         return result
 
+    async def rule_search(
+        self,
+        task_context: str,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Search compiled Rules applicable to the current task context."""
+        return await self.client.rule_search(task_context, options=options)
+
+    async def compile_embeddings(
+        self, texts: List[str], *, target_uri: str, expected_model: str | None = None
+    ) -> Dict[str, Any]:
+        """Use the authenticated server embedder for transient Compile routing batches."""
+        response = await self.client._request(
+            "POST",
+            "/api/v1/compile/embeddings",
+            json={"texts": texts, "target_uri": target_uri, "expected_model": expected_model},
+        )
+        return self.client._handle_response_data(response).get("result", {})
+
+    async def diff_paths(
+        self,
+        dirs: list[str],
+        *,
+        head: str,
+        base: str | None = None,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        """Return one authenticated directory-change page; a null base compares an empty tree."""
+        return await self.client.git_diff_paths(
+            dirs, to_ref=head, from_ref=base, offset=offset, limit=limit
+        )
+
     async def list_resources(
-        self, path: Optional[str] = None, recursive: bool = False
+        self,
+        path: Optional[str] = None,
+        recursive: bool = False,
+        node_limit: int = 1000,
+        *,
+        offset: int = 0,
     ) -> List[Dict[str, Any]]:
-        """列出资源"""
+        """列出资源；offset 跳过指定数量的可见节点，递归深度遵循服务端默认值。"""
         if path is None or path == "":
             path = viking_resource_prefix
-        entries = await self.client.ls(path, recursive=recursive)
+        entries = await self.client.ls(
+            path, recursive=recursive, node_limit=node_limit, offset=offset
+        )
         return entries
 
-    async def read_content(self, uri: str, level: str = "abstract") -> str:
+    def _skill_snapshot_ref(self, uri: str) -> Optional[str]:
+        """Select the task's immutable Skill commit; reads outside its package stay live."""
+        snapshot = self._skill_snapshot
+        if snapshot and (
+            uri == snapshot["uri"] or uri.startswith(snapshot["uri"].rstrip("/") + "/")
+        ):
+            return snapshot.get("snapshot_id")
+        return None
+
+    async def stat(self, uri: str) -> Dict[str, Any]:
+        if self._skill_snapshot_ref(uri):
+            try:
+                data = await self.download_bytes(uri)
+            except InvalidArgumentError as exc:
+                # Git reports existing trees through its invalid-operation response.
+                if "path is a directory, not a file:" not in str(exc):
+                    raise
+                return {"uri": uri, "isDir": True, "size": 0}
+            return {"uri": uri, "isDir": False, "size": len(data)}
+        client = self.client
+        should_close = False
+        scoped_user_id = self._owner_user_id_for_uri(uri)
+        if scoped_user_id:
+            client, should_close = await self._get_user_scoped_client(scoped_user_id)
+
+        try:
+            return await client.stat(uri)
+        finally:
+            if should_close:
+                await client.close()
+
+    async def attrs(self, uri: str) -> Dict[str, Any]:
+        return await self.client.attrs(uri)
+
+    async def mkdir(self, uri: str, description: Optional[str] = None) -> None:
+        """Create a directory; description initializes its L0 when provided."""
+        await self.client.mkdir(uri, description=description)
+
+    async def tree(
+        self, uri: str, *, node_limit: int = 1000, offset: int = 0
+    ) -> List[Dict[str, Any]]:
+        """Return one visible tree page; offset skips entries from preceding pages."""
+        return await self.client.tree(uri, node_limit=node_limit, offset=offset)
+
+    async def read_raw(self, uri: str, offset: int = 0, limit: int = -1) -> str:
+        if self._skill_snapshot_ref(uri):
+            if offset < 0 or limit < -1:
+                raise ValueError("Invalid snapshot line range")
+            lines = (await self.download_bytes(uri)).decode("utf-8").splitlines(keepends=True)
+            return "".join(lines[offset:] if limit == -1 else lines[offset : offset + limit])
+        return await self.client.read_raw(uri, offset=offset, limit=limit)
+
+    async def download_bytes(self, uri: str) -> bytes:
+        client = self.client
+        should_close = False
+        scoped_user_id = self._owner_user_id_for_uri(uri)
+        if scoped_user_id:
+            client, should_close = await self._get_user_scoped_client(scoped_user_id)
+
+        try:
+            snapshot_id = self._skill_snapshot_ref(uri)
+            if snapshot_id:
+                return (await client.git_show(snapshot_id, path=uri))["bytes"]
+            return await client.download_bytes(uri)
+        finally:
+            if should_close:
+                await client.close()
+
+    async def find_skills(
+        self,
+        query: str,
+        *,
+        limit: int = 10,
+        score_threshold: float | None = None,
+        target_uri: str | None = None,
+    ) -> Dict[str, Any]:
+        return await self.client.find_skills(
+            query=query,
+            limit=limit,
+            score_threshold=score_threshold,
+            target_uri=target_uri,
+        )
+
+    async def get_skill(
+        self,
+        skill_name: str,
+        *,
+        target_uri: str,
+        include_content: bool = True,
+        include_files: bool = True,
+        include_integrity: bool = False,
+    ) -> Dict[str, Any]:
+        return await self.client.get_skill(
+            skill_name,
+            include_content=include_content,
+            include_files=include_files,
+            include_integrity=include_integrity,
+            include_source=False,
+            target_uri=target_uri,
+        )
+
+    async def add_skill(
+        self,
+        path: str,
+        *,
+        target_uri: str,
+        wait: bool = True,
+    ) -> Dict[str, Any]:
+        """Publish a Compile-created package so failed tasks can roll back their own output."""
+        return await self.client.add_skill(
+            path,
+            options={
+                "target_uri": target_uri,
+                "extra": {
+                    "source_metadata": {"type": "api", "source": "compile", "operation": "add"}
+                },
+            },
+            wait=wait,
+        )
+
+    async def update_skill(
+        self,
+        skill_name: str,
+        path: str,
+        *,
+        target_uri: str,
+        wait: bool = True,
+    ) -> Dict[str, Any]:
+        """Replace the named Skill package with files from path."""
+        return await self.client.update_skill(
+            skill_name,
+            path,
+            options={"target_uri": target_uri},
+            wait=wait,
+        )
+
+    async def batch_write(
+        self,
+        *,
+        root_uri: str,
+        operations: List[Dict[str, Any]],
+        wait: bool = True,
+        skip_conflicts: bool = False,
+        defer_processing: bool = False,
+        edit_source: Literal["manual", "agent", "compile"] = "manual",
+    ) -> Dict[str, Any]:
+        """Publish a bundle, optionally retaining conflicting targets and reporting their URIs."""
+        return await self.client.batch_write(
+            root_uri=root_uri,
+            operations=operations,
+            wait=wait,
+            options={
+                "skip_conflicts": skip_conflicts,
+                "defer_processing": defer_processing,
+                "edit_source": edit_source,
+            },
+        )
+
+    async def read_content(
+        self,
+        uri: str,
+        level: str = "abstract",
+        user_id: Optional[str] = None,
+        offset: int = 0,
+        limit: int = -1,
+    ) -> str:
         """读取内容
 
         Args:
             uri: Viking URI
             level: 读取级别 ("abstract" - L0摘要, "overview" - L1概览, "read" - L2完整内容)
+            offset: Starting line number (0-indexed); only used for level="read"
+            limit: Number of lines to read, -1 means read to end; only used for level="read"
         """
+        if self._skill_snapshot_ref(uri):
+            if level in {"read", "raw"}:
+                return await self.read_raw(uri, offset=offset, limit=limit)
+            if level in {"abstract", "overview"}:
+                directory = uri.rstrip("/")
+                if not (await self.stat(uri))["isDir"]:
+                    directory = directory.rsplit("/", 1)[0]
+                return await self.read_raw(f"{directory}/.{level}.md")
+            raise ValueError(f"Unsupported level: {level}")
+        client = self.client
+        should_close = False
+        scoped_user_id = user_id or self._owner_user_id_for_uri(uri)
+        if scoped_user_id:
+            client, should_close = await self._get_user_scoped_client(scoped_user_id)
+
         try:
             if level == "abstract":
-                return await self.client.abstract(uri)
+                return await client.abstract(uri)
             elif level == "overview":
-                return await self.client.overview(uri)
+                return await client.overview(uri)
             elif level == "read":
-                return await self.client.read(uri)
+                if offset == 0 and limit == -1:
+                    return await client.read(uri)
+                return await client.read(uri, offset=offset, limit=limit)
+            elif level == "raw":
+                read_raw = getattr(client, "read_raw", None)
+                if read_raw is not None:
+                    return await read_raw(uri)
+                try:
+                    return await client.read(uri, raw=True)
+                except TypeError:
+                    return await client.read(uri)
             else:
                 raise ValueError(f"Unsupported level: {level}")
         except FileNotFoundError:
@@ -145,194 +796,183 @@ class VikingClient:
         except Exception as e:
             logger.warning(f"Failed to read content from {uri}: {e}")
             return ""
+        finally:
+            if should_close:
+                await client.close()
 
     async def read_user_profile(self, user_id: str) -> str:
-        """读取用户 profile。
+        """读取用户 profile。"""
+        effective_user_id = self._effective_user_id(user_id)
+        if not effective_user_id:
+            return await self.read_content(uri="viking://~/memories/profile.md", level="read")
 
-        首先检查用户是否存在，如不存在则初始化用户并返回空字符串。
-        用户存在时，再查询 profile 信息。
-
-        Args:
-            user_id: 用户ID
-
-        Returns:
-            str: 用户 profile 内容，如果用户不存在或查询失败返回空字符串
-        """
-        # Step 1: 检查用户是否存在
-        user_exists = await self._check_user_exists(user_id)
-
-        # Step 2: 如果用户不存在，初始化用户并直接返回
-        if not user_exists:
-            await self._initialize_user(user_id)
-            return ""
-
-        # Step 3: 用户存在，查询 profile
-        uri = f"viking://user/{user_id}/memories/profile.md"
-        result = await self.read_content(uri=uri, level="read")
+        uri = f"{self._memory_target_uri(effective_user_id)}profile.md"
+        result = await self.read_content(uri=uri, level="read", user_id=effective_user_id)
         return result
 
-    async def search(self, query: str, target_uri: Optional[str] = "") -> Dict[str, Any]:
-        # session = self.client.session()
+    async def read_peer_profile(self, peer_id: str) -> str:
+        """读取当前 User 下指定 peer 的 profile。"""
+        try:
+            uri = self._current_peer_profile_uri(peer_id)
+        except ValueError:
+            return ""
+        return await self.read_content(uri=uri, level="read")
 
-        result = await self.client.search(query, target_uri=target_uri)
+    async def search(
+        self,
+        query: str,
+        target_uri: str | list[str] | None = None,
+        limit: int = 10,
+        user_id: Optional[str] = None,
+        peer_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        client = self.client
+        should_close = False
+        scoped_user_id = user_id
+        if scoped_user_id is None and isinstance(target_uri, str):
+            scoped_user_id = self._owner_user_id_for_uri(target_uri)
+        if scoped_user_id:
+            client, should_close = await self._get_user_scoped_client(scoped_user_id)
 
-        # 将 FindResult 对象转换为 JSON map
+        try:
+            if peer_id:
+                target_uri = target_uri or self._current_peer_memory_target_uri(peer_id)
+            result = await client.search(
+                query,
+                target_uri=target_uri,
+                limit=limit,
+            )
+        finally:
+            if should_close:
+                await client.close()
+
+        # 将 FindResult 对象或已序列化的 JSON map 统一转换为 JSON map
+        memories = self._matched_context_group_to_dicts(result, "memories")
+        resources = self._matched_context_group_to_dicts(result, "resources")
+        skills = self._matched_context_group_to_dicts(result, "skills")
         return {
-            "memories": [self._matched_context_to_dict(m) for m in result.memories]
-            if hasattr(result, "memories")
-            else [],
-            "resources": [self._matched_context_to_dict(r) for r in result.resources]
-            if hasattr(result, "resources")
-            else [],
-            "skills": [self._matched_context_to_dict(s) for s in result.skills]
-            if hasattr(result, "skills")
-            else [],
-            "total": getattr(result, "total", len(getattr(result, "resources", []))),
+            "memories": memories,
+            "resources": resources,
+            "skills": skills,
+            "total": self._matched_context_total(result, memories, resources, skills),
             "query": query,
             "target_uri": target_uri,
         }
 
     async def search_user_memory(self, query: str, user_id: str) -> list[Any]:
-        user_exists = await self._check_user_exists(user_id)
-        if not user_exists:
-            return []
-        uri_user_memory = f"viking://user/{user_id}/memories/"
-        result = await self.client.search(query, target_uri=uri_user_memory)
-        return (
-            [self._matched_context_to_dict(m) for m in result.memories]
-            if hasattr(result, "memories")
-            else []
-        )
+        effective_user_id = self._effective_user_id(user_id)
+        uri_user_memory = self._memory_target_uri(effective_user_id)
+        result = await self.search(query, target_uri=uri_user_memory, user_id=effective_user_id)
+        memories = result.get("memories") if isinstance(result, dict) else None
+        return memories if isinstance(memories, list) else []
 
-    async def _check_user_exists(self, user_id: str) -> bool:
-        """检查用户是否存在于账户中。
+    async def _get_user_scoped_client(self, user_id: Optional[str]) -> tuple[Any, bool]:
+        effective_user_id = self._effective_user_id(user_id)
+        if not effective_user_id:
+            return self.client, False
 
-        Args:
-            user_id: 用户ID
+        if self._is_root_key_mode():
+            client = await self._create_trusted_user_client(effective_user_id)
+            return client, True
 
-        Returns:
-            bool: 用户是否存在
-        """
-        if self.mode == "local":
-            return True
-        try:
-            res = await self.client.admin_list_users(self.account_id)
-            if not res or len(res) == 0:
-                return False
-            return any(user.get("user_id") == user_id for user in res)
-        except Exception as e:
-            logger.warning(f"Failed to check user existence: {e}")
-            return False
+        return self.client, False
 
-    async def _initialize_user(self, user_id: str, role: str = "user") -> bool:
-        """初始化用户。
-
-        Args:
-            user_id: 用户ID
-
-        Returns:
-            bool: 初始化是否成功
-        """
-        if self.mode == "local":
-            return True
-        try:
-            result = await self.client.admin_register_user(
-                account_id=self.account_id, user_id=user_id, role=role
-            )
-
-            # Save the API key if returned and we're in remote mode with a valid apikey manager
-            if self._apikey_manager and isinstance(result, dict):
-                api_key = result.get("user_key")
-                if api_key:
-                    self._apikey_manager.set_apikey(user_id, api_key)
-
-            return True
-        except Exception as e:
-            if "User already exists" in str(e):
-                return True
-            logger.warning(f"Failed to initialize user {user_id}: {e}")
-            return False
-
-    async def _get_or_create_user_apikey(self, user_id: str) -> Optional[str]:
-        """获取或创建用户的 API key。
-
-        优先从本地 json 文件获取，如果本地没有则：
-        1. 删除用户（如果存在）
-        2. 重新创建用户
-        3. 保存新的 API key
-
-        Args:
-            user_id: 用户ID
-
-        Returns:
-            API key 或 None（如果获取失败）
-        """
-        if not self._apikey_manager:
-            return None
-
-        # Step 1: Check local storage first
-        api_key = self._apikey_manager.get_apikey(user_id)
-        if api_key:
-            return api_key
-
-        try:
-            # 2a. Remove user if exists
-            user_exists = await self._check_user_exists(user_id)
-            if user_exists:
-                await self.client.admin_remove_user(self.account_id, user_id)
-            # 2b. Recreate user - this will save API key in _initialize_user
-            success = await self._initialize_user(user_id)
-            if not success:
-                logger.warning(f"Failed to recreate user {user_id}")
-                return None
-
-            # 2c. Get API key from local storage (it was saved by _initialize_user)
-            api_key = self._apikey_manager.get_apikey(user_id)
-            if api_key:
-                return api_key
-            else:
-                return None
-
-        except Exception as e:
-            logger.error(f"Error getting or creating API key for user {user_id}: {e}")
-            return None
+    async def _create_trusted_user_client(self, user_id: str):
+        client_kwargs = {
+            "url": self.openviking_config.server_url,
+            "api_key": self.openviking_config.api_key,
+            "account": self.account_id,
+            "user": user_id,
+            "profile_enabled": False,
+        }
+        self._apply_actor_peer_scope(client_kwargs)
+        client = ov.AsyncHTTPClient(**client_kwargs)
+        await client.initialize()
+        return client
 
     async def search_memory(
-        self, query: str, user_id: str, agent_user_id: str, limit: int = 10
-    ) -> dict[str, list[Any]]:
-        """通过上下文消息，检索viking 的user、Agent memory。
+        self,
+        query: str,
+        user_ids: str | list[str] | None = None,
+        limit: int = 10,
+        agent_user_id: Optional[str] = None,
+        *,
+        owner_user_id: Optional[str] = None,
+        peer_ids: Optional[list[str]] = None,
+    ) -> list[Any] | dict[str, list[Any]]:
+        """通过上下文消息检索用户 memory。"""
 
-        首先检查用户是否存在，如不存在则初始化用户并返回空结果。
-        用户存在时，再进行记忆检索。
-        """
-        # Step 1: 检查用户是否存在
-        user_exists = await self._check_user_exists(user_id)
+        def _extract_memories(result: Any) -> list[Any]:
+            if not result:
+                return []
+            if isinstance(result, list):
+                return result
+            if isinstance(result, dict):
+                memories = result.get("memories")
+                return memories if isinstance(memories, list) else []
+            memories = getattr(result, "memories", None)
+            return memories if isinstance(memories, list) else []
 
-        # Step 2: 如果用户不存在，初始化用户并直接返回
-        if not user_exists:
-            await self._initialize_user(user_id)
-            return {
-                "user_memory": [],
-                "agent_memory": [],
+        if user_ids is None:
+            normalized_user_ids: list[str] = []
+        elif isinstance(user_ids, str):
+            normalized_user_ids = [user_ids]
+        else:
+            normalized_user_ids = list(user_ids)
+        normalized_user_ids = [
+            str(user_id).strip() for user_id in normalized_user_ids if str(user_id).strip()
+        ]
+
+        normalized_peer_ids = self._dedupe_strings(
+            [pid for pid in (self._peer_id(peer_value) for peer_value in (peer_ids or [])) if pid]
+        )
+        effective_owner_user_id = self._effective_user_id(owner_user_id) if owner_user_id else None
+
+        search_targets = self.build_memory_search_targets(
+            user_ids=normalized_user_ids,
+            owner_user_id=effective_owner_user_id,
+            peer_ids=normalized_peer_ids,
+        )
+        if not search_targets:
+            return []
+
+        all_user_memories = []
+        for target_uri, scoped_user_id in search_targets:
+            find_kwargs: Dict[str, Any] = {
+                "query": query,
+                "target_uri": target_uri,
+                "limit": limit,
             }
-        # Step 3: 用户存在，查询记忆
-        uri_user_memory = f"viking://user/{user_id}/memories/"
-        user_memory = await self.client.find(
-            query=query,
-            target_uri=uri_user_memory,
-            limit=limit,
-        )
-        agent_space_name = self.get_agent_space_name(agent_user_id)
-        uri_agent_memory = f"viking://agent/{agent_space_name}/memories/"
-        agent_memory = await self.client.find(
-            query=query,
-            target_uri=uri_agent_memory,
-            limit=limit,
-        )
-        return {
-            "user_memory": user_memory.memories if hasattr(user_memory, "memories") else [],
-            "agent_memory": agent_memory.memories if hasattr(agent_memory, "memories") else [],
-        }
+            client = self.client
+            should_close = False
+            if scoped_user_id:
+                client, should_close = await self._get_user_scoped_client(scoped_user_id)
+            try:
+                user_memory = await client.find(**find_kwargs)
+                all_user_memories.extend(_extract_memories(user_memory))
+            finally:
+                if should_close:
+                    await client.close()
+
+        if agent_user_id is not None:
+            agent_uri = f"viking://agent/{self.agent_id or self.admin_user_id}/memories/"
+            agent_memory = await self.client.find(
+                query=query,
+                target_uri=agent_uri,
+                limit=limit,
+            )
+            return {
+                "user_memory": all_user_memories,
+                "agent_memory": _extract_memories(agent_memory),
+            }
+
+        return all_user_memories
+
+    async def search_experiences(self, query: str, limit: int = 5) -> list[Any]:
+        """用 query 检索 vikingbot experience 记忆。"""
+        exp_uri = f"{self._memory_target_uri(self.admin_user_id)}experiences/"
+        result = await self.client.find(query=query, target_uri=exp_uri, limit=limit)
+        return self._matched_context_group_to_dicts(result, "memories")
 
     async def grep(
         self,
@@ -341,167 +981,412 @@ class VikingClient:
         case_insensitive: bool = False,
         node_limit: Optional[int] = 10,
         exclude_uri: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """通过模式（正则表达式）搜索内容"""
-        return await self.client.grep(
-            uri,
-            pattern,
-            case_insensitive=case_insensitive,
-            node_limit=node_limit,
-            exclude_uri=exclude_uri,
-        )
-
-    async def glob(self, pattern: str, uri: Optional[str] = None) -> Dict[str, Any]:
-        """通过 glob 模式匹配文件"""
-        return await self.client.glob(pattern, uri=uri)
-
-    async def commit(self, session_id: str, messages: list[dict[str, Any]], user_id: str = None):
-        """提交会话"""
-        import re
-        import uuid
-
-        from openviking.message.part import TextPart, ToolPart
-
-        user_exists = await self._check_user_exists(user_id)
-        if not user_exists:
-            success = await self._initialize_user(user_id)
-            if not success:
-                return {"error": "Failed to initialize user"}
-
-        # For remote mode, try to get user's API key and create a dedicated client
+        if self._skill_snapshot_ref(uri):
+            raise ValueError("Read fixed Skill files with openviking_multi_read")
         client = self.client
-        start = time.time()
-        if (
-            self.mode == "remote"
-            and user_id
-            and user_id != self.admin_user_id
-            and self._apikey_manager
-        ):
-            user_api_key = await self._get_or_create_user_apikey(user_id)
-            if user_api_key:
-                # Create a new HTTP client with user's API key
-                client = ov.AsyncHTTPClient(
-                    url=self.openviking_config.server_url,
-                    api_key=user_api_key,
-                    agent_id=self.agent_id,
-                )
-                await client.initialize()
+        should_close = False
+        if user_id:
+            client, should_close = await self._get_user_scoped_client(user_id)
 
-        create_res = await client.create_session()
-        session_id = create_res["session_id"]
-        session = client.session(session_id)
+        try:
+            result = await client.grep(
+                uri,
+                pattern,
+                case_insensitive=case_insensitive,
+                node_limit=node_limit,
+                exclude_uri=exclude_uri,
+            )
+            if (self._skill_snapshot or {}).get("snapshot_id"):
+                result["matches"] = [
+                    item
+                    for item in result.get("matches", [])
+                    if not self._skill_snapshot_ref(item.get("uri", ""))
+                ]
+                result["count"] = len(result["matches"])
+            return result
+        finally:
+            if should_close:
+                await client.close()
 
-        for message in messages:
-            role = message.get("role")
-            content = message.get("content")
-            tools_used = message.get("tools_used") or []
+    async def glob(
+        self, pattern: str, uri: Optional[str] = None, user_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """通过 glob 模式匹配文件"""
+        client = self.client
+        should_close = False
+        if user_id:
+            client, should_close = await self._get_user_scoped_client(user_id)
 
-            parts: list[Any] = []
+        try:
+            return await client.glob(pattern, uri=uri)
+        finally:
+            if should_close:
+                await client.close()
 
-            if content:
-                parts.append(TextPart(text=content))
+    def _session_client(self, user_id: Optional[str] = None):
+        if user_id and user_id == self.admin_user_id and self.admin_user_client:
+            return self.admin_user_client
+        return self.admin_user_client or self.client
 
-            for tool_info in tools_used:
-                tool_name = tool_info.get("tool_name", "")
+    async def _session_client_for_user(self, user_id: Optional[str] = None):
+        if self._has_request_connection():
+            return self.client
+        if not user_id or self._is_dev_mode() or self._is_user_key_mode():
+            return self._session_client(user_id)
+        if user_id == self.admin_user_id and self.admin_user_client:
+            return self.admin_user_client
+
+        client = self._user_clients.get(user_id)
+        if client is None and self._is_root_key_mode():
+            client = await self._create_trusted_user_client(user_id)
+            self._user_clients[user_id] = client
+        return client or self._session_client(user_id)
+
+    def _assistant_peer_id(self) -> Optional[str]:
+        return None
+
+    def _normalize_session_messages(
+        self,
+        messages: list[dict[str, Any]],
+        default_user_peer_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        assistant_peer_id = self._assistant_peer_id()
+
+        def build_payload(
+            payload_role: str,
+            parts: list[dict[str, Any]],
+            created_at: Any,
+            peer_id: Optional[str],
+        ) -> dict[str, Any]:
+            payload: dict[str, Any] = {
+                "role": payload_role,
+                "parts": parts,
+                "created_at": created_at,
+            }
+            if peer_id:
+                payload["peer_id"] = peer_id
+            return payload
+
+        def build_tool_parts(tool_infos: Any) -> list[dict[str, Any]]:
+            parts: list[dict[str, Any]] = []
+            if not isinstance(tool_infos, list):
+                return parts
+
+            for tool_info in tool_infos:
+                if not isinstance(tool_info, dict):
+                    continue
+                tool_name = str(tool_info.get("tool_name") or tool_info.get("name") or "").strip()
                 if not tool_name:
                     continue
+                if tool_info.get("auto") is True or tool_name == "auto_memory_search":
+                    continue
 
-                tool_id = f"{tool_name}_{uuid.uuid4().hex[:8]}"
-                tool_input = None
-                try:
-                    import json
+                raw_args = tool_info.get("args", tool_info.get("arguments", {}))
+                if isinstance(raw_args, dict):
+                    tool_input = raw_args
+                else:
+                    try:
+                        tool_input = json.loads(raw_args) if raw_args else {}
+                    except Exception:
+                        tool_input = {"raw_args": str(raw_args)}
 
-                    args_str = tool_info.get("args", "{}")
-                    tool_input = json.loads(args_str) if args_str else {}
-                except Exception:
-                    tool_input = {"raw_args": tool_info.get("args", "")}
-
-                result_str = str(tool_info.get("result", ""))
-
-                skill_uri = ""
-                if tool_name == "read_file" and result_str:
-                    match = re.search(r"^---\s*\nname:\s*(.+?)\s*\n", result_str, re.MULTILINE)
+                result_str = str(tool_info.get("result", tool_info.get("tool_output", "")))
+                skill_uri = str(tool_info.get("skill_uri") or "").strip()
+                if not skill_uri:
+                    explicit_skill_uris = tool_info.get("skill_uris") or []
+                    if isinstance(explicit_skill_uris, list) and explicit_skill_uris:
+                        skill_uri = str(explicit_skill_uris[0] or "").strip()
+                if not skill_uri and tool_name == "read_file" and result_str:
+                    match = re.search(
+                        r"^---\s*\nname:\s*(.+?)\s*\n",
+                        result_str,
+                        re.MULTILINE,
+                    )
                     if match:
                         skill_name = match.group(1).strip()
-                        skill_uri = f"viking://agent/skills/{skill_name}"
+                        skill_uri = self._skill_memory_uri(skill_name)
 
-                execute_success = tool_info.get("execute_success", True)
-                tool_status = "completed" if execute_success else "error"
+                tool_id = str(
+                    tool_info.get("tool_call_id")
+                    or tool_info.get("tool_id")
+                    or tool_info.get("id")
+                    or f"{tool_name}_{uuid.uuid4().hex[:8]}"
+                )
+                explicit_status = str(tool_info.get("tool_status") or "").strip()
                 parts.append(
-                    ToolPart(
-                        tool_id=tool_id,
-                        tool_name=tool_name,
-                        tool_uri=f"viking://session/{session_id}/tools/{tool_id}",
-                        tool_input=tool_input,
-                        tool_output=result_str[:2000],
-                        tool_status=tool_status,
-                        skill_uri=skill_uri,
-                        duration_ms=float(tool_info.get("duration", 0.0)),
-                        prompt_tokens=tool_info.get("input_token"),
-                        completion_tokens=tool_info.get("output_token"),
+                    {
+                        "type": "tool",
+                        "tool_id": tool_id,
+                        "tool_name": tool_name,
+                        "tool_uri": f"viking://~/sessions/{session_id}/tools/{tool_id}"
+                        if session_id
+                        else "",
+                        "tool_input": tool_input,
+                        "tool_output": result_str,
+                        "tool_status": explicit_status
+                        or ("completed" if tool_info.get("execute_success", True) else "error"),
+                        "skill_uri": skill_uri,
+                        "duration_ms": float(tool_info.get("duration", 0.0) or 0.0),
+                        "prompt_tokens": tool_info.get("input_token"),
+                        "completion_tokens": tool_info.get("output_token"),
+                    }
+                )
+            return parts
+
+        for message in messages:
+            role = str(message.get("role") or "").strip().lower()
+            if role not in {"user", "assistant", "system", "tool"}:
+                continue
+
+            content = self._session_message_content(message)
+            tools_used = message.get("tools_used") or []
+            tool_parts = build_tool_parts(tools_used)
+            agent_turns = message.get("agent_turns")
+
+            if not content and not tool_parts and not agent_turns:
+                continue
+
+            ov_role = "user" if role == "user" else "assistant"
+            peer_id = message.get("peer_id")
+            if not peer_id and ov_role == "user":
+                peer_id = message.get("sender_id") or default_user_peer_id
+            elif not peer_id and ov_role == "assistant":
+                peer_id = assistant_peer_id
+
+            safe_message_peer_id = self._peer_id(peer_id)
+            created_at = message.get("created_at") or message.get("timestamp")
+
+            turn_payloads: list[dict[str, Any]] = []
+            if ov_role == "assistant" and isinstance(agent_turns, list):
+                for turn in agent_turns:
+                    if not isinstance(turn, dict):
+                        continue
+                    turn_parts: list[dict[str, Any]] = []
+                    turn_content = self._session_message_content(turn)
+                    if turn_content:
+                        turn_parts.append({"type": "text", "text": turn_content})
+                    turn_parts.extend(build_tool_parts(turn.get("tool_calls") or turn.get("tools")))
+                    if not turn_parts:
+                        continue
+                    turn_payloads.append(
+                        build_payload(
+                            "assistant",
+                            turn_parts,
+                            turn.get("created_at") or turn.get("timestamp") or created_at,
+                            safe_message_peer_id,
+                        )
+                    )
+
+            if ov_role == "user" and content:
+                normalized.append(
+                    build_payload(
+                        "user",
+                        [{"type": "text", "text": content}],
+                        created_at,
+                        safe_message_peer_id,
+                    )
+                )
+            if turn_payloads:
+                normalized.extend(turn_payloads)
+            elif tool_parts:
+                normalized.append(
+                    build_payload(
+                        "assistant",
+                        tool_parts,
+                        created_at,
+                        safe_message_peer_id if ov_role == "assistant" else None,
+                    )
+                )
+            if ov_role == "assistant" and content:
+                normalized.append(
+                    build_payload(
+                        "assistant",
+                        [{"type": "text", "text": content}],
+                        created_at,
+                        safe_message_peer_id,
                     )
                 )
 
-            if not parts:
-                continue
-            # 获取消息的时间戳，如果没有则使用当前时间
-            created_at = message.get("timestamp")
-            await session.add_message(role=role, parts=parts, created_at=created_at)
+        return normalized
 
-        result = await session.commit_async()
-        if client is not self.client:
-            await client.close()
-        logger.info(f"time spent: {time.time() - start}")
-        logger.debug(f"Message add ed to OpenViking session {session_id}, user: {user_id}")
-        return {"success": result["status"]}
+    def _session_message_content(self, message: dict[str, Any]) -> str:
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        return ""
+
+    async def ensure_session(
+        self,
+        session_id: str,
+        user_id: Optional[str] = None,
+        memory_policy: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        client = await self._session_client_for_user(user_id)
+        try:
+            return await client.get_session(session_id)
+        except Exception as exc:
+            if not self._is_not_found_error(exc):
+                raise
+
+        return await client.create_session(
+            session_id=session_id,
+            options={"memory_policy": memory_policy} if memory_policy is not None else None,
+        )
+
+    @staticmethod
+    def _is_not_found_error(exc: Exception) -> bool:
+        code = getattr(exc, "code", None)
+        if code == "NOT_FOUND":
+            return True
+        if exc.__class__.__name__ == "NotFoundError":
+            return True
+        return "not found" in str(exc).lower()
+
+    async def get_session(self, session_id: str, user_id: Optional[str] = None) -> Dict[str, Any]:
+        await self.ensure_session(session_id, user_id=user_id)
+        client = await self._session_client_for_user(user_id)
+        return await client.get_session(session_id)
+
+    async def get_session_context(
+        self, session_id: str, token_budget: int, user_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        await self.ensure_session(session_id, user_id=user_id)
+        client = await self._session_client_for_user(user_id)
+        return await client.get_session_context(
+            session_id,
+            token_budget=token_budget,
+        )
+
+    async def append_messages(
+        self,
+        session_id: str,
+        messages: list[dict[str, Any]],
+        default_user_peer_id: Optional[str] = None,
+        session_user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        await self.ensure_session(session_id, user_id=session_user_id)
+        batch = self._normalize_session_messages(
+            messages,
+            default_user_peer_id=default_user_peer_id,
+            session_id=session_id,
+        )
+        if not batch:
+            return {"session_id": session_id, "added": 0, "message_count": 0}
+        client = await self._session_client_for_user(session_user_id)
+        total_added = 0
+        message_count = 0
+        for start in range(0, len(batch), 100):
+            result = await client.batch_add_messages(
+                session_id=session_id,
+                messages=batch[start : start + 100],
+            )
+            total_added += int(result.get("added", 0) or 0)
+            message_count = int(result.get("message_count", message_count) or 0)
+        return {"session_id": session_id, "added": total_added, "message_count": message_count}
+
+    async def commit_session(
+        self,
+        session_id: str,
+        keep_recent_count: int = 0,
+        user_id: Optional[str] = None,
+        memory_policy: Optional[Dict[str, Any]] = None,
+        enable_working_memory: Optional[bool] = None,
+        retention_mode: Optional[str] = None,
+        keep_recent_turn_count: Optional[int] = None,
+        retained_message_token_budget: Optional[int] = None,
+        min_raw_tail_steps: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        await self.ensure_session(
+            session_id,
+            user_id=user_id,
+            memory_policy=memory_policy
+            if memory_policy is not None
+            else self.default_memory_policy(),
+        )
+        client = await self._session_client_for_user(user_id)
+        retention_kwargs = {
+            key: value
+            for key, value in {
+                "enable_working_memory": enable_working_memory,
+                "retention_mode": retention_mode,
+                "keep_recent_turn_count": keep_recent_turn_count,
+                "retained_message_token_budget": retained_message_token_budget,
+                "min_raw_tail_steps": min_raw_tail_steps,
+            }.items()
+            if value is not None
+        }
+        return await client.commit_session(
+            session_id,
+            keep_recent_count=keep_recent_count,
+            **retention_kwargs,
+        )
+
+    async def commit(
+        self,
+        session_id: str,
+        messages: list[dict[str, Any]],
+        user_id: str = None,
+        keep_recent_count: int = 0,
+        peer_id: Optional[str] = None,
+        memory_policy: Optional[Dict[str, Any]] = None,
+        retention_mode: Optional[str] = None,
+        keep_recent_turn_count: Optional[int] = None,
+        retained_message_token_budget: Optional[int] = None,
+        min_raw_tail_steps: Optional[int] = None,
+    ):
+        """Append messages to a stable session and commit it."""
+        session_user_id = self._effective_session_user_id(user_id)
+        session_memory_policy = (
+            memory_policy if memory_policy is not None else self.default_memory_policy()
+        )
+        await self.ensure_session(
+            session_id,
+            user_id=session_user_id,
+            memory_policy=session_memory_policy,
+        )
+        appended = await self.append_messages(
+            session_id,
+            messages,
+            default_user_peer_id=self._peer_id(peer_id),
+            session_user_id=session_user_id,
+        )
+        retention_kwargs = {
+            key: value
+            for key, value in {
+                "retention_mode": retention_mode,
+                "keep_recent_turn_count": keep_recent_turn_count,
+                "retained_message_token_budget": retained_message_token_budget,
+                "min_raw_tail_steps": min_raw_tail_steps,
+            }.items()
+            if value is not None
+        }
+        commit_result = await self.commit_session(
+            session_id,
+            keep_recent_count=keep_recent_count,
+            user_id=session_user_id,
+            memory_policy=session_memory_policy,
+            **retention_kwargs,
+        )
+        logger.debug(
+            f"Committed OpenViking session {session_id}, "
+            f"api_key_type={self.api_key_type}, appended={appended.get('added', 0)}"
+        )
+        return {
+            "success": True,
+            "session_id": session_id,
+            "append": appended,
+            "commit": commit_result,
+        }
 
     async def close(self):
         """关闭客户端"""
         await self.client.close()
-
-
-async def main_test():
-    client = await VikingClient.create(agent_id="shared")
-    # res = client.list_resources()
-    # res = await client.search("头有点疼", target_uri="viking://user/memories/")
-    # res = await client.get_viking_memory_context("123", current_message="头疼", history=[])
-    res = await client.search_memory("你好", "user_1")
-    # res = await client.list_resources("viking://resources/")
-    # res = await client.read_content("viking://user/memories/profile.md", level="read")
-    # res = await client.add_resource("https://github.com/volcengine/OpenViking", "ov代码")
-    # res = await client.grep("viking://resources/", "viking", True)
-    # res = await client.commit(
-    #     session_id="99999",
-    #     messages=[{"role": "user", "content": "你好"}],
-    #     user_id="1010101010",
-    # )
-    # res = await client.commit("1234", [{"role": "user", "content": "帮我搜索 Python asyncio 教程"}
-    #                                    ,{"role": "assistant", "content": "我来帮你r搜索 Python asyncio 相关的教程。"}])
-    print(res)
-
-    await client.close()
-    print("处理完成！")
-
-
-async def account_test():
-
-    client = ov.AsyncHTTPClient(
-        url="http://localhost:1933",
-        api_key="",
-        agent_id="shared",
-    )
-    await client.initialize()
-
-    # res = await client.admin_list_users("eval")
-    # res = await client.admin_remove_user("default", "")
-    # res = await client.admin_remove_user("default", "admin")
-    # res = await client.admin_list_accounts()
-    # res = await client.admin_create_account("eval", "default")
-    res = await client.search("123")
-
-    print(res)
-
-
-if __name__ == "__main__":
-    asyncio.run(main_test())
-    # asyncio.run(account_test())
+        if self.admin_user_client:
+            await self.admin_user_client.close()
+        for client in self._user_clients.values():
+            await client.close()

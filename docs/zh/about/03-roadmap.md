@@ -1,78 +1,19 @@
 # 路线图
 
-本文档概述 OpenViking 的开发路线图。
+本页区分当前 `main` 分支的实现与后续方向，不承诺发布时间或优先级。已发布版本请查阅 [release notes](https://github.com/volcengine/OpenViking/releases)。
 
-## 已完成功能
+## main 已实现
 
-### 核心基础设施
-- 三层信息模型（L0/L1/L2）
-- Viking URI 寻址系统
-- 双层存储（AGFS + 向量索引）
-- 异步/同步客户端支持
+- **上下文与检索：** L0/L1/L2 分层、Viking URI、语义搜索和上下文感知检索。[概念说明](../concepts/03-context-layers.md)
+- **资源：** 文档、代码、网页和媒体导入，可重复读取来源的定时更新。音视频文件可保存；内容理解需要启用兼容的 VLM。[资源管理](../api/02-resources.md)
+- **更新与历史：** 根据 freshness 刷新父目录摘要，以及基于 Git 的快照提交、历史查询和恢复。父目录刷新可能延后；快照需显式提交，恢复的是文件内容，不含历史 ACL 或向量索引。[上下文分层](../concepts/03-context-layers.md) · [快照指南](../guides/15-snapshot.md)
+- **会话与记忆：** 对话追踪、记忆提取和会话归档。[会话说明](../concepts/08-session.md)
+- **接入与集成：** HTTP API、SDK、CLI、MCP 和 Agent 插件。[API 概览](../api/01-overview.md) · [MCP 指南](../guides/06-mcp-integration.md)
+- **运维：** JSON 配置（`ov.conf`）、多模型供应商、租户隔离、加密、可观测性和本地/S3 存储。[配置指南](../guides/01-configuration.md) · [部署指南](../guides/03-deployment.md)
 
-### 资源管理
-- 文本资源管理（Markdown、HTML、PDF）
-- 自动 L0/L1 生成
-- 带向量索引的语义搜索
-- 资源关联和链接
+## 后续方向
 
-### 检索
-- 基本语义搜索（`find`）
-- 带意图分析的上下文感知搜索（`search`）
-- 基于会话的查询扩展
-- 重排序流水线
+- 继续完善分布式存储。
+- 接入更多 Agent 框架。
 
-### 会话管理
-- 对话状态追踪
-- 上下文和技能使用追踪
-- 自动记忆提取
-- 使用 LLM 的记忆去重
-- 会话归档和压缩
-
-### 技能
-- 技能定义和存储
-- MCP 工具自动转换
-- 技能搜索和检索
-
-### 配置
-- 可插拔的 Embedding 提供者
-- 可插拔的 LLM 提供者
-- 基于 YAML 的配置
-
-### Server & Client 架构
-- HTTP Server (FastAPI)
-- Python HTTP Client
-- API Key 认证
-- 客户端抽象层（LocalClient / HTTPClient）
-
----
-
-## 未来计划
-
-### CLI
-- 完整的命令行界面，支持所有操作
-- 分布式存储后端
-
-### 多模态支持
-- 支持图像、视频、音频等多模态资源的智能解析和访问
-- 多模态资源的目录存储结构
-
-### 上下文管理
-- 上下文修改对上层的传导更新
-- 支持对上下文的版本管理和回滚 (参考 git) 
-
-### 资源节点的权限控制
-- 支持多Agent / 多User 使用
-- 不同角色的隔离设计
-- 资源目录节点的访问控制和权限设计
-
-### 生态集成
-- 流行 Agent 框架适配
-- 插件系统，支持自定义组件
-
-欢迎在 issue 中提出建议和反馈。
----
-
-## 贡献
-
-我们欢迎贡献以帮助实现这些目标。请参阅 [贡献指南](contributing.md)。
+提案与范围讨论见 [GitHub issues](https://github.com/volcengine/OpenViking/issues)，参与开发见[贡献指南](https://github.com/volcengine/OpenViking/blob/main/docs/repository/CONTRIBUTING_CN.md)。

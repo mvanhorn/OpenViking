@@ -2,15 +2,12 @@
 //!
 //! RAGFS provides a unified filesystem abstraction that allows multiple
 //! filesystem implementations (plugins) to be mounted at different paths.
-//! It exposes these filesystems through a REST API, making them accessible
-//! to AI agents and other clients.
+//! It is consumed in-process through the Rust binding (`ragfs-python`).
 //!
 //! # Architecture
 //!
 //! - **Core**: Fundamental traits and types (FileSystem, ServicePlugin, etc.)
 //! - **Plugins**: Filesystem implementations (MemFS, KVFS, QueueFS, etc.)
-//! - **Server**: HTTP API server for remote access
-//! - **Shell**: Interactive command-line interface
 //!
 //! # Example
 //!
@@ -32,14 +29,28 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
+#[cfg(feature = "cache")]
+pub mod cache;
+#[cfg(feature = "cache")]
+pub mod cache_runtime;
 pub mod core;
+pub mod crypto;
+pub mod git;
+#[cfg(feature = "cache")]
+pub mod leader;
+pub mod lock;
+pub mod metrics;
+pub mod multibackend;
 pub mod plugins;
-pub mod server;
+pub mod privacy_extractor;
+pub mod privacy_matcher;
+pub mod shape;
 
 // Re-export core types for convenience
 pub use core::{
-    ConfigParameter, ConfigValue, Error, FileInfo, FileSystem, HealthStatus, MountableFS,
-    PluginConfig, PluginRegistry, Result, ServicePlugin, WriteFlag,
+    ConfigParameter, ConfigValue, Error, FileInfo, FileSystem, FilesystemStats, FsOperation,
+    GlobEntry, GlobPage, HealthStatus, MountableFS, OperationStats, OperationTimer, PluginConfig,
+    PluginRegistry, Result, ServicePlugin, StatsCollector, StatsWrappedFS, WriteFlag,
 };
 
 /// Version of RAGFS

@@ -199,7 +199,7 @@ class OVInspector:
     def _headers(self) -> dict:
         h: dict[str, str] = {"Content-Type": "application/json"}
         if self.agent_id:
-            h["X-OpenViking-Agent"] = self.agent_id
+            h["X-OpenViking-Actor-Peer"] = self.agent_id
         return h
 
     def _get(self, path: str, timeout: int = 10):
@@ -230,7 +230,8 @@ class OVInspector:
         通过检查每个 session 的 updated_at 来找到最新的。"""
         sessions = self.list_sessions()
         real_sessions = [
-            s for s in sessions
+            s
+            for s in sessions
             if isinstance(s, dict) and not s.get("session_id", "").startswith("memory-store-")
         ]
         if not real_sessions:
@@ -305,7 +306,9 @@ def run_test(
 
     gateway_responses = []
     for i, msg_cfg in enumerate(TOOL_TRIGGER_MESSAGES):
-        console.print(f"\n[cyan]消息 {i + 1}/{len(TOOL_TRIGGER_MESSAGES)}:[/cyan] {msg_cfg['description']}")
+        console.print(
+            f"\n[cyan]消息 {i + 1}/{len(TOOL_TRIGGER_MESSAGES)}:[/cyan] {msg_cfg['description']}"
+        )
         console.print(f"  [dim]> {msg_cfg['input'][:80]}...[/dim]")
 
         try:
@@ -318,15 +321,19 @@ def run_test(
                 console.print("  [yellow]检测到 tool_use 在响应中[/yellow]")
 
             if verbose:
-                console.print(f"  [dim]完整响应: {json.dumps(data, ensure_ascii=False)[:500]}[/dim]")
+                console.print(
+                    f"  [dim]完整响应: {json.dumps(data, ensure_ascii=False)[:500]}[/dim]"
+                )
 
-            gateway_responses.append({
-                "index": i,
-                "msg": msg_cfg,
-                "response": data,
-                "reply": reply,
-                "has_tool": has_tool,
-            })
+            gateway_responses.append(
+                {
+                    "index": i,
+                    "msg": msg_cfg,
+                    "response": data,
+                    "reply": reply,
+                    "has_tool": has_tool,
+                }
+            )
 
             check(
                 f"消息 {i + 1} 发送成功",
@@ -387,7 +394,11 @@ def run_test(
         return
 
     console.print(f"  [green]OV session context 消息数: {len(messages)}[/green]")
-    check("OV session 有内容", len(messages) > 0 or bool(archive_overview), f"messages={len(messages)}")
+    check(
+        "OV session 有内容",
+        len(messages) > 0 or bool(archive_overview),
+        f"messages={len(messages)}",
+    )
 
     # ── Phase 3: 分析存储的内容是否包含 tool 信息 ──────────────────────
 
@@ -403,15 +414,17 @@ def run_test(
                 all_stored_text += (part.get("text", "") or "") + "\n"
 
     if verbose:
-        console.print(Panel(
-            all_stored_text[:3000] + ("..." if len(all_stored_text) > 3000 else ""),
-            title="OV 存储的全部文本",
-        ))
+        console.print(
+            Panel(
+                all_stored_text[:3000] + ("..." if len(all_stored_text) > 3000 else ""),
+                title="OV 存储的全部文本",
+            )
+        )
 
     any_tool_in_gateway = any(r.get("has_tool") for r in gateway_responses)
 
     # 检查 toolUse 标记（仅在 gateway 响应确实含 tool_use 时才必须）
-    has_tool_use_marker = bool(re.search(r'\[toolUse:', all_stored_text, re.IGNORECASE))
+    has_tool_use_marker = bool(re.search(r"\[toolUse:", all_stored_text, re.IGNORECASE))
     if any_tool_in_gateway:
         check(
             "存储文本包含 [toolUse:] 标记",
@@ -426,7 +439,7 @@ def run_test(
         )
 
     # 检查 toolResult 标记
-    has_tool_result_marker = bool(re.search(r'result\]:', all_stored_text, re.IGNORECASE))
+    has_tool_result_marker = bool(re.search(r"result\]:", all_stored_text, re.IGNORECASE))
     check(
         "存储文本包含 tool result 标记",
         has_tool_result_marker or not any_tool_in_gateway,
@@ -434,7 +447,7 @@ def run_test(
     )
 
     # 检查 assistant 标记
-    has_assistant = bool(re.search(r'\[assistant\]:', all_stored_text, re.IGNORECASE))
+    has_assistant = bool(re.search(r"\[assistant\]:", all_stored_text, re.IGNORECASE))
     check(
         "存储文本包含 [assistant] 标记",
         has_assistant,
@@ -442,7 +455,7 @@ def run_test(
     )
 
     # 检查 user 标记
-    has_user = bool(re.search(r'\[user\]:', all_stored_text, re.IGNORECASE))
+    has_user = bool(re.search(r"\[user\]:", all_stored_text, re.IGNORECASE))
     check(
         "存储文本包含 [user] 标记",
         has_user,
@@ -451,7 +464,6 @@ def run_test(
 
     # 检查关键内容是否保留（检查活跃上下文 + 归档摘要 + gateway 响应）
     all_gateway_text = "\n".join(r.get("reply", "") for r in gateway_responses)
-    combined_text = all_stored_text + "\n" + all_gateway_text
 
     for msg_cfg in TOOL_TRIGGER_MESSAGES:
         for kw in msg_cfg.get("expect_keywords", []):
@@ -473,9 +485,9 @@ def run_test(
     tool_related_lines = []
     for line in all_stored_text.split("\n"):
         stripped = line.strip()
-        if re.search(r'\[toolUse:', stripped, re.IGNORECASE):
+        if re.search(r"\[toolUse:", stripped, re.IGNORECASE):
             tool_related_lines.append(("toolUse", stripped[:150]))
-        elif re.search(r'result\]:', stripped, re.IGNORECASE):
+        elif re.search(r"result\]:", stripped, re.IGNORECASE):
             tool_related_lines.append(("toolResult", stripped[:150]))
 
     if tool_related_lines:
@@ -521,7 +533,9 @@ def print_summary():
         console.print("\n[green bold]全部通过！toolUse/toolResult 捕获验证成功。[/green bold]")
     else:
         console.print(f"\n[red bold]有 {failed} 个断言失败。[/red bold]")
-        console.print("[yellow]注: 如果模型没有调用工具，toolUse/toolResult 标记可能不存在 — 这不代表代码有 bug。[/yellow]")
+        console.print(
+            "[yellow]注: 如果模型没有调用工具，toolUse/toolResult 标记可能不存在 — 这不代表代码有 bug。[/yellow]"
+        )
         console.print("[yellow]可以在 gateway 日志中确认 afterTurn 的存储内容。[/yellow]")
 
 
@@ -533,7 +547,9 @@ def main():
     parser.add_argument("--gateway", default=GATEWAY_URL, help="Gateway 地址")
     parser.add_argument("--openviking", default=OPENVIKING_URL, help="OpenViking 地址")
     parser.add_argument("--token", default="", help="Gateway auth token (默认: 自动发现)")
-    parser.add_argument("--agent-id", default=AGENT_ID, help=f"OpenViking agent ID (默认: {AGENT_ID})")
+    parser.add_argument(
+        "--agent-id", default=AGENT_ID, help=f"OpenViking agent ID (默认: {AGENT_ID})"
+    )
     parser.add_argument("--delay", type=float, default=3.0, help="消息间延迟秒数")
     parser.add_argument("--verbose", "-v", action="store_true", help="详细输出")
     args = parser.parse_args()

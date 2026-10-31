@@ -1,0 +1,143 @@
+"""Protocol types for synchronous AGFS-like clients."""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from typing import Any, Awaitable, BinaryIO, Dict, Literal, Protocol, overload, runtime_checkable
+
+AGFSByteStream = Iterator[bytes]
+
+
+@runtime_checkable
+class AGFSSyncClientProtocol(Protocol):
+    """AGFS binding contract used by OpenViking."""
+
+    def ls(
+        self,
+        path: str = "/",
+        ctx: Dict[str, str] | None = None,
+        *,
+        offset: int = 0,
+        limit: int | None = None,
+        sort_by: str | None = None,
+        sort_order: str = "asc",
+    ) -> list[Dict[str, Any]]:
+        """List a sorted directory range."""
+
+    @overload
+    def read(
+        self,
+        path: str,
+        offset: int = 0,
+        size: int = -1,
+        stream: Literal[False] = False,
+    ) -> bytes:
+        """Read file content from AGFS."""
+
+    @overload
+    def read(
+        self,
+        path: str,
+        offset: int = 0,
+        size: int = -1,
+        stream: Literal[True] = True,
+    ) -> AGFSByteStream:
+        """Read file content from AGFS."""
+
+    @overload
+    def cat(
+        self,
+        path: str,
+        offset: int = 0,
+        size: int = -1,
+        stream: Literal[False] = False,
+    ) -> bytes:
+        """Read file content from AGFS."""
+
+    @overload
+    def cat(
+        self,
+        path: str,
+        offset: int = 0,
+        size: int = -1,
+        stream: Literal[True] = True,
+    ) -> AGFSByteStream:
+        """Read file content or a byte stream from AGFS."""
+
+    def write(
+        self,
+        path: str,
+        data: bytes | Iterator[bytes] | BinaryIO,
+        max_retries: int = 3,
+    ) -> str:
+        """Write file content to AGFS and return the backend result."""
+
+    def mkdir(self, path: str, mode: str = "755") -> Dict[str, Any]:
+        """Create a directory in AGFS."""
+
+    def ensure_parent_dirs(self, path: str, mode: str = "755") -> Dict[str, Any]:
+        """Ensure parent directories exist for the given AGFS path."""
+
+    def rm(self, path: str, recursive: bool = False, force: bool = True) -> Dict[str, Any]:
+        """Remove a file or directory from AGFS."""
+
+    def stat(self, path: str) -> Dict[str, Any]:
+        """Return AGFS metadata for the given path."""
+
+    def mv(self, old_path: str, new_path: str) -> Dict[str, Any]:
+        """Move or rename a path inside AGFS."""
+
+    def copy_within_mount(self, src_path: str, dst_path: str) -> Dict[str, Any]:
+        """Attempt a same-mount verbatim copy and report whether it was used."""
+
+    def grep(self, **kwargs: Any) -> Dict[str, Any]:
+        """Run a grep-like search through the AGFS backend."""
+
+    def tree_directory(
+        self,
+        path: str,
+        show_hidden: bool = False,
+        node_limit: int | None = None,
+        level_limit: int | None = None,
+        ctx: Dict[str, str] | None = None,
+        *,
+        offset: int = 0,
+        sort_by: str | None = None,
+        sort_order: str = "asc",
+        directories_only: bool = False,
+    ) -> list[Dict[str, Any]]:
+        """Return a sorted range from a directory tree."""
+
+    def glob_directory(
+        self,
+        path: str,
+        pattern: str,
+        show_hidden: bool = False,
+        page_size: int | None = None,
+        level_limit: int | None = None,
+        continuation_token: str | None = None,
+    ) -> Dict[str, Any]:
+        """Return one page of flat glob matches for the given AGFS directory."""
+
+    def pathlock_acquire_batch_async(
+        self,
+        ctx: Dict[str, str],
+        requests: list[Dict[str, str]],
+        timeout_secs: float = 0.0,
+        owner_lease_ref: Dict[str, Any] | None = None,
+    ) -> Awaitable[Dict[str, Any]]:
+        """Acquire a PathLock batch without blocking a Python worker thread."""
+
+    def leader_try_acquire_async(
+        self, key: str, holder_id: str, ttl_secs: float
+    ) -> Awaitable[str | None]:
+        """Try to acquire leadership and return an opaque lease reference."""
+
+    def leader_validate(self) -> None:
+        """Validate that distributed leadership is available."""
+
+    def leader_renew_async(self, lease_ref: str, ttl_secs: float) -> Awaitable[bool]:
+        """Renew leadership while its hidden ownership token still matches."""
+
+    def leader_release_async(self, lease_ref: str) -> Awaitable[None]:
+        """Release leadership while its hidden ownership token still matches."""

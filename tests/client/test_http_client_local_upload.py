@@ -8,14 +8,15 @@ import json
 import pytest
 
 from openviking_cli.client.http import AsyncHTTPClient
+from openviking_cli.utils.config import OPENVIKING_CLI_CONFIG_ENV
 
 
 class _FakeHTTPClient:
     def __init__(self):
         self.calls = []
 
-    async def post(self, path, json=None, files=None):
-        self.calls.append({"path": path, "json": json, "files": files})
+    async def post(self, path, json=None, files=None, data=None):
+        self.calls.append({"path": path, "json": json, "files": files, "data": data})
         return object()
 
 
@@ -23,7 +24,7 @@ class _FakeHTTPClient:
 def isolated_ovcli_config(tmp_path, monkeypatch):
     config_path = tmp_path / "ovcli.conf"
     config_path.write_text(json.dumps({"url": "http://localhost:1933"}))
-    monkeypatch.setenv("OPENVIKING_CLI_CONFIG_FILE", str(config_path))
+    monkeypatch.setenv(OPENVIKING_CLI_CONFIG_ENV, str(config_path))
 
 
 @pytest.mark.asyncio
@@ -44,8 +45,6 @@ async def test_write_omits_removed_semantic_flags_from_http_payload(tmp_path, mo
         "content": "updated",
         "mode": "replace",
         "wait": True,
-        "timeout": None,
-        "telemetry": False,
     }
 
 
@@ -89,11 +88,15 @@ async def test_add_resource_uploads_local_file_even_when_url_is_localhost(tmp_pa
         "result": {"root_uri": "viking://resources/demo"}
     }
 
-    await client.add_resource(str(resource_file), reason="test")
+    await client.add_resource(
+        str(resource_file),
+        options={"reason": "test", "watch_interval": 60},
+    )
 
     call = fake_http.calls[-1]
     assert call["path"] == "/api/v1/resources"
     assert call["json"]["temp_file_id"] == "upload_resource.md"
+    assert call["json"]["watch_interval"] == 60
     assert "path" not in call["json"]
 
 
@@ -112,12 +115,18 @@ async def test_import_ovpack_uploads_local_file_even_when_url_is_localhost(tmp_p
     client._upload_temp_file = fake_upload
     client._handle_response = lambda _response: {"uri": "viking://resources/imported"}
 
-    await client.import_ovpack(str(pack_file), parent="viking://resources/")
+    await client.import_ovpack(
+        str(pack_file),
+        parent="viking://resources/",
+        on_conflict="skip",
+    )
 
     call = fake_http.calls[-1]
     assert call["path"] == "/api/v1/pack/import"
     assert call["json"]["temp_file_id"] == "upload_pack.ovpack"
+    assert call["json"]["on_conflict"] == "skip"
     assert "file_path" not in call["json"]
+    assert "force" not in call["json"]
 
 
 @pytest.mark.asyncio
@@ -147,3 +156,34 @@ async def test_import_ovpack_fails_fast_when_path_is_directory(tmp_path):
         await client.import_ovpack(str(pack_dir), parent="viking://resources/")
 
     assert fake_http.calls == []
+
+
+@pytest.mark.asyncio
+async def test_upload_temp_file_forwards_shared_upload_mode_from_config(tmp_path, monkeypatch):
+    config_path = tmp_path / "ovcli.conf"
+    config_path.write_text(
+        json.dumps(
+            {
+                "url": "http://localhost:1933",
+                "upload": {
+                    "mode": "shared",
+                },
+            }
+        )
+    )
+    monkeypatch.setenv(OPENVIKING_CLI_CONFIG_ENV, str(config_path))
+
+    upload_file = tmp_path / "demo.md"
+    upload_file.write_text("# Demo\n")
+
+    client = AsyncHTTPClient()
+    fake_http = _FakeHTTPClient()
+    client._http = fake_http
+    client._handle_response = lambda _response: {"temp_file_id": "shared_abc"}
+
+    temp_file_id = await client._upload_temp_file(str(upload_file))
+
+    assert temp_file_id == "shared_abc"
+    call = fake_http.calls[-1]
+    assert call["path"] == "/api/v1/resources/temp_upload"
+    assert call["data"] == {"upload_mode": "shared"}

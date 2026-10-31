@@ -1,0 +1,47 @@
+name: 17. Docs
+
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - '.github/workflows/_docs.yml'
+      - '.github/workflows/_docs-deploy.yml'
+      - '.github/workflows/docs.yml'
+  push:
+    branches: [ main ]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/_docs.yml'
+      - '.github/workflows/_docs-deploy.yml'
+      - '.github/workflows/docs.yml'
+      # The deploy also publishes the plugin downloads under /dl.
+      - 'examples/.claude-plugin/**'
+      - 'examples/.agents/**'
+      - 'examples/claude-code-memory-plugin/**'
+      - 'examples/codex-memory-plugin/**'
+      - 'examples/agent-hook-plugin/**'
+      - 'examples/opencode-plugin/**'
+      - 'examples/pi-coding-agent-extension/**'
+      - 'examples/memory-plugin-shared/**'
+      - '.github/scripts/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docs-check:
+    name: Build Docs
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/_docs.yml
+    permissions:
+      contents: read
+
+  docs-deploy:
+    name: Build and Deploy Docs
+    if: github.repository == 'volcengine/OpenViking' && github.event_name != 'pull_request'
+    uses: ./.github/workflows/_docs-deploy.yml
+    permissions:
+      contents: read
+      pages: write
+      id-token: write

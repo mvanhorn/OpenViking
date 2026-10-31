@@ -80,8 +80,8 @@ AK/SK 同时用于 TOS 和 VikingDB 的鉴权。
 2. 左侧菜单 → **API Key 管理** → 创建 API Key
 3. 记录生成的 API Key
 4. 确认以下模型已开通（在 **模型广场** 中申请）：
-   - `doubao-embedding-vision-250615`（多模态 Embedding）
-   - `doubao-seed-2-0-pro-260215`（VLM 推理）
+   - `doubao-embedding-vision-251215`（多模态 Embedding）
+   - `doubao-seed-2-0-lite-260428`（VLM 推理）
 5. 将 API Key 填入配置文件的 `embedding.dense.api_key` 和 `vlm.api_key`
 
 ---
@@ -251,6 +251,7 @@ journalctl -u openviking -f          # 查看实时日志
 # -v  挂载宿主机文件到容器内，格式为 宿主机路径:容器内路径
 #     ov.conf 挂载是必填的，data 目录用于持久化数据（容器删除后不丢失）
 # --restart  进程崩溃或机器重启后自动拉起
+# 镜像推荐优先使用 ghcr.io；如果访问有问题，可改用 openviking-cn-beijing.cr.volces.com/volcengine/openviking:latest
 
 docker run -d \
   --name openviking \
@@ -333,14 +334,14 @@ openviking:
           use_path_style: false
     embedding:
       dense:
-        model: "doubao-embedding-vision-250615"
+        model: "doubao-embedding-vision-251215"
         api_key: "your-ark-api-key"
         api_base: "https://ark.cn-beijing.volces.com/api/v3"
         dimension: 1024
         provider: volcengine
         input: multimodal
     vlm:
-      model: "doubao-seed-2-0-pro-260215"
+      model: "doubao-seed-2-0-lite-260428"
       api_key: "your-ark-api-key"
       api_base: "https://ark.cn-beijing.volces.com/api/v3"
       temperature: 0.0
@@ -604,7 +605,7 @@ sudo systemctl start docker
 
 ### Embedding 模型调用失败
 
-- **模型未开通**：在方舟控制台 **模型广场** 中确认 `doubao-embedding-vision-250615` 已申请并通过
+- **模型未开通**：在方舟控制台 **模型广场** 中确认 `doubao-embedding-vision-251215` 已申请并通过
 - **API Key 错误**：确认 `embedding.dense.api_key` 填写正确
 - **API Base 错误**：确认为 `https://ark.cn-beijing.volces.com/api/v3`
 

@@ -8,14 +8,31 @@ Analyzes session context to generate query plans.
 
 from typing import List, Optional
 
+from openviking.config.vlm import VLMHandle
 from openviking.message import Message
 from openviking.prompts import render_prompt
 from openviking_cli.retrieve.types import ContextType, QueryPlan, TypedQuery
-from openviking_cli.utils.config import get_openviking_config
 from openviking_cli.utils.llm import parse_json_from_response
 from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+DEFAULT_INTENT_ANALYSIS_PROMPT = "retrieval.intent_analysis"
+
+# Model-specific query-planner prompts. Models not listed here keep using the
+# default intent-analysis prompt for backward compatibility.
+QUERY_PLANNER_PROMPT_BY_MODEL: dict[str, str] = {
+    "ollama/guoxuter/ov_intent_analysis_sft:v7_q8": "retrieval.ov_intent_analysis_sft_v7",
+    "ollama/guoxuter/ov_intent_analysis_sft:v4_q8": "retrieval.ov_intent_analysis_sft_v4",
+}
+
+
+def resolve_intent_analysis_prompt_id(query_planner: VLMHandle) -> str:
+    """Return the prompt id expected by the configured query-planner model."""
+    model = getattr(query_planner, "model", None)
+    if not isinstance(model, str):
+        return DEFAULT_INTENT_ANALYSIS_PROMPT
+    return QUERY_PLANNER_PROMPT_BY_MODEL.get(model.strip(), DEFAULT_INTENT_ANALYSIS_PROMPT)
 
 
 class IntentAnalyzer:
@@ -31,9 +48,12 @@ class IntentAnalyzer:
     # Limit content length (about 10000 tokens)
     MAX_COMPRESSION_SUMMARY_CHARS = 30000
 
-    def __init__(self, max_recent_messages: int = 5):
+    def __init__(self, max_recent_messages: int = 5, *, query_planner: VLMHandle):
         """Initialize intent analyzer."""
+        if query_planner is None:
+            raise ValueError("IntentAnalyzer requires an explicitly resolved query planner")
         self.max_recent_messages = max_recent_messages
+        self.query_planner = query_planner
 
     async def analyze(
         self,
@@ -52,26 +72,43 @@ class IntentAnalyzer:
             context_type: Constrained context type (only generate queries for this type)
             target_abstract: Target directory abstract for more precise queries
         """
-        # Build context prompt
+        query_planner = self.query_planner
+
+        # Build context prompt. Some fine-tuned planner models expect a compact
+        # prompt/output contract, selected by exact model mapping above.
         prompt = self._build_context_prompt(
             compression_summary,
             messages,
             current_message,
             context_type,
             target_abstract,
+            prompt_id=resolve_intent_analysis_prompt_id(query_planner),
         )
 
-        # Call LLM
-        response = await get_openviking_config().vlm.get_completion_async(prompt)
+        response = await query_planner.get_completion_async(prompt)
 
         # Parse result
         parsed = parse_json_from_response(response)
         if not parsed:
             raise ValueError("Failed to parse intent analysis response")
 
+        if isinstance(parsed, list):
+            parsed = {"reasoning": "", "queries": parsed}
+        elif not isinstance(parsed, dict):
+            raise ValueError(
+                "Intent analysis response must be a JSON object or array, got "
+                f"{type(parsed).__name__}"
+            )
+
+        reasoning = parsed.get("reasoning", "")
+        if not isinstance(reasoning, str):
+            reasoning = str(reasoning)
+
         # Build QueryPlan
         queries = []
         for q in parsed.get("queries", []):
+            if not isinstance(q, dict):
+                continue
             try:
                 context_type = ContextType(q.get("context_type", "resource"))
             except ValueError:
@@ -91,12 +128,12 @@ class IntentAnalyzer:
             logger.info(
                 f'  [{i + 1}] type={q.context_type.value}, priority={q.priority}, query="{q.query}"'
             )
-        logger.debug(f"[IntentAnalyzer] Reasoning: {parsed.get('reasoning', '')[:200]}...")
+        logger.debug(f"[IntentAnalyzer] Reasoning: {reasoning[:200]}...")
 
         return QueryPlan(
             queries=queries,
             session_context=self._summarize_context(compression_summary, current_message),
-            reasoning=parsed.get("reasoning", ""),
+            reasoning=reasoning,
         )
 
     def _build_context_prompt(
@@ -106,6 +143,7 @@ class IntentAnalyzer:
         current_message: Optional[str],
         context_type: Optional[ContextType] = None,
         target_abstract: str = "",
+        prompt_id: str = DEFAULT_INTENT_ANALYSIS_PROMPT,
     ) -> str:
         """Build prompt for intent analysis."""
         # Format compression info
@@ -122,7 +160,7 @@ class IntentAnalyzer:
         current = current_message if current_message else "None"
 
         return render_prompt(
-            "retrieval.intent_analysis",
+            prompt_id,
             {
                 "compression_summary": summary,
                 "recent_messages": recent_messages,

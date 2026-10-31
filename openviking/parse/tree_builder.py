@@ -8,30 +8,33 @@ L0/L1/L2 content and URI structure.
 
 v5.0 Architecture:
 1. Parser: parse + create directory structure in temp VikingFS
-2. TreeBuilder: move to AGFS + enqueue to SemanticQueue + create Resources
-3. SemanticProcessor: async generate L0/L1 + vectorize
+2. TreeBuilder: build final URI metadata and keep temp references
+3. ResourceProcessor: source commit from temp to final VikingFS path
+4. SemanticProcessor: async generate L0/L1 + vectorize
 
 IMPORTANT (v5.0 Architecture):
 - Parser creates directory structure directly, no LLM calls
-- TreeBuilder moves files and enqueues to SemanticQueue
+- TreeBuilder does not move files; source commit is handled after URI metadata is built
 - SemanticProcessor handles all semantic generation asynchronously
 - Temporary directory approach eliminates memory pressure and enables concurrency
 - Resource objects are lightweight (no content fields)
 - Content splitting is handled by Parser, not TreeBuilder
 """
 
-import logging
-from typing import Optional
+from typing import Any, Optional
 
 from openviking.core.building_tree import BuildingTree
 from openviking.core.context import Context
+from openviking.core.namespace import is_content_root_uri
 from openviking.parse.parsers.media.utils import get_media_base_uri, get_media_type
 from openviking.server.identity import RequestContext
 from openviking.storage.viking_fs import get_viking_fs
 from openviking.utils import parse_code_hosting_url
+from openviking.utils.path_safety import normalize_storage_target_uri
+from openviking_cli.utils import get_logger
 from openviking_cli.utils.uri import VikingURI
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class TreeBuilder:
@@ -40,18 +43,20 @@ class TreeBuilder:
 
     New v5.0 Architecture:
     - Parser creates directory structure in temp VikingFS (no LLM calls)
-    - TreeBuilder moves to AGFS + enqueues to SemanticQueue + creates Resources
+    - TreeBuilder builds final URI metadata while preserving temp URIs
+    - ResourceProcessor commits temp content to the final source path
     - SemanticProcessor handles semantic generation asynchronously
 
     Process flow:
     1. Parser creates directory structure with files in temp VikingFS
-    2. TreeBuilder.finalize_from_temp() moves to AGFS, enqueues to SemanticQueue, creates Resources
-    3. SemanticProcessor generates .abstract.md and .overview.md asynchronously
-    4. SemanticProcessor directly vectorizes and inserts to collection
+    2. TreeBuilder.finalize_from_temp() returns final URI and temp URI metadata
+    3. ResourceProcessor performs source commit with short path locks
+    4. SemanticProcessor generates .abstract.md and .overview.md asynchronously
+    5. SemanticProcessor directly vectorizes and inserts to collection
 
     Key changes from v4.0:
     - Semantic generation moved from Parser to SemanticQueue
-    - TreeBuilder enqueues directories for async processing
+    - ResourceProcessor enqueues directories for async processing
     - Direct vectorization in SemanticProcessor (no EmbeddingQueue)
     """
 
@@ -69,40 +74,71 @@ class TreeBuilder:
             if media_type:
                 return get_media_base_uri(media_type)
             return "viking://resources"
-        if scope == "user":
-            # user resources go to memories (no separate resources dir)
-            return "viking://user"
-        # Agent scope
-        return "viking://agent"
-
-    async def _resolve_unique_uri(self, uri: str, max_attempts: int = 100) -> str:
-        """Return a URI that does not collide with an existing resource.
-
-        If *uri* is free, return it unchanged.  Otherwise append ``_1``,
-        ``_2``, ... until a free name is found.
-        """
-        viking_fs = get_viking_fs()
-
-        async def _exists(u: str) -> bool:
-            try:
-                await viking_fs.stat(u)
-                return True
-            except Exception:
-                return False
-
-        if not await _exists(uri):
-            return uri
-
-        for i in range(1, max_attempts + 1):
-            candidate = f"{uri}_{i}"
-            if not await _exists(candidate):
-                return candidate
-
-        raise FileExistsError(f"Cannot resolve unique name for {uri} after {max_attempts} attempts")
+        raise ValueError(f"unsupported tree scope: {scope}")
 
     # ============================================================================
     # v5.0 Methods (temporary directory + SemanticQueue architecture)
     # ============================================================================
+
+    async def resolve_target_uri(
+        self,
+        *,
+        ctx: RequestContext,
+        doc_name: str,
+        scope: str = "resources",
+        to_uri: Optional[str] = None,
+        parent_uri: Optional[str] = None,
+        source_path: Optional[str] = None,
+        source_format: Optional[str] = None,
+        create_parent: bool = False,
+    ) -> tuple[str, Optional[str]]:
+        """Resolve the final target URI and optional unique-name candidate."""
+
+        if to_uri:
+            to_uri = normalize_storage_target_uri(to_uri)
+        if parent_uri:
+            parent_uri = normalize_storage_target_uri(parent_uri)
+
+        final_doc_name = VikingURI.sanitize_segment(doc_name)
+        if source_path and source_format == "repository":
+            parsed_org_repo = parse_code_hosting_url(source_path)
+            if parsed_org_repo:
+                final_doc_name = parsed_org_repo
+
+        auto_base_uri = self._get_base_uri(scope, source_path, source_format)
+        base_uri = parent_uri or auto_base_uri
+        use_to_as_parent = bool(to_uri and is_content_root_uri(to_uri, kind="resource"))
+        if to_uri and not use_to_as_parent:
+            return to_uri, None
+
+        effective_parent_uri = (parent_uri or to_uri) if use_to_as_parent else parent_uri
+        if effective_parent_uri:
+            effective_parent_uri = effective_parent_uri.rstrip("/")
+        if effective_parent_uri:
+            viking_fs = get_viking_fs()
+            parent_is_content_root = is_content_root_uri(
+                effective_parent_uri,
+                kind="resource",
+            )
+            parent_exists = await viking_fs.exists(effective_parent_uri, ctx=ctx)
+            if not parent_exists:
+                if create_parent or parent_is_content_root:
+                    logger.info(
+                        f"[TreeBuilder] Parent URI does not exist, creating: {effective_parent_uri}"
+                    )
+                    await viking_fs.mkdir(effective_parent_uri, exist_ok=True, ctx=ctx)
+                else:
+                    raise FileNotFoundError(
+                        f"Parent URI does not exist: {effective_parent_uri}. "
+                        f"Use --parent-auto-create/-p to automatically create it."
+                    )
+            stat_result = await viking_fs.stat(effective_parent_uri, ctx=ctx, skip_count=True)
+            if not stat_result.get("isDir"):
+                raise ValueError(f"Parent URI is not a directory: {effective_parent_uri}")
+            base_uri = effective_parent_uri
+
+        planned_uri = VikingURI(base_uri).join(final_doc_name).uri
+        return planned_uri, planned_uri
 
     async def finalize_from_temp(
         self,
@@ -113,88 +149,94 @@ class TreeBuilder:
         parent_uri: Optional[str] = None,
         source_path: Optional[str] = None,
         source_format: Optional[str] = None,
+        create_parent: bool = False,
+        flatten_single_file: bool = False,
+        artifact_ref: Optional[Any] = None,
+        output_store: Optional[Any] = None,
     ) -> "BuildingTree":
         """
-        Finalize processing by moving from temp to AGFS.
+        Finalize URI metadata for a temp parse result.
 
         Args:
-            to_uri: Exact target URI (must not exist)
-            parent_uri: Target parent URI (must exist)
+            to_uri: Exact target URI, or resources root to import under
+            parent_uri: Target parent URI (must exist unless create_parent is True)
+            create_parent: Whether to automatically create parent directory if it doesn't exist
+            artifact_ref / output_store: When provided, the artifact structure is
+                read through the backend-agnostic store (supporting local
+                artifacts); otherwise the legacy AGFS ``ls(temp_uri)`` path is
+                used. Either way the resulting ``temp_doc_uri`` keeps the AGFS URI
+                shape and target-URI resolution stays on VikingFS.
         """
 
         viking_fs = get_viking_fs()
         temp_uri = temp_dir_path
 
-        def is_resources_root(uri: Optional[str]) -> bool:
-            return (uri or "").rstrip("/") == "viking://resources"
+        # 1. Find the single document root. The structural walk is identical for
+        # AGFS and local artifacts, so it is delegated to resolve_artifact_doc_root
+        # when a store/ref is available. ``temp_doc_uri`` remains an AGFS-shaped
+        # URI relative to temp_uri for downstream persistence.
+        if output_store is not None and artifact_ref is not None:
+            from openviking.parse.output import resolve_artifact_doc_root
 
-        # 1. Find document root directory
-        entries = await viking_fs.ls(temp_uri, ctx=ctx)
-        doc_dirs = [e for e in entries if e.get("isDir") and e["name"] not in [".", ".."]]
-
-        if len(doc_dirs) != 1:
-            logger.error(
-                f"[TreeBuilder] Expected 1 document directory in {temp_uri}, found {len(doc_dirs)}"
+            resolved = await resolve_artifact_doc_root(
+                output_store, artifact_ref, flatten_single_file=flatten_single_file
             )
-            raise ValueError(
-                f"[TreeBuilder] Expected 1 document directory in {temp_uri}, found {len(doc_dirs)}"
-            )
+            original_name = resolved.doc_name
+            doc_name = VikingURI.sanitize_segment(original_name)
+            temp_doc_uri = f"{temp_uri.rstrip('/')}/{resolved.doc_rel}"
+            root_is_file = resolved.root_is_file
+        else:
+            entries = await viking_fs.ls(temp_uri, ctx=ctx)
+            doc_dirs = [e for e in entries if e.get("isDir") and e["name"] not in [".", ".."]]
 
-        original_name = doc_dirs[0]["name"]
-        doc_name = VikingURI.sanitize_segment(original_name)
-        temp_doc_uri = f"{temp_uri}/{original_name}"  # use original name to find temp dir
+            if len(doc_dirs) != 1:
+                logger.error(
+                    f"[TreeBuilder] Expected 1 document directory in {temp_uri}, found {len(doc_dirs)}"
+                )
+                raise ValueError(
+                    f"[TreeBuilder] Expected 1 document directory in {temp_uri}, found {len(doc_dirs)}"
+                )
+
+            original_name = doc_dirs[0]["name"]
+            doc_name = VikingURI.sanitize_segment(original_name)
+            temp_doc_uri = f"{temp_uri}/{original_name}"  # use original name to find temp dir
+            root_is_file = False
+            if flatten_single_file:
+                doc_entries = [
+                    entry
+                    for entry in await viking_fs.ls(temp_doc_uri, ctx=ctx)
+                    if entry.get("name") not in [".", ".."]
+                ]
+                if len(doc_entries) == 1 and not doc_entries[0].get("isDir"):
+                    original_name = doc_entries[0]["name"]
+                    doc_name = VikingURI.sanitize_segment(original_name)
+                    temp_doc_uri = f"{temp_doc_uri}/{original_name}"
+                    root_is_file = True
         if original_name != doc_name:
             logger.debug(f"[TreeBuilder] Sanitized doc name: {original_name!r} -> {doc_name!r}")
 
-        # Check if source_path is a GitHub/GitLab URL and extract org/repo
-        final_doc_name = doc_name
-        if source_path and source_format == "repository":
-            parsed_org_repo = parse_code_hosting_url(source_path)
-            if parsed_org_repo:
-                final_doc_name = parsed_org_repo
-
-        # 2. Determine base_uri and final document name with org/repo for GitHub/GitLab
-        auto_base_uri = self._get_base_uri(scope, source_path, source_format)
-        base_uri = parent_uri or auto_base_uri
-        use_to_as_parent = is_resources_root(to_uri)
-        # 3. Determine candidate_uri
-        if to_uri and not use_to_as_parent:
-            candidate_uri = to_uri
-        else:
-            effective_parent_uri = parent_uri or to_uri if use_to_as_parent else parent_uri
-            if effective_parent_uri:
-                # Parent URI must exist and be a directory
-                try:
-                    stat_result = await viking_fs.stat(effective_parent_uri, ctx=ctx)
-                except Exception as e:
-                    raise FileNotFoundError(
-                        f"Parent URI does not exist: {effective_parent_uri}"
-                    ) from e
-                if not stat_result.get("isDir"):
-                    raise ValueError(f"Parent URI is not a directory: {effective_parent_uri}")
-                base_uri = effective_parent_uri
-            candidate_uri = VikingURI(base_uri).join(final_doc_name).uri
-
-        if to_uri and not use_to_as_parent:
-            final_uri = candidate_uri
-        elif use_to_as_parent:
-            # Treat an explicit resources root target as "import under this
-            # directory" while preserving the child URI so downstream logic can
-            # incrementally update viking://resources/<child> when it exists.
-            final_uri = candidate_uri
-        else:
-            final_uri = await self._resolve_unique_uri(candidate_uri)
+        planned_uri, unique_candidate_uri = await self.resolve_target_uri(
+            ctx=ctx,
+            doc_name=original_name,
+            scope=scope,
+            to_uri=to_uri,
+            parent_uri=parent_uri,
+            source_path=source_path,
+            source_format=source_format,
+            create_parent=create_parent,
+        )
 
         tree = BuildingTree(
             source_path=source_path,
             source_format=source_format,
         )
-        tree._root_uri = final_uri
-        if not to_uri or use_to_as_parent:
-            tree._candidate_uri = candidate_uri
+        tree._root_uri = planned_uri
+        tree._root_is_file = root_is_file
+        if unique_candidate_uri:
+            tree._candidate_uri = unique_candidate_uri
 
         # Create a minimal Context object for the root so that tree.root is not None
-        root_context = Context(uri=final_uri, temp_uri=temp_doc_uri)
+        root_context = Context(uri=planned_uri, temp_uri=temp_doc_uri)
         tree.add_context(root_context)
 
         return tree

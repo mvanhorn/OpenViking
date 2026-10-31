@@ -1,0 +1,17 @@
+# Legacy HTTP entrypoint. Server and gateway (under /gateway) share OPENVIKING_SERVER_PORT.
+# Studio is served at /studio by the same server.
+#
+# For public HTTPS, add a domain block and publish ports 80/443 in Compose:
+#
+#   {$OPENVIKING_PUBLIC_BASE_URL} {
+#       reverse_proxy openviking:{$OPENVIKING_SERVER_PORT:1933} {
+#           flush_interval -1
+#       }
+#       # tls {$OV_ACME_EMAIL}
+#   }
+
+:1934 {
+	reverse_proxy openviking:{$OPENVIKING_SERVER_PORT:1933} {
+		flush_interval -1
+	}
+}

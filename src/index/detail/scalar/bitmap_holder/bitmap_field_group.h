@@ -135,28 +135,27 @@ class FieldBitmapGroup : public BitmapGroupBase {
       std::vector<std::string> keys;
       split(keys, field_str, ";");
       for (auto& key_i : keys) {
-        const std::string norm_key = dir_index_ ? normalize_path_key(key_i) : key_i;
-        if (!exist_bitmap(norm_key)) {
-          if (dir_index_) {
-            dir_index_->add_key(norm_key);
-          }
-        }
-
+        const std::string norm_key =
+            dir_index_ ? normalize_path_key(key_i) : key_i;
+        const bool is_new_bitmap = !exist_bitmap(norm_key);
         Bitmap* temp_p = get_editable_bitmap(norm_key);
         if (temp_p) {
+          if (dir_index_ && is_new_bitmap) {
+            dir_index_->add_key(norm_key, temp_p);
+          }
           temp_p->Set(offset);
         }
       }
 
     } else {
-      const std::string norm_key = dir_index_ ? normalize_path_key(field_str) : field_str;
-      if (!exist_bitmap(norm_key)) {
-        if (dir_index_) {
-          dir_index_->add_key(norm_key);
-        }
-      }
+      const std::string norm_key =
+          dir_index_ ? normalize_path_key(field_str) : field_str;
+      const bool is_new_bitmap = !exist_bitmap(norm_key);
       Bitmap* temp_p = get_editable_bitmap(norm_key);
       if (temp_p) {
+        if (dir_index_ && is_new_bitmap) {
+          dir_index_->add_key(norm_key, temp_p);
+        }
         temp_p->Set(offset);
       }
     }
@@ -209,14 +208,16 @@ class FieldBitmapGroup : public BitmapGroupBase {
       std::vector<std::string> keys;
       split(keys, field_str, ";");
       for (auto& key_i : keys) {
-        const std::string norm_key = dir_index_ ? normalize_path_key(key_i) : key_i;
+        const std::string norm_key =
+            dir_index_ ? normalize_path_key(key_i) : key_i;
         Bitmap* temp_p = get_editable_bitmap(norm_key);
         if (temp_p) {
           temp_p->Unset(offset);
         }
       }
     } else {
-      const std::string norm_key = dir_index_ ? normalize_path_key(field_str) : field_str;
+      const std::string norm_key =
+          dir_index_ ? normalize_path_key(field_str) : field_str;
       Bitmap* temp_p = get_editable_bitmap(norm_key);
       if (temp_p) {
         temp_p->Unset(offset);
@@ -288,7 +289,8 @@ using FieldBitmapGroupPtr = std::shared_ptr<FieldBitmapGroup>;
 class FieldBitmapGroupSet;
 using FieldBitmapGroupSetPtr = std::shared_ptr<FieldBitmapGroupSet>;
 
-// Collection of all field inverted index groups, encapsulates bitmap filter computation
+// Collection of all field inverted index groups, encapsulates bitmap filter
+// computation
 class FieldBitmapGroupSet {
  public:
   explicit FieldBitmapGroupSet(std::string grp_set_name = std::string{})
@@ -463,7 +465,11 @@ class FieldBitmapGroupSet {
   }
 
   const Bitmap* get_bitmap(const std::string& field, const std::string key) {
-    return get_editable_bitmap(field, key);
+    auto itr = field_bitmap_groups_map_.find(field);
+    if (itr == field_bitmap_groups_map_.end()) {
+      return nullptr;
+    }
+    return itr->second->get_bitmap(key);
   }
 
   Bitmap* get_editable_bitmap(const std::string& field, const std::string key) {
@@ -479,8 +485,8 @@ class FieldBitmapGroupSet {
                             double greater_than, bool include_ge) {
     auto itr = field_bitmap_groups_map_.find(field);
     if (itr == field_bitmap_groups_map_.end()) {
-      SPDLOG_ERROR("make_range_copy failed, cannot find {} in {}\n",
-                   field, field_bitmap_groups_map_.size());
+      SPDLOG_ERROR("make_range_copy failed, cannot find {} in {}\n", field,
+                   field_bitmap_groups_map_.size());
       return nullptr;
     }
     return itr->second->get_bitmap_in_range(range_out, lower_than, include_le,

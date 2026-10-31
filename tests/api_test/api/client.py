@@ -17,14 +17,18 @@ class OpenVikingAPIClient:
         base_url: Optional[str] = None,
         server_url: Optional[str] = None,
         api_key: Optional[str] = None,
+        root_api_key: Optional[str] = None,
         account: Optional[str] = None,
         user: Optional[str] = None,
+        send_identity_headers: bool = False,
     ):
         self.base_url = base_url or Config.CONSOLE_URL
         self.server_url = server_url or Config.SERVER_URL
         self.api_key = api_key or Config.OPENVIKING_API_KEY
+        self.root_api_key = root_api_key or Config.OPENVIKING_ROOT_API_KEY
         self.account = account or Config.OPENVIKING_ACCOUNT
         self.user = user or Config.OPENVIKING_USER
+        self.send_identity_headers = send_identity_headers
         self.session = requests.Session()
         self._setup_default_headers()
         self.max_retries = 3
@@ -59,8 +63,13 @@ class OpenVikingAPIClient:
             return data
 
     def _request_with_retry(self, method: str, url: str, **kwargs) -> requests.Response:
-        filtered_headers = self._filter_sensitive_headers(dict(self.session.headers))
-        filtered_kwargs = self._filter_sensitive_data(kwargs)
+        request_headers = dict(self.session.headers)
+        if kwargs.get("headers"):
+            request_headers.update(kwargs["headers"])
+        filtered_headers = self._filter_sensitive_headers(request_headers)
+        filtered_kwargs = self._filter_sensitive_data(
+            {key: value for key, value in kwargs.items() if key != "headers"}
+        )
 
         self.last_request_info = {
             "method": method,
@@ -106,12 +115,18 @@ class OpenVikingAPIClient:
             "Connection": "keep-alive",
             "Content-Type": "application/json",
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            "X-OpenViking-Account": self.account,
-            "X-OpenViking-User": self.user,
         }
+        if self.send_identity_headers:
+            headers["X-OpenViking-Account"] = self.account
+            headers["X-OpenViking-User"] = self.user
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         self.session.headers.update(headers)
+
+    def _admin_headers(self) -> Dict[str, str]:
+        if not self.root_api_key:
+            return {}
+        return {"Authorization": f"Bearer {self.root_api_key}"}
 
     def _build_url(self, base: str, endpoint: str, params: Optional[Dict[str, Any]] = None) -> str:
         url = f"{base}{endpoint}"
@@ -159,6 +174,7 @@ class OpenVikingAPIClient:
         limit: int = 10,
         score_threshold: Optional[float] = None,
         filter: Optional[Dict[str, Any]] = None,
+        context_type: Optional[str | list[str]] = None,
     ) -> requests.Response:
         endpoint = "/api/v1/search/find"
         url = self._build_url(self.server_url, endpoint)
@@ -169,6 +185,8 @@ class OpenVikingAPIClient:
             payload["score_threshold"] = score_threshold
         if filter:
             payload["filter"] = filter
+        if context_type:
+            payload["context_type"] = context_type
         return self._request_with_retry("POST", url, json=payload)
 
     def search(
@@ -179,6 +197,7 @@ class OpenVikingAPIClient:
         limit: int = 10,
         score_threshold: Optional[float] = None,
         filter: Optional[Dict[str, Any]] = None,
+        context_type: Optional[str | list[str]] = None,
     ) -> requests.Response:
         endpoint = "/api/v1/search/search"
         url = self._build_url(self.server_url, endpoint)
@@ -191,6 +210,8 @@ class OpenVikingAPIClient:
             payload["score_threshold"] = score_threshold
         if filter:
             payload["filter"] = filter
+        if context_type:
+            payload["context_type"] = context_type
         return self._request_with_retry("POST", url, json=payload)
 
     def grep(
@@ -253,7 +274,10 @@ class OpenVikingAPIClient:
         path: str,
         to: Optional[str] = None,
         reason: Optional[str] = None,
+        parent: Optional[str] = None,
+        instruction: Optional[str] = None,
         wait: bool = False,
+        processing_mode: Optional[str] = None,
     ) -> requests.Response:
         endpoint = "/api/v1/resources"
         url = self._build_url(self.server_url, endpoint)
@@ -270,8 +294,14 @@ class OpenVikingAPIClient:
             payload["to"] = to
         if reason:
             payload["reason"] = reason
+        if parent:
+            payload["parent"] = parent
+        if instruction:
+            payload["instruction"] = instruction
         if wait:
             payload["wait"] = wait
+        if processing_mode:
+            payload["processing_mode"] = processing_mode
         try:
             return self._request_with_retry("POST", url, json=payload)
         finally:
@@ -312,10 +342,19 @@ class OpenVikingAPIClient:
         url = self._build_url(self.server_url, endpoint)
         return self._request_with_retry("DELETE", url)
 
-    def add_message(self, session_id: str, role: str, content: str) -> requests.Response:
+    def add_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        peer_id: Optional[str] = None,
+    ) -> requests.Response:
         endpoint = f"/api/v1/sessions/{session_id}/messages"
         url = self._build_url(self.server_url, endpoint)
-        return self._request_with_retry("POST", url, json={"role": role, "content": content})
+        payload = {"role": role, "content": content}
+        if peer_id is not None:
+            payload["peer_id"] = peer_id
+        return self._request_with_retry("POST", url, json=payload)
 
     def fs_ls(self, uri: str, simple: bool = False, recursive: bool = False) -> requests.Response:
         endpoint = "/api/v1/fs/ls"
@@ -335,10 +374,13 @@ class OpenVikingAPIClient:
         url = self._build_url(self.server_url, endpoint, params)
         return self._request_with_retry("GET", url)
 
-    def fs_mkdir(self, uri: str) -> requests.Response:
+    def fs_mkdir(self, uri: str, description: Optional[str] = None) -> requests.Response:
         endpoint = "/api/v1/fs/mkdir"
         url = self._build_url(self.server_url, endpoint)
-        return self._request_with_retry("POST", url, json={"uri": uri})
+        payload = {"uri": uri}
+        if description is not None:
+            payload["description"] = description
+        return self._request_with_retry("POST", url, json=payload)
 
     def fs_read(self, uri: str) -> requests.Response:
         endpoint = "/api/v1/content/read"
@@ -352,7 +394,6 @@ class OpenVikingAPIClient:
         content: str,
         mode: str = "replace",
         wait: bool = False,
-        timeout: Optional[float] = None,
     ) -> requests.Response:
         endpoint = "/api/v1/content/write"
         url = self._build_url(self.server_url, endpoint)
@@ -362,8 +403,6 @@ class OpenVikingAPIClient:
             "mode": mode,
             "wait": wait,
         }
-        if timeout is not None:
-            payload["timeout"] = timeout
         return self._request_with_retry("POST", url, json=payload)
 
     def fs_rm(self, uri: str, recursive: bool = False) -> requests.Response:
@@ -410,13 +449,18 @@ class OpenVikingAPIClient:
         return response
 
     def import_ovpack(
-        self, file_path: str, parent: str, force: bool = False, vectorize: bool = True
+        self,
+        file_path: str,
+        parent: str,
+        on_conflict: str | None = None,
     ) -> requests.Response:
         endpoint = "/api/v1/pack/import"
         url = self._build_url(self.server_url, endpoint)
         if not os.path.isfile(file_path):
             raise FileNotFoundError(f"Local ovpack file not found: {file_path}")
-        payload = {"parent": parent, "force": force, "vectorize": vectorize}
+        payload = {"parent": parent}
+        if on_conflict is not None:
+            payload["on_conflict"] = on_conflict
         payload["temp_file_id"] = self._upload_temp_file(file_path)
         return self._request_with_retry(
             "POST",
@@ -429,38 +473,22 @@ class OpenVikingAPIClient:
         url = self._build_url(self.server_url, endpoint)
         return self.session.post(url, json={"from_uri": from_uri, "to_uri": to_uri})
 
-    def link(self, from_uri: str, to_uris: Any, reason: str = "") -> requests.Response:
-        endpoint = "/api/v1/relations/link"
+    def fs_cp(
+        self,
+        from_uri: str,
+        to_uri: str,
+        recursive: bool = False,
+    ) -> requests.Response:
+        endpoint = "/api/v1/fs/cp"
         url = self._build_url(self.server_url, endpoint)
         return self.session.post(
-            url, json={"from_uri": from_uri, "to_uris": to_uris, "reason": reason}
+            url,
+            json={
+                "from_uri": from_uri,
+                "to_uri": to_uri,
+                "recursive": recursive,
+            },
         )
-
-    def relations(self, uri: str) -> requests.Response:
-        endpoint = "/api/v1/relations"
-        params = {"uri": uri}
-        url = self._build_url(self.server_url, endpoint, params)
-        return self.session.get(url)
-
-    def unlink(self, from_uri: str, to_uri: str) -> requests.Response:
-        endpoint = "/api/v1/relations/link"
-        url = self._build_url(self.server_url, endpoint)
-        return self.session.delete(url, json={"from_uri": from_uri, "to_uri": to_uri})
-
-    def session_used(
-        self,
-        session_id: str,
-        contexts: Optional[list] = None,
-        skill: Optional[Dict[str, Any]] = None,
-    ) -> requests.Response:
-        endpoint = f"/api/v1/sessions/{session_id}/used"
-        url = self._build_url(self.server_url, endpoint)
-        payload = {}
-        if contexts:
-            payload["contexts"] = contexts
-        if skill:
-            payload["skill"] = skill
-        return self.session.post(url, json=payload)
 
     def session_commit(self, session_id: str) -> requests.Response:
         endpoint = f"/api/v1/sessions/{session_id}/commit"
@@ -472,12 +500,10 @@ class OpenVikingAPIClient:
         url = self._build_url(self.server_url, endpoint)
         return self._request_with_retry("GET", url)
 
-    def system_wait(self, timeout: Optional[float] = None) -> requests.Response:
+    def system_wait(self) -> requests.Response:
         endpoint = "/api/v1/system/wait"
         url = self._build_url(self.server_url, endpoint)
         payload = {}
-        if timeout is not None:
-            payload["timeout"] = timeout
         return self._request_with_retry("POST", url, json=payload)
 
     def observer_queue(self) -> requests.Response:
@@ -490,8 +516,8 @@ class OpenVikingAPIClient:
         url = self._build_url(self.server_url, endpoint)
         return self._request_with_retry("GET", url)
 
-    def observer_vlm(self) -> requests.Response:
-        endpoint = "/api/v1/observer/vlm"
+    def observer_models(self) -> requests.Response:
+        endpoint = "/api/v1/observer/models"
         url = self._build_url(self.server_url, endpoint)
         return self._request_with_retry("GET", url)
 
@@ -510,76 +536,118 @@ class OpenVikingAPIClient:
         url = self._build_url(self.server_url, endpoint)
         return self._request_with_retry("GET", url)
 
-    def wait_for_task(self, task_id: str, timeout: float = 60.0, poll_interval: float = 1.0) -> dict:
+    def wait_for_task(
+        self, task_id: str, timeout: float = 60.0, poll_interval: float = 1.0
+    ) -> dict:
         import time
+
         start_time = time.time()
         while time.time() - start_time < timeout:
             response = self.get_task(task_id)
             if response.status_code == 200:
                 data = response.json()
-                if data.get('status') == 'ok':
-                    result = data.get('result', {})
-                    task_status = result.get('status')
-                    if task_status in ['completed', 'failed']:
+                if data.get("status") == "ok":
+                    result = data.get("result", {})
+                    task_status = result.get("status")
+                    if task_status in ["completed", "failed"]:
                         return result
             time.sleep(poll_interval)
-        return {'status': 'timeout', 'task_id': task_id}
+        return {"status": "timeout", "task_id": task_id}
 
     def admin_create_account(self, account_id: str, admin_user_id: str) -> requests.Response:
         endpoint = "/api/v1/admin/accounts"
         url = self._build_url(self.server_url, endpoint)
         return self._request_with_retry(
-            "POST", url, json={"account_id": account_id, "admin_user_id": admin_user_id}
+            "POST",
+            url,
+            json={"account_id": account_id, "admin_user_id": admin_user_id},
+            headers=self._admin_headers(),
         )
 
     def admin_list_accounts(self) -> requests.Response:
         endpoint = "/api/v1/admin/accounts"
         url = self._build_url(self.server_url, endpoint)
-        return self._request_with_retry("GET", url)
+        return self._request_with_retry("GET", url, headers=self._admin_headers())
 
     def admin_delete_account(self, account_id: str) -> requests.Response:
         endpoint = f"/api/v1/admin/accounts/{account_id}"
         url = self._build_url(self.server_url, endpoint)
-        return self._request_with_retry("DELETE", url)
+        return self._request_with_retry("DELETE", url, headers=self._admin_headers())
 
     def admin_register_user(
         self, account_id: str, user_id: str, role: str = "user"
     ) -> requests.Response:
         endpoint = f"/api/v1/admin/accounts/{account_id}/users"
         url = self._build_url(self.server_url, endpoint)
-        return self._request_with_retry("POST", url, json={"user_id": user_id, "role": role})
+        return self._request_with_retry(
+            "POST", url, json={"user_id": user_id, "role": role}, headers=self._admin_headers()
+        )
 
     def admin_list_users(self, account_id: str) -> requests.Response:
         endpoint = f"/api/v1/admin/accounts/{account_id}/users"
         url = self._build_url(self.server_url, endpoint)
-        return self._request_with_retry("GET", url)
+        return self._request_with_retry("GET", url, headers=self._admin_headers())
 
     def admin_remove_user(self, account_id: str, user_id: str) -> requests.Response:
         endpoint = f"/api/v1/admin/accounts/{account_id}/users/{user_id}"
         url = self._build_url(self.server_url, endpoint)
-        return self._request_with_retry("DELETE", url)
+        return self._request_with_retry("DELETE", url, headers=self._admin_headers())
 
     def admin_set_role(self, account_id: str, user_id: str, role: str) -> requests.Response:
         endpoint = f"/api/v1/admin/accounts/{account_id}/users/{user_id}/role"
         url = self._build_url(self.server_url, endpoint)
-        return self._request_with_retry("PUT", url, json={"role": role})
+        return self._request_with_retry(
+            "PUT", url, json={"role": role}, headers=self._admin_headers()
+        )
 
     def admin_regenerate_key(self, account_id: str, user_id: str) -> requests.Response:
         endpoint = f"/api/v1/admin/accounts/{account_id}/users/{user_id}/key"
         url = self._build_url(self.server_url, endpoint)
-        return self._request_with_retry("POST", url, json={})
+        return self._request_with_retry("POST", url, json={}, headers=self._admin_headers())
 
-    def add_skill(
-        self, data: Any, wait: bool = False, timeout: Optional[float] = None
-    ) -> requests.Response:
+    def add_skill(self, data: Any, wait: bool = False) -> requests.Response:
         endpoint = "/api/v1/skills"
         url = self._build_url(self.server_url, endpoint)
         payload = {"data": data}
         if wait:
             payload["wait"] = wait
-        if timeout is not None:
-            payload["timeout"] = timeout
         return self._request_with_retry("POST", url, json=payload)
+
+    def content_reindex(
+        self,
+        uri: str,
+        regenerate: bool = False,
+        wait: bool = True,
+    ) -> requests.Response:
+        mode = "full" if regenerate else "vectors_only"
+        endpoint = "/api/v1/content/reindex"
+        url = self._build_url(self.server_url, endpoint)
+        payload = {"uri": uri, "mode": mode, "wait": wait}
+        return self._request_with_retry("POST", url, json=payload)
+
+    def content_download(self, uri: str) -> requests.Response:
+        endpoint = "/api/v1/content/download"
+        params = {"uri": uri}
+        url = self._build_url(self.server_url, endpoint, params)
+        return self._request_with_retry("GET", url)
+
+    def list_tasks(
+        self,
+        task_type: Optional[str] = None,
+        status: Optional[str] = None,
+        resource_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> requests.Response:
+        endpoint = "/api/v1/tasks"
+        params = {"limit": limit}
+        if task_type:
+            params["task_type"] = task_type
+        if status:
+            params["status"] = status
+        if resource_id:
+            params["resource_id"] = resource_id
+        url = self._build_url(self.server_url, endpoint, params)
+        return self._request_with_retry("GET", url)
 
     def close(self):
         self.session.close()

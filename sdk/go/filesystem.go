@@ -1,0 +1,425 @@
+// Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+// SPDX-License-Identifier: AGPL-3.0
+
+package openviking
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/url"
+)
+
+// List lists directory contents.
+func (c *Client) List(ctx context.Context, uri string, opts *ListOptions) ([]any, error) {
+	page, err := c.ListPage(ctx, uri, opts)
+	if err != nil {
+		return nil, err
+	}
+	return page.Result, nil
+}
+
+// ListPage lists directory contents with pagination metadata.
+func (c *Client) ListPage(ctx context.Context, uri string, opts *ListOptions) (*ListPage, error) {
+	if opts == nil {
+		opts = &ListOptions{Output: "original", AbsLimit: 256, NodeLimit: 1000}
+	}
+	output := opts.Output
+	if output == "" {
+		output = "original"
+	}
+	absLimit := opts.AbsLimit
+	if absLimit == 0 {
+		absLimit = 256
+	}
+	overviewLimit := opts.OverviewLimit
+	if overviewLimit == 0 {
+		overviewLimit = 4000
+	}
+	nodeLimit := opts.NodeLimit
+	if nodeLimit == 0 {
+		nodeLimit = 1000
+	}
+	query := url.Values{}
+	query.Set("uri", NormalizeURI(uri))
+	queryBool(query, "simple", opts.Simple)
+	queryBool(query, "recursive", opts.Recursive)
+	query.Set("output", output)
+	queryInt(query, "abs_limit", absLimit)
+	if opts.IncludeAbstract != nil {
+		queryBool(query, "include_abstract", *opts.IncludeAbstract)
+	}
+	if opts.IncludeOverview != nil {
+		queryBool(query, "include_overview", *opts.IncludeOverview)
+	}
+	queryInt(query, "overview_limit", overviewLimit)
+	queryBool(query, "show_all_hidden", opts.ShowAllHidden)
+	queryInt(query, "node_limit", nodeLimit)
+	if opts.Offset != 0 {
+		queryInt(query, "offset", opts.Offset)
+	}
+	if opts.Limit != 0 {
+		queryInt(query, "limit", opts.Limit)
+	}
+	if opts.Tags != nil {
+		query["tags"] = opts.Tags
+	}
+	if opts.IncludeTags {
+		query.Set("include_tags", "true")
+	}
+	if opts.SortBy != "" {
+		query.Set("sort_by", opts.SortBy)
+	}
+	if opts.SortOrder != "" {
+		query.Set("sort_order", opts.SortOrder)
+	}
+	if opts.ExtraFields != nil {
+		query["extra_fields"] = opts.ExtraFields
+	}
+	var result []any
+	env, err := c.doJSONEnvelope(ctx, http.MethodGet, "/api/v1/fs/ls", query, nil, &result)
+	if err != nil {
+		return nil, err
+	}
+	return &ListPage{Result: result, HasMore: env.HasMore}, nil
+}
+
+// Tree returns a directory tree.
+func (c *Client) Tree(ctx context.Context, uri string, opts *TreeOptions) ([]map[string]any, error) {
+	page, err := c.TreePage(ctx, uri, opts)
+	if err != nil {
+		return nil, err
+	}
+	return page.Result, nil
+}
+
+// TreePage returns a directory tree with pagination metadata.
+func (c *Client) TreePage(ctx context.Context, uri string, opts *TreeOptions) (*TreePage, error) {
+	if opts == nil {
+		opts = &TreeOptions{Output: "original", AbsLimit: 128, NodeLimit: 1000}
+	}
+	output := opts.Output
+	if output == "" {
+		output = "original"
+	}
+	absLimit := opts.AbsLimit
+	if absLimit == 0 {
+		absLimit = 128
+	}
+	overviewLimit := opts.OverviewLimit
+	if overviewLimit == 0 {
+		overviewLimit = 4000
+	}
+	nodeLimit := opts.NodeLimit
+	if nodeLimit == 0 {
+		nodeLimit = 1000
+	}
+	levelLimit := 3
+	if opts.LevelLimit != nil {
+		levelLimit = *opts.LevelLimit
+	}
+	query := url.Values{}
+	query.Set("uri", NormalizeURI(uri))
+	query.Set("output", output)
+	queryInt(query, "abs_limit", absLimit)
+	if opts.IncludeAbstract != nil {
+		queryBool(query, "include_abstract", *opts.IncludeAbstract)
+	}
+	if opts.IncludeOverview != nil {
+		queryBool(query, "include_overview", *opts.IncludeOverview)
+	}
+	queryInt(query, "overview_limit", overviewLimit)
+	queryBool(query, "show_all_hidden", opts.ShowAllHidden)
+	if opts.DirectoriesOnly {
+		query.Set("directories_only", "true")
+	}
+	queryInt(query, "node_limit", nodeLimit)
+	queryInt(query, "level_limit", levelLimit)
+	if opts.Offset != 0 {
+		queryInt(query, "offset", opts.Offset)
+	}
+	if opts.Limit != 0 {
+		queryInt(query, "limit", opts.Limit)
+	}
+	if opts.ExtraFields != nil {
+		query["extra_fields"] = opts.ExtraFields
+	}
+	if opts.Tags != nil {
+		query["tags"] = opts.Tags
+	}
+	if opts.IncludeTags {
+		query.Set("include_tags", "true")
+	}
+	var result []map[string]any
+	env, err := c.doJSONEnvelope(ctx, http.MethodGet, "/api/v1/fs/tree", query, nil, &result)
+	if err != nil {
+		return nil, err
+	}
+	return &TreePage{Result: result, HasMore: env.HasMore}, nil
+}
+
+// Stat returns metadata for a URI.
+func (c *Client) Stat(ctx context.Context, uri string) (map[string]any, error) {
+	query := url.Values{"uri": []string{NormalizeURI(uri)}}
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/fs/stat", query, nil, &result)
+	return result, err
+}
+
+// Attrs returns logical extended attributes for a URI.
+func (c *Client) Attrs(ctx context.Context, uri string) (map[string]any, error) {
+	query := url.Values{"uri": []string{NormalizeURI(uri)}}
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/fs/attrs", query, nil, &result)
+	return result, err
+}
+
+// Mkdir creates a directory.
+func (c *Client) Mkdir(ctx context.Context, uri string, description string, acl ...ACLSpec) error {
+	payload := map[string]any{"uri": NormalizeURI(uri)}
+	setString(payload, "description", description)
+	if len(acl) > 0 {
+		payload["acl"] = acl[0]
+	}
+	return c.doJSON(ctx, http.MethodPost, "/api/v1/fs/mkdir", nil, payload, nil)
+}
+
+// Remove deletes a URI.
+func (c *Client) Remove(ctx context.Context, uri string, opts *RemoveOptions) error {
+	if opts == nil {
+		opts = &RemoveOptions{}
+	}
+	query := url.Values{}
+	query.Set("uri", NormalizeURI(uri))
+	queryBool(query, "recursive", opts.Recursive)
+	queryBool(query, "wait", opts.Wait)
+	return c.doJSON(ctx, http.MethodDelete, "/api/v1/fs", query, nil, nil)
+}
+
+// Move moves a URI to another URI.
+func (c *Client) Move(ctx context.Context, fromURI, toURI string) error {
+	return c.doJSON(ctx, http.MethodPost, "/api/v1/fs/mv", nil, map[string]any{
+		"from_uri": NormalizeURI(fromURI),
+		"to_uri":   NormalizeURI(toURI),
+	}, nil)
+}
+
+// Read reads file content.
+func (c *Client) Read(ctx context.Context, uri string, offset int, limit int) (string, error) {
+	query := url.Values{}
+	query.Set("uri", NormalizeURI(uri))
+	queryInt(query, "offset", offset)
+	queryInt(query, "limit", limit)
+	var result string
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/content/read", query, nil, &result)
+	return result, err
+}
+
+// DownloadBytes downloads raw stored bytes.
+func (c *Client) DownloadBytes(ctx context.Context, uri string) ([]byte, error) {
+	query := url.Values{"uri": []string{NormalizeURI(uri)}}
+	req, err := c.newRequest(ctx, http.MethodGet, "/api/v1/content/download", query, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		env, decodeErr := decodeEnvelope(resp.StatusCode, data)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		if env.Error != nil {
+			return nil, apiError(resp.StatusCode, env.Error)
+		}
+		return nil, &Error{
+			Code:       "UNKNOWN",
+			Message:    envelopeDetail(env, resp.StatusCode, data),
+			StatusCode: resp.StatusCode,
+		}
+	}
+	return data, nil
+}
+
+// Abstract reads L0 abstract content.
+func (c *Client) Abstract(ctx context.Context, uri string) (string, error) {
+	query := url.Values{"uri": []string{NormalizeURI(uri)}}
+	var result string
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/content/abstract", query, nil, &result)
+	return result, err
+}
+
+// Overview reads L1 overview content.
+func (c *Client) Overview(ctx context.Context, uri string) (string, error) {
+	query := url.Values{"uri": []string{NormalizeURI(uri)}}
+	var result string
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/content/overview", query, nil, &result)
+	return result, err
+}
+
+// Write writes text content and refreshes related semantics/vectors.
+func (c *Client) Write(ctx context.Context, uri string, content string, opts *WriteOptions) (map[string]any, error) {
+	if opts == nil {
+		opts = &WriteOptions{}
+	}
+	mode := opts.Mode
+	if mode == "" {
+		mode = "replace"
+	}
+	payload := map[string]any{
+		"uri":     NormalizeURI(uri),
+		"content": content,
+		"mode":    mode,
+		"wait":    opts.Wait,
+	}
+	setAny(payload, "telemetry", opts.Telemetry)
+	setString(payload, "processing_mode", opts.ProcessingMode)
+	if opts.ACL != nil {
+		payload["acl"] = opts.ACL
+	}
+	if opts.Tags != nil || opts.TagMode == "clear" {
+		if opts.Tags != nil {
+			payload["tags"] = opts.Tags
+		}
+		tagMode := opts.TagMode
+		if tagMode == "" {
+			tagMode = "replace"
+		}
+		payload["tag_mode"] = tagMode
+	}
+	if err := mergeExtra(payload, opts.Extra); err != nil {
+		return nil, err
+	}
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/content/write", nil, payload, &result)
+	return result, err
+}
+
+// BatchWrite applies file writes in one request and refreshes their indexes once.
+func (c *Client) BatchWrite(
+	ctx context.Context,
+	rootURI string,
+	operations []BatchWriteOperation,
+	opts *BatchWriteOptions,
+) (map[string]any, error) {
+	normalized := make([]BatchWriteOperation, len(operations))
+	copy(normalized, operations)
+	for i := range normalized {
+		normalized[i].URI = NormalizeURI(normalized[i].URI)
+	}
+	payload := map[string]any{
+		"root_uri":   NormalizeURI(rootURI),
+		"operations": normalized,
+	}
+	if opts != nil {
+		if opts.Wait != nil {
+			payload["wait"] = *opts.Wait
+		}
+		setAny(payload, "defer_processing", opts.DeferProcessing)
+		setAny(payload, "telemetry", opts.Telemetry)
+		setString(payload, "processing_mode", opts.ProcessingMode)
+		if err := mergeExtraProtected(payload, opts.Extra, "wait"); err != nil {
+			return nil, err
+		}
+	}
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/content/batch-write", nil, payload, &result)
+	return result, err
+}
+
+// EnsureDirectoryIndex preserves summaries and uses fallbackAbstract only when both are absent.
+// Return readable levels, or queued task metadata when Wait is false.
+func (c *Client) EnsureDirectoryIndex(
+	ctx context.Context,
+	uri string,
+	fallbackAbstract string,
+	opts *EnsureDirectoryIndexOptions,
+) (map[string]any, error) {
+	payload := map[string]any{
+		"uri":               NormalizeURI(uri),
+		"fallback_abstract": fallbackAbstract,
+		"wait":              true,
+	}
+	if opts != nil {
+		payload["wait"] = boolValue(opts.Wait, true)
+		setAny(payload, "telemetry", opts.Telemetry)
+	}
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/content/ensure_directory_index", nil, payload, &result)
+	return result, err
+}
+
+// SetTags sets explicit k=v retrieval tags metadata for a file or directory.
+// Valid modes are "replace" (default), "append", and "clear". An empty
+// replace request is a no-op; clear removes existing tags. Recursive applies
+// the update to every file under a directory URI.
+func (c *Client) SetTags(ctx context.Context, uri string, tags []string, opts *SetTagsOptions) (map[string]any, error) {
+	if opts == nil {
+		opts = &SetTagsOptions{Mode: "replace"}
+	}
+	mode := opts.Mode
+	if mode == "" {
+		mode = "replace"
+	}
+	// Normalize nil to an empty list. The server treats replace + [] as a no-op
+	// and clear as the explicit request to remove existing tags.
+	if tags == nil {
+		tags = []string{}
+	}
+	payload := map[string]any{
+		"uri":       NormalizeURI(uri),
+		"tags":      tags,
+		"mode":      mode,
+		"recursive": opts.Recursive,
+	}
+	setAny(payload, "telemetry", opts.Telemetry)
+	if err := mergeExtraProtected(payload, opts.Extra, "uri", "tags", "mode", "recursive", "telemetry"); err != nil {
+		return nil, err
+	}
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/fs/attrs/set_tags", nil, payload, &result)
+	return result, err
+}
+
+// Reindex triggers reindexing for a URI.
+func (c *Client) Reindex(ctx context.Context, uri string, opts *ReindexOptions) (map[string]any, error) {
+	if opts == nil {
+		opts = &ReindexOptions{Mode: "vectors_only", Wait: true}
+	}
+	mode := opts.Mode
+	if mode == "" {
+		mode = "vectors_only"
+	}
+	payload := map[string]any{
+		"uri":       NormalizeURI(uri),
+		"mode":      mode,
+		"wait":      opts.Wait,
+		"recursive": boolValue(opts.Recursive, true),
+	}
+	if opts.Force {
+		payload["force"] = true
+	}
+	if opts.Tags != nil || opts.TagMode == "clear" {
+		if opts.Tags != nil {
+			payload["tags"] = opts.Tags
+		}
+		tagMode := opts.TagMode
+		if tagMode == "" {
+			tagMode = "replace"
+		}
+		payload["tag_mode"] = tagMode
+	}
+	if err := mergeExtraProtected(payload, opts.Extra, "force", "tags", "tag_mode"); err != nil {
+		return nil, err
+	}
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/content/reindex", nil, payload, &result)
+	return result, err
+}

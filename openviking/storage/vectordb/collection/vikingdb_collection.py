@@ -3,13 +3,14 @@
 import json
 from typing import Any, Dict, List, Optional
 
+from openviking.storage.errors import VikingDBException
 from openviking.storage.vectordb.collection.collection import ICollection
 from openviking.storage.vectordb.collection.result import (
     AggregateResult,
     DataItem,
     FetchDataInCollectionResult,
-    SearchItemResult,
     SearchResult,
+    parse_remote_search_result,
 )
 from openviking.storage.vectordb.collection.vikingdb_clients import (
     VIKINGDB_APIS,
@@ -21,6 +22,9 @@ from openviking_cli.utils.logger import default_logger as logger
 class VikingDBCollection(ICollection):
     """
     VikingDB collection implementation for private deployment.
+
+    Data-plane operations in this class target the VikingDB V2 API surface
+    under /api/vikingdb/data/*.
     """
 
     def __init__(
@@ -34,6 +38,39 @@ class VikingDBCollection(ICollection):
         self.meta_data = meta_data if meta_data is not None else {}
         self.project_name = self.meta_data.get("ProjectName", "default")
         self.collection_name = self.meta_data.get("CollectionName", "")
+
+    @staticmethod
+    def _build_response_error(response: Any, action: str) -> VikingDBException:
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            result = {}
+
+        if isinstance(result, dict):
+            code = result.get("code")
+            message = (
+                result.get("message") or result.get("msg") or result.get("error") or response.text
+            )
+        else:
+            code = None
+            message = response.text
+
+        status_code = response.status_code
+        error_type = (
+            "http_client_error"
+            if 400 <= status_code < 500
+            else "http_server_error"
+            if status_code >= 500
+            else "http_error"
+        )
+        return VikingDBException(
+            f"Request to {action} failed: {status_code} {message}",
+            status_code=status_code,
+            code=str(code) if code is not None else None,
+            error_type=error_type,
+            retryable=status_code == 429 or status_code >= 500,
+            action=action,
+        )
 
     def _console_post(self, data: Dict[str, Any], action: str):
         path, method = VIKINGDB_APIS[action]
@@ -49,7 +86,13 @@ class VikingDBCollection(ICollection):
         except json.JSONDecodeError:
             return {}
 
-    def _console_get(self, params: Optional[Dict[str, Any]], action: str):
+    def _console_get(
+        self,
+        params: Optional[Dict[str, Any]],
+        action: str,
+        *,
+        raise_on_error: bool = False,
+    ):
         if params is None:
             params = {}
         path, method = VIKINGDB_APIS[action]
@@ -57,34 +100,38 @@ class VikingDBCollection(ICollection):
         response = self.client.do_req(method, path=path, req_body=params)
 
         if response.status_code != 200:
+            if raise_on_error:
+                raise self._build_response_error(response, action)
             logger.error(f"Request to {action} failed: {response.text}")
             return {}
         try:
             result = response.json()
             return result.get("Result", {})
         except json.JSONDecodeError:
+            if raise_on_error:
+                raise self._build_response_error(response, action)
             return {}
 
     def _data_post(self, path: str, data: Dict[str, Any]):
         response = self.client.do_req("POST", path, req_body=data)
         if response.status_code != 200:
-            logger.error(f"Request to {path} failed: {response.text}")
-            return {}
+            raise self._build_response_error(response, path)
         try:
             result = response.json()
             return result.get("result", {})
         except json.JSONDecodeError:
+            logger.warning("Invalid JSON response from %s", path)
             return {}
 
     def _data_get(self, path: str, params: Dict[str, Any]):
         response = self.client.do_req("GET", path, req_params=params)
         if response.status_code != 200:
-            logger.error(f"Request to {path} failed: {response.text}")
-            return {}
+            raise self._build_response_error(response, path)
         try:
             result = response.json()
             return result.get("result", {})
         except json.JSONDecodeError:
+            logger.warning("Invalid JSON response from %s", path)
             return {}
 
     def update(self, fields: Optional[Dict[str, Any]] = None, description: Optional[str] = None):
@@ -99,12 +146,16 @@ class VikingDBCollection(ICollection):
 
         return self._console_post(data, action="UpdateVikingdbCollection")
 
-    def get_meta_data(self):
+    def get_meta_data(self, *, raise_on_error: bool = False):
         params = {
             "ProjectName": self.project_name,
             "CollectionName": self.collection_name,
         }
-        return self._console_get(params, action="GetVikingdbCollection")
+        return self._console_get(
+            params,
+            action="GetVikingdbCollection",
+            raise_on_error=raise_on_error,
+        )
 
     def close(self):
         pass
@@ -132,7 +183,7 @@ class VikingDBCollection(ICollection):
     def update_index(
         self,
         index_name: str,
-        scalar_index: Optional[Dict[str, Any]] = None,
+        scalar_index: Optional[List[str]] = None,
         description: Optional[str] = None,
     ):
         raise NotImplementedError("index should be managed manually")
@@ -155,6 +206,17 @@ class VikingDBCollection(ICollection):
             "collection_name": self.collection_name,
             "data": data_list,
             "ttl": ttl,
+            "ignore_unknown_fields": True,
+        }
+        return self._data_post(path, data)
+
+    def update_data(self, data_list: List[Dict[str, Any]]):
+        path = "/api/vikingdb/data/update"
+        data = {
+            "project": self.project_name,
+            "collection_name": self.collection_name,
+            "data": data_list,
+            "ignore_unknown_fields": True,
         }
         return self._data_post(path, data)
 
@@ -164,6 +226,7 @@ class VikingDBCollection(ICollection):
             "project": self.project_name,
             "collection_name": self.collection_name,
             "ids": primary_keys,
+            "ignore_unknown_fields": True,
         }
         resp_data = self._data_post(path, data)
         return self._parse_fetch_result(resp_data)
@@ -203,18 +266,7 @@ class VikingDBCollection(ICollection):
         return result
 
     def _parse_search_result(self, data: Dict[str, Any]) -> SearchResult:
-        result = SearchResult()
-        if isinstance(data, dict) and "data" in data:
-            data_list = data.get("data", [])
-            result.data = [
-                SearchItemResult(
-                    id=item.get("id"),
-                    fields=item.get("fields"),
-                    score=item.get("score"),
-                )
-                for item in data_list
-            ]
-        return result
+        return parse_remote_search_result(data)
 
     def search_by_vector(
         self,
@@ -225,6 +277,8 @@ class VikingDBCollection(ICollection):
         filters: Optional[Dict[str, Any]] = None,
         sparse_vector: Optional[Dict[str, float]] = None,
         output_fields: Optional[List[str]] = None,
+        advance: Optional[Dict[str, Any]] = None,
+        return_detail_info: bool = False,
     ) -> SearchResult:
         path = "/api/vikingdb/data/search/vector"
         data = {
@@ -236,9 +290,14 @@ class VikingDBCollection(ICollection):
             "output_fields": output_fields,
             "limit": limit,
             "offset": offset,
+            "ignore_unknown_fields": True,
         }
         if sparse_vector:
             data["sparse_vector"] = sparse_vector
+        if advance is not None:
+            data["advance"] = advance
+        if return_detail_info:
+            data["return_detail_info"] = True
         resp_data = self._data_post(path, data)
         return self._parse_search_result(resp_data)
 
@@ -261,6 +320,7 @@ class VikingDBCollection(ICollection):
             "output_fields": output_fields,
             "limit": limit,
             "offset": offset,
+            "ignore_unknown_fields": True,
         }
         resp_data = self._data_post(path, data)
         return self._parse_search_result(resp_data)
@@ -288,6 +348,7 @@ class VikingDBCollection(ICollection):
             "output_fields": output_fields,
             "limit": limit,
             "offset": offset,
+            "ignore_unknown_fields": True,
         }
         resp_data = self._data_post(path, data)
         return self._parse_search_result(resp_data)
@@ -299,6 +360,7 @@ class VikingDBCollection(ICollection):
         offset: int = 0,
         filters: Optional[Dict[str, Any]] = None,
         output_fields: Optional[List[str]] = None,
+        advance: Optional[Dict[str, Any]] = None,
     ) -> SearchResult:
         path = "/api/vikingdb/data/search/random"
         data = {
@@ -309,7 +371,10 @@ class VikingDBCollection(ICollection):
             "output_fields": output_fields,
             "limit": limit,
             "offset": offset,
+            "ignore_unknown_fields": True,
         }
+        if advance is not None:
+            data["advance"] = advance
         resp_data = self._data_post(path, data)
         return self._parse_search_result(resp_data)
 
@@ -322,6 +387,8 @@ class VikingDBCollection(ICollection):
         offset: int = 0,
         filters: Optional[Dict[str, Any]] = None,
         output_fields: Optional[List[str]] = None,
+        mode: Optional[str] = None,
+        fields: Optional[List[str]] = None,
     ) -> SearchResult:
         path = "/api/vikingdb/data/search/keywords"
         data = {
@@ -330,11 +397,15 @@ class VikingDBCollection(ICollection):
             "index_name": index_name,
             "keywords": keywords,
             "query": query,
+            "mode": mode,
+            "fields": fields,
             "filter": filters,
             "output_fields": output_fields,
             "limit": limit,
             "offset": offset,
+            "ignore_unknown_fields": True,
         }
+        data = {k: v for k, v in data.items() if v is not None}
         resp_data = self._data_post(path, data)
         return self._parse_search_result(resp_data)
 
@@ -359,6 +430,7 @@ class VikingDBCollection(ICollection):
             "output_fields": output_fields,
             "limit": limit,
             "offset": offset,
+            "ignore_unknown_fields": True,
         }
         resp_data = self._data_post(path, data)
         return self._parse_search_result(resp_data)

@@ -1,20 +1,48 @@
-# 系统与监控
+# 系统状态
 
-OpenViking 提供系统健康检查、可观测性和调试 API，用于监控各组件状态。
+OpenViking 系统 API 提供健康检查、就绪检查、一致性检查和后台处理状态。
+组件级观测和 Prometheus 指标分别提供独立文档。
 
 ## API 参考
 
-### health()
+### health
 
-基础健康检查端点。无需认证。
+#### 1. API 实现介绍
 
-**Python SDK (Embedded / HTTP)**
+基础存活检查，无需认证。返回版本号、健康状态和认证模式。提供凭据后会尝试解析身份，成功时补充身份字段；凭据无效时返回认证错误。
 
-```python
-# 检查系统是否健康
-if client.observer.is_healthy():
-    print("System OK")
-```
+Trusted 模式下，完整的 `X-OpenViking-Account` 和 `X-OpenViking-User` 请求头会触发身份解析，
+必须携带匹配的 root API key，localhost 也不例外。Trusted 模式的 `root_api_key_required`
+始终为 `true`，解析得到的 `role` 表示调用者权限。匿名健康探测返回基础存活信息，不包含身份字段。
+
+**代码入口**:
+- `openviking/server/routers/system.py:health_check` - HTTP 路由
+- `sdk/python/openviking_sdk/client.py:SyncHTTPClient.health` - SDK 入口
+- `crates/ov_cli/src/commands/system.rs` - CLI 命令
+
+#### 2. 接口和参数说明
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| profile | string | 否 | - | 传 `1`、`true`、`yes` 或 `on` 时，为本次请求开启 `cProfile`，并在 JSON 响应里追加 `profile` 字段 |
+
+**profile 行为说明**:
+- `profile` 是 HTTP middleware 级能力，对任意返回 JSON 的 OpenViking 接口都生效，不限于 `/health`。
+- 仅当服务端在 `ov.conf` 中开启 `server.profile_enabled = true` 时，请求里的 `profile=1` 才会生效；否则服务端会忽略该参数。
+- `profile` 仅对当前请求生效，请求结束后自动关闭；后续请求默认不会继承这次 profile 状态。
+- 仅 JSON 响应会追加 `profile` 字段；纯文本、文件、流式响应不会被改写。
+- `profile` 的返回值是 `list[string]`，每个元素对应一行格式化后的 `pstats` 输出，便于浏览器直接查看和前端按行渲染。
+- `ov` CLI 会显示返回的 `profile`；Python HTTP client 可以通过 `ovcli.conf.profile = true` 触发服务端 profile，但大多数 SDK 方法默认只返回业务 `result`，不会把顶层 `profile` 一并暴露给调用方。
+
+**profile 表头字段说明**:
+- `ncalls`: 调用次数。若显示为 `总调用次数/原始调用次数`，前者是总调用数，后者是 primitive calls。
+- `tottime`: 函数自身耗时，总时间，不包含其调用的子函数耗时。
+- `percall`（第一列）: `tottime / ncalls`，即函数自身平均每次调用耗时。
+- `cumtime`: 累计耗时，包含当前函数及其所有子调用耗时。
+- `percall`（第二列）: `cumtime / primitive calls`，即按原始调用计算的平均累计耗时。
+- `filename:lineno(function)`: 函数定义位置。普通 Python 代码会显示为裁剪后的模块路径；`~:0(...)` 这类条目通常表示 builtin 或 C 扩展调用。
+
+#### 3. 使用示例
 
 **HTTP API**
 
@@ -26,31 +54,147 @@ GET /health
 curl -X GET http://localhost:1933/health
 ```
 
+```bash
+curl -G http://localhost:1933/health \
+  --data-urlencode "profile=1"
+```
+
+**Python SDK**
+
+```python
+import openviking_sdk as ov
+
+client = ov.SyncHTTPClient(url="http://localhost:1933")
+client.initialize()
+
+healthy = client.health()
+print(f"Healthy: {healthy}")
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.health());
+```
+
+**Go SDK**
+
+```go
+healthy, err := client.Health(ctx)
+if err != nil {
+    return err
+}
+fmt.Println(healthy)
+```
+
 **CLI**
 
 ```bash
-openviking health
+ov system health
 ```
 
-**响应**
+```bash
+ov --profile health
+```
+
+**响应示例**
 
 ```json
 {
-  "status": "ok"
+  "status": "ok",
+  "healthy": true,
+  "version": "0.1.x",
+  "auth_mode": "api_key"
+}
+```
+
+**带 profile 的响应示例**
+
+```json
+{
+  "status": "ok",
+  "healthy": true,
+  "version": "0.1.x",
+  "profile": [
+    "         325 function calls (310 primitive calls) in 0.004 seconds",
+    "",
+    "   Ordered by: cumulative time",
+    "   List reduced from 87 to 87 due to restriction <100>",
+    "",
+    "   ncalls  tottime  percall  cumtime  percall filename:lineno(function)",
+    "        1    0.000    0.000    0.003    0.003 starlette/middleware/base.py:112(call_next)",
+    "        1    0.000    0.000    0.001    0.001 openviking/server/routers/system.py:39(health_check)",
+    "        3    0.000    0.000    0.000    0.000 ~:0(<method 'read' of 'builtins.RAGFSBindingClient' objects>)"
+  ]
 }
 ```
 
 ---
 
-### status()
+### ready
 
-获取系统状态，包括初始化状态和用户信息。
+#### 1. API 实现介绍
 
-**Python SDK (Embedded / HTTP)**
+部署环境使用的就绪探针。检查 AGFS、VectorDB、APIKeyManager、Embedding 和 Ollama（如配置）的状态。当所有配置的子系统都准备完成时返回 200，否则返回 503。无需认证（专为 Kubernetes 探针设计）。
 
-```python
-print(client.observer.system())
+**代码入口**:
+- `openviking/server/routers/system.py:readiness_check` - HTTP 路由
+
+#### 2. 接口和参数说明
+
+无参数。
+
+**检查项说明**:
+- `agfs`: 包含文件系统访问和主备同步状态的嵌套检查结果
+- `vectordb`: 向量数据库是否健康
+- `api_key_manager`: API 密钥管理器是否已加载
+- `embedding`: 启动时 Embedding provider 是否已初始化；不发起模型请求
+- `ollama`: Ollama 服务是否可达（仅当配置时）
+
+#### 3. 使用示例
+
+**HTTP API**
+
 ```
+GET /ready
+```
+
+```bash
+curl -X GET http://localhost:1933/ready
+```
+
+**响应示例**
+
+```json
+{
+  "status": "ready",
+  "checks": {
+    "agfs": {"status": "ok", "checks": {"filesystem": "ok", "multiwrite_sync": "not_supported"}},
+    "vectordb": "ok",
+    "api_key_manager": "ok",
+    "embedding": "ok",
+    "ollama": "not_configured"
+  }
+}
+```
+
+---
+
+### status
+
+#### 1. API 实现介绍
+
+获取系统状态，包括初始化状态和当前认证用户信息。`result.user` 是认证请求的 `user_id`（来自 API 密钥或请求头），而非进程级服务默认值，客户端可用于解析多租户路径。
+
+**代码入口**:
+- `openviking/server/routers/system.py:system_status` - HTTP 路由
+- `crates/ov_cli/src/commands/system.rs` - CLI 命令
+
+#### 2. 接口和参数说明
+
+无参数。
+
+#### 3. 使用示例
 
 **HTTP API**
 
@@ -63,13 +207,15 @@ curl -X GET http://localhost:1933/api/v1/system/status \
   -H "X-API-Key: your-key"
 ```
 
+公开 SDK 的 `get_status()` / `getStatus()` / `GetStatus()` 返回 Observer 汇总状态，不是本接口的身份信息。访问本接口使用 HTTP；这些 SDK 方法见[运行观测](18-observer.md)。
+
 **CLI**
 
 ```bash
-openviking status
+ov system status
 ```
 
-**响应**
+**响应示例**
 
 ```json
 {
@@ -77,33 +223,119 @@ openviking status
   "result": {
     "initialized": true,
     "user": "alice"
-  },
-  "time": 0.1
+  }
 }
 ```
 
 ---
 
-### wait_processed()
+### consistency
 
-等待所有异步处理（embedding、语义生成）完成。
+#### 1. API 实现介绍
 
-**参数**
+检查指定 URI 子树的文件系统内容和向量索引是否一致，用于调试索引缺失、向量快照导出失败等问题。该能力是通用数据一致性检查，不属于 OVPack 私有接口；`ov export --include-vectors` 和 `ov backup --include-vectors` 会复用同一检查。
+
+响应只返回摘要和缺失项，不返回完整 expected 列表。`missing_records` 最多返回前 20 条；如果还有更多缺失项，`missing_records_truncated` 为 `true`。
+
+**代码入口**:
+- `openviking/server/routers/system.py:check_consistency` - HTTP 路由
+- `sdk/python/openviking_sdk/client.py:SyncHTTPClient.check_consistency` - SDK 入口
+- `crates/ov_cli/src/commands/system.rs:consistency` - CLI 命令
+
+#### 2. 接口和参数说明
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| timeout | float | 否 | None | 超时时间（秒） |
+| uri | string | 是 | - | 要检查的 Viking URI 子树 |
 
-**Python SDK (Embedded / HTTP)**
+#### 3. 使用示例
+
+**HTTP API**
+
+```
+POST /api/v1/system/consistency
+Content-Type: application/json
+```
+
+```bash
+curl -X POST http://localhost:1933/api/v1/system/consistency \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{"uri":"viking://resources/my-project"}'
+```
+
+**Python SDK**
 
 ```python
-# 添加资源
-client.add_resource("./docs/")
-
-# 等待所有处理完成
-status = client.wait_processed()
-print(f"Processing complete: {status}")
+report = client.check_consistency(uri="viking://resources/my-project")
+print(report["ok"])
+print(report["missing_records"])
 ```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.checkConsistency("viking://resources/"));
+```
+
+**Go SDK**
+
+```go
+report, err := client.CheckConsistency(ctx, "viking://resources/my-project")
+if err != nil {
+    return err
+}
+fmt.Println(report["ok"])
+```
+
+**CLI**
+
+```bash
+ov system consistency viking://resources/my-project
+```
+
+**响应示例**
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "ok": false,
+    "expected_count": 3,
+    "missing_record_count": 1,
+    "missing_records_truncated": false,
+    "missing_records": [
+      {
+        "uri": "viking://resources/my-project/README.md",
+        "path": "README.md",
+        "level": 2,
+        "key": "README.md#level=2"
+      }
+    ]
+  }
+}
+```
+
+---
+
+### wait_processed
+
+#### 1. API 实现介绍
+
+等待处理队列排空。该检查不限定为调用方刚提交的请求，也不覆盖所有异步 API。需检查返回的 `error_count` 和 `errors`，队列排空不代表所有操作成功。确认某次导入或 commit 的结果，应查询它的[任务 ID](17-tasks.md)。
+
+**代码入口**:
+- `openviking/server/routers/system.py:wait_processed` - HTTP 路由
+- `sdk/python/openviking_sdk/client.py:SyncHTTPClient.wait_processed` - SDK 入口
+- `crates/ov_cli/src/commands/system.rs` - CLI 命令
+
+#### 2. 接口和参数说明
+
+**参数**
+
+无必填参数。可选 JSON 请求体仍接受旧版 `timeout` 字段，但该字段已废弃，传入值会被忽略。不传请求体仍可调用。HTTP 请求超时使用客户端配置。
+
+#### 3. 使用示例
 
 **HTTP API**
 
@@ -114,329 +346,69 @@ POST /api/v1/system/wait
 ```bash
 curl -X POST http://localhost:1933/api/v1/system/wait \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key" \
-  -d '{
-    "timeout": 60.0
-  }'
-```
-
-**CLI**
-
-```bash
-openviking wait [--timeout 60]
-```
-
-**响应**
-
-```json
-{
-  "status": "ok",
-  "result": {
-    "pending": 0,
-    "in_progress": 0,
-    "processed": 20,
-    "errors": 0
-  },
-  "time": 0.1
-}
-```
-
----
-
-## Observer API
-
-Observer API 提供详细的组件级监控。
-
-### observer.queue
-
-获取队列系统状态（embedding 和语义处理队列）。
-
-**Python SDK (Embedded / HTTP)**
-
-```python
-print(client.observer.queue)
-# Output:
-# [queue] (healthy)
-# Queue                 Pending  In Progress  Processed  Errors  Total
-# Embedding             0        0            10         0       10
-# Semantic              0        0            10         0       10
-# TOTAL                 0        0            20         0       20
-```
-
-**HTTP API**
-
-```
-GET /api/v1/observer/queue
-```
-
-```bash
-curl -X GET http://localhost:1933/api/v1/observer/queue \
   -H "X-API-Key: your-key"
 ```
 
-**CLI**
-
-```bash
-openviking observer queue
-```
-
-**响应**
-
-```json
-{
-  "status": "ok",
-  "result": {
-    "name": "queue",
-    "is_healthy": true,
-    "has_errors": false,
-    "status": "Queue  Pending  In Progress  Processed  Errors  Total\nEmbedding  0  0  10  0  10\nSemantic  0  0  10  0  10\nTOTAL  0  0  20  0  20"
-  },
-  "time": 0.1
-}
-```
-
----
-
-### observer.vikingdb
-
-获取 VikingDB 状态（集合、索引、向量数量）。
-
-**Python SDK (Embedded / HTTP)**
+**Python SDK**
 
 ```python
-print(client.observer.vikingdb())
-# Output:
-# [vikingdb] (healthy)
-# Collection  Index Count  Vector Count  Status
-# context     1            55            OK
-# TOTAL       1            55
-
-# 访问特定属性
-print(client.observer.vikingdb().is_healthy)  # True
-print(client.observer.vikingdb().status)      # Status table string
+# 等待当前处理队列排空
+status = client.wait_processed()
+print(status)  # 检查各队列的 error_count 和 errors
 ```
 
-**HTTP API**
+**TypeScript SDK**
 
-```
-GET /api/v1/observer/vikingdb
-```
-
-```bash
-curl -X GET http://localhost:1933/api/v1/observer/vikingdb \
-  -H "X-API-Key: your-key"
+```typescript
+console.log(await client.waitProcessed());
 ```
 
-**CLI**
+**Go SDK**
 
-```bash
-openviking observer vikingdb
-```
-
-**响应**
-
-```json
-{
-  "status": "ok",
-  "result": {
-    "name": "vikingdb",
-    "is_healthy": true,
-    "has_errors": false,
-    "status": "Collection  Index Count  Vector Count  Status\ncontext  1  55  OK\nTOTAL  1  55"
-  },
-  "time": 0.1
+```go
+status, err := client.WaitProcessed(ctx)
+if err != nil {
+    return err
 }
-```
-
----
-
-### observer.vlm
-
-获取 VLM（视觉语言模型）token 使用状态。
-
-**Python SDK (Embedded / HTTP)**
-
-```python
-print(client.observer.vlm)
-# Output:
-# [vlm] (healthy)
-# Model                          Provider      Prompt  Completion  Total  Last Updated
-# doubao-1-5-vision-pro-32k      volcengine    1000    500         1500   2024-01-01 12:00:00
-# TOTAL                                        1000    500         1500
-```
-
-**HTTP API**
-
-```
-GET /api/v1/observer/vlm
-```
-
-```bash
-curl -X GET http://localhost:1933/api/v1/observer/vlm \
-  -H "X-API-Key: your-key"
+fmt.Println(status)
 ```
 
 **CLI**
 
 ```bash
-openviking observer vlm
+ov system wait
 ```
 
-**响应**
+**响应示例**
 
 ```json
 {
   "status": "ok",
   "result": {
-    "name": "vlm",
-    "is_healthy": true,
-    "has_errors": false,
-    "status": "Model  Provider  Prompt  Completion  Total  Last Updated\ndoubao-1-5-vision-pro-32k  volcengine  1000  500  1500  2024-01-01 12:00:00\nTOTAL  1000  500  1500"
-  },
-  "time": 0.1
-}
-```
-
----
-
-### observer.system
-
-获取整体系统状态，包括所有组件。
-
-**Python SDK (Embedded / HTTP)**
-
-```python
-print(client.observer.system())
-# Output:
-# [queue] (healthy)
-# ...
-#
-# [vikingdb] (healthy)
-# ...
-#
-# [vlm] (healthy)
-# ...
-#
-# [system] (healthy)
-```
-
-**HTTP API**
-
-```
-GET /api/v1/observer/system
-```
-
-```bash
-curl -X GET http://localhost:1933/api/v1/observer/system \
-  -H "X-API-Key: your-key"
-```
-
-**CLI**
-
-```bash
-openviking observer system
-```
-
-**响应**
-
-```json
-{
-  "status": "ok",
-  "result": {
-    "is_healthy": true,
-    "errors": [],
-    "components": {
-      "queue": {
-        "name": "queue",
-        "is_healthy": true,
-        "has_errors": false,
-        "status": "..."
-      },
-      "vikingdb": {
-        "name": "vikingdb",
-        "is_healthy": true,
-        "has_errors": false,
-        "status": "..."
-      },
-      "vlm": {
-        "name": "vlm",
-        "is_healthy": true,
-        "has_errors": false,
-        "status": "..."
-      }
+    "Embedding": {
+      "processed": 10,
+      "requeue_count": 0,
+      "error_count": 0,
+      "errors": []
+    },
+    "Semantic": {
+      "processed": 10,
+      "requeue_count": 0,
+      "error_count": 0,
+      "errors": []
     }
-  },
-  "time": 0.1
+  }
 }
 ```
 
 ---
 
-### is_healthy()
-
-快速检查整个系统的健康状态。
-
-**Python SDK (Embedded / HTTP)**
-
-```python
-if client.observer.is_healthy():
-    print("System OK")
-else:
-    print(client.observer.system())
-```
-
-**HTTP API**
-
-```
-GET /api/v1/debug/health
-```
-
-```bash
-curl -X GET http://localhost:1933/api/v1/debug/health \
-  -H "X-API-Key: your-key"
-```
-
-**响应**
-
-```json
-{
-  "status": "ok",
-  "result": {
-    "healthy": true
-  },
-  "time": 0.1
-}
-```
-
----
-
-## 数据结构
-
-### ComponentStatus
-
-单个组件的状态信息。
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| name | str | 组件名称 |
-| is_healthy | bool | 组件是否健康 |
-| has_errors | bool | 组件是否存在错误 |
-| status | str | 状态表格字符串 |
-
-### SystemStatus
-
-整体系统状态，包括所有组件。
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| is_healthy | bool | 整个系统是否健康 |
-| components | Dict[str, ComponentStatus] | 各组件的状态 |
-| errors | List[str] | 错误信息列表 |
-
----
+<a id="reindex"></a><a id="observer-api"></a>
 
 ## 相关文档
 
 - [Resources](02-resources.md) - 资源管理
 - [Retrieval](06-retrieval.md) - 搜索与检索
 - [Sessions](05-sessions.md) - 会话管理
+- [运行观测](18-observer.md) - 组件即时状态
+- [Metrics](09-metrics.md) - Prometheus 指标

@@ -10,30 +10,51 @@ similar to how init_viking_fs encapsulates VikingFS initialization.
 import asyncio
 import hashlib
 import json
+import logging
 import threading
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from openviking.models.embedder.base import EmbedResult, embed_compat
+from openviking.core.context import ContextType, ResourceContentType
+from openviking.models.embedder.base import embed_compat
+from openviking.models.model_error import ModelErrorKind, model_error_kind
 from openviking.server.identity import RequestContext, Role
-from openviking.storage.errors import CollectionNotFoundError
-from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
-from openviking.storage.queuefs.named_queue import DequeueHandlerBase
-from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
-from openviking.telemetry import bind_telemetry, resolve_telemetry
-from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
-from openviking.utils.circuit_breaker import (
-    CircuitBreaker,
-    CircuitBreakerOpen,
-    classify_api_error,
+from openviking.service.task_tracker_concurrency import run_to_completion
+from openviking.storage.acl import ACL_GRANT_FIELDS, ACL_MODE_FIELD, AclMode
+from openviking.storage.errors import (
+    CollectionNotFoundError,
+    EmbeddingConfigurationError,
+    EmbeddingRebuildRequiredError,
 )
+from openviking.storage.index_action import FieldPatch, IndexAction
+from openviking.storage.queuefs.embedding_msg import (
+    EmbeddingMsg,
+    IncompleteInitialRecordError,
+    missing_initial_record_fields,
+)
+from openviking.storage.queuefs.named_queue import DequeueHandlerBase
+from openviking.storage.queuefs.process_result import ProcessResult
+from openviking.storage.vector_ids import vector_record_id
+from openviking.storage.viking_vector_index_backend import (
+    VIKINGDB_CONTENT_MAX_SIZE,
+    VikingVectorIndexBackend,
+    normalize_upsert_options,
+)
+from openviking.telemetry import bind_ingestion_source_type, bind_telemetry, resolve_telemetry
+from openviking.utils.circuit_breaker import CircuitBreakerOpen
+from openviking.utils.log_correlation import log_correlation
+from openviking.utils.tags import merge_search_tags
+from openviking.utils.time_utils import get_current_timestamp
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config.open_viking_config import OpenVikingConfig
 
 logger = get_logger(__name__)
+EMBEDDING_META_MARKER = "\n\n[openviking.embedding]\n"
+
+_EMBEDDING_COMPATIBILITY_KEYS = ("provider", "model", "dimension", "model_identity")
 
 
 @dataclass
@@ -49,7 +70,9 @@ class CollectionSchemas:
     """
 
     @staticmethod
-    def context_collection(name: str, vector_dim: int) -> Dict[str, Any]:
+    def context_collection(
+        name: str, vector_dim: int, description: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
         Get the schema for the unified context collection.
 
@@ -69,7 +92,7 @@ class CollectionSchemas:
             # context_type 字段：区分上下文的大类
             # 枚举值："resource"（资源，默认）, "memory"（记忆）, "skill"（技能）
             # 推导规则：
-            #   - URI 以 viking://agent/skills 开头 → "skill"
+            #   - URI 位于 user skills 目录下 → "skill"
             #   - URI 包含 "memories" → "memory"
             #   - 其他情况 → "resource"
             {"FieldName": "context_type", "FieldType": "string"},
@@ -94,9 +117,29 @@ class CollectionSchemas:
                 {"FieldName": "name", "FieldType": "string"},
                 {"FieldName": "description", "FieldType": "string"},
                 {"FieldName": "tags", "FieldType": "string"},
+                {"FieldName": "search_tags", "FieldType": "list<string>"},
                 {"FieldName": "abstract", "FieldType": "string"},
+                {"FieldName": "content", "FieldType": "text"},
+                # md5 of the final stored file bytes for this record's URI. Used by
+                # incremental diff to skip re-processing unchanged files. Older
+                # records may lack it; callers must treat missing/empty as "unknown"
+                # and fall back to reading file bytes.
+                {"FieldName": "md5", "FieldType": "string", "DefaultValue": ""},
                 {"FieldName": "account_id", "FieldType": "string"},
-                {"FieldName": "owner_space", "FieldType": "string"},
+                {"FieldName": "owner_user_id", "FieldType": "string"},
+                {
+                    "FieldName": ACL_MODE_FIELD,
+                    "FieldType": "string",
+                    "DefaultValue": AclMode.NONE.value,
+                },
+                *[
+                    {
+                        "FieldName": field,
+                        "FieldType": "list<string>",
+                        "DefaultValue": [],
+                    }
+                    for field in ACL_GRANT_FIELDS
+                ],
             ]
         )
         scalar_index = [
@@ -112,16 +155,131 @@ class CollectionSchemas:
                 "level",
                 "name",
                 "tags",
+                "search_tags",
                 "account_id",
-                "owner_space",
+                "owner_user_id",
+                ACL_MODE_FIELD,
+                *ACL_GRANT_FIELDS,
             ]
         )
         return {
             "CollectionName": name,
-            "Description": "Unified context collection",
+            "Description": description or "Unified context collection",
             "Fields": fields,
             "ScalarIndex": scalar_index,
+            "FullText": [
+                {
+                    "Field": "content",
+                    "Analyzer": {"Tokenizer": "standard", "StopWordsFilters": ["symbol"]},
+                },
+            ],
         }
+
+
+def _get_active_embedding_model_config(config: "OpenVikingConfig") -> Any:
+    embedding_cfg = config.embedding
+    if embedding_cfg.hybrid is not None:
+        return embedding_cfg.hybrid
+    if embedding_cfg.dense is not None:
+        return embedding_cfg.dense
+    if embedding_cfg.sparse is not None:
+        return embedding_cfg.sparse
+    raise ValueError("No active embedding model configuration found")
+
+
+def _build_embedding_metadata(config: "OpenVikingConfig") -> Dict[str, Any]:
+    model_cfg = _get_active_embedding_model_config(config)
+    # When credentials are configured, the first credential drives the actual
+    # provider/model used at request time (see EmbeddingConfig._effective_*),
+    # so the metadata signature must reflect the credential rather than the
+    # parent's possibly-default provider/model. Otherwise a credential-only
+    # OpenAI config would still be signed as ``provider=volcengine`` (the parent
+    # default), masking real vector-space changes.
+    first_cred = None
+    creds = getattr(model_cfg, "credentials", None) or []
+    if creds:
+        first_cred = creds[0]
+    cred_provider = getattr(first_cred, "provider", None) if first_cred else None
+    cred_model = getattr(first_cred, "model", None) if first_cred else None
+    provider = (
+        cred_provider
+        or getattr(model_cfg, "provider", None)
+        or getattr(model_cfg, "backend", None)
+        or ""
+    ).lower()
+    model = cred_model or getattr(model_cfg, "model", None) or ""
+    dimension = config.embedding.dimension
+    model_path = getattr(model_cfg, "model_path", None)
+    model_identity = model
+
+    if provider == "local":
+        try:
+            from openviking.models.embedder.local_embedders import get_local_model_identity
+
+            resolved_identity = get_local_model_identity(model, model_path=model_path)
+            model_identity = str(hashlib.sha256(resolved_identity.encode("utf-8")).hexdigest())
+        except Exception:
+            model_identity = model
+
+    return {
+        "provider": provider,
+        "model": model,
+        "dimension": dimension,
+        "model_identity": model_identity,
+    }
+
+
+def _embedding_metadata_compatible(
+    existing_meta: Optional[Dict[str, Any]],
+    current_meta: Dict[str, Any],
+) -> bool:
+    if existing_meta is None:
+        return False
+    return all(
+        existing_meta.get(key) == current_meta.get(key) for key in _EMBEDDING_COMPATIBILITY_KEYS
+    )
+
+
+def _collection_has_content_fulltext(meta: Dict[str, Any]) -> bool:
+    fields = meta.get("Fields", [])
+    has_content = any(
+        f.get("FieldName") == "content" and f.get("FieldType") == "text" for f in fields
+    )
+    fulltext = meta.get("FullText") or []
+    if isinstance(fulltext, str):
+        try:
+            fulltext = json.loads(fulltext)
+        except json.JSONDecodeError:
+            fulltext = []
+    has_content_fulltext = any(
+        isinstance(ft, dict) and ft.get("Field") == "content" for ft in fulltext
+    )
+    return has_content and has_content_fulltext
+
+
+def _encode_collection_description(
+    base_description: str,
+    embedding_meta: Dict[str, Any],
+) -> str:
+    description = (base_description or "Unified context collection").strip()
+    meta_json = json.dumps(embedding_meta, sort_keys=True, ensure_ascii=False)
+    return f"{description}{EMBEDDING_META_MARKER}{meta_json}"
+
+
+def _decode_collection_description(
+    description: Optional[str],
+) -> tuple[str, Optional[Dict[str, Any]]]:
+    text = description or ""
+    if EMBEDDING_META_MARKER not in text:
+        return text, None
+
+    base, meta_json = text.split(EMBEDDING_META_MARKER, 1)
+    try:
+        payload = json.loads(meta_json.strip())
+    except json.JSONDecodeError:
+        logger.warning("Failed to parse collection embedding metadata from description")
+        return text, None
+    return base.strip(), payload if isinstance(payload, dict) else None
 
 
 async def init_context_collection(storage) -> bool:
@@ -142,8 +300,175 @@ async def init_context_collection(storage) -> bool:
     if not name:
         raise ValueError("Vector DB collection name is required")
     collection_name = name
-    schema = CollectionSchemas.context_collection(collection_name, vector_dim)
-    return await storage.create_collection(collection_name, schema)
+    embedding_meta = _build_embedding_metadata(config)
+    vectordb_cfg = config.storage.vectordb
+    uses_volcengine_data_plane = bool(
+        vectordb_cfg.backend == "volcengine"
+        and getattr(getattr(vectordb_cfg, "volcengine", None), "api_key", None)
+    )
+    if uses_volcengine_data_plane:
+        logger.info(
+            "Skip collection bootstrap for volcengine data-plane backend; "
+            "collection/index/schema must be pre-created out of band"
+        )
+        return False
+    schema = CollectionSchemas.context_collection(
+        collection_name,
+        vector_dim,
+        description=_encode_collection_description("Unified context collection", embedding_meta),
+    )
+    created = await storage.create_collection(collection_name, schema)
+    if created:
+        return True
+
+    existing_meta = None
+    if hasattr(storage, "get_collection_meta"):
+        existing_meta = await storage.get_collection_meta()
+
+    if not existing_meta:
+        raise EmbeddingConfigurationError(
+            "Existing collection metadata is unavailable; cannot validate embedding compatibility"
+        )
+
+    actual_dimension = next(
+        (
+            field.get("Dim")
+            for field in existing_meta.get("Fields", [])
+            if field.get("FieldName") == "vector"
+        ),
+        None,
+    )
+    if actual_dimension is not None and actual_dimension != vector_dim:
+        raise EmbeddingRebuildRequiredError(
+            f"Existing collection dimension {actual_dimension} differs from {vector_dim}"
+        )
+
+    expected_fields = {field.get("FieldName") for field in schema["Fields"]}
+    existing_fields = {field.get("FieldName") for field in existing_meta.get("Fields", [])}
+    missing_fields = sorted(expected_fields - existing_fields)
+    expected_scalar_indexes = set(schema["ScalarIndex"])
+    existing_scalar_indexes = set(existing_meta.get("ScalarIndex", []))
+    missing_scalar_indexes = sorted(expected_scalar_indexes - existing_scalar_indexes)
+
+    async def _update_local_schema() -> None:
+        if vectordb_cfg.backend not in {"local", "cuvs"} or "Fields" not in existing_meta:
+            return
+        if not missing_fields and not missing_scalar_indexes:
+            return
+        if not hasattr(storage, "update_collection_schema"):
+            raise EmbeddingConfigurationError(
+                "Local context collection does not support automatic schema updates"
+            )
+        await storage.update_collection_schema(schema["Fields"], schema["ScalarIndex"])
+
+    base_description, existing_embedding_meta = _decode_collection_description(
+        existing_meta.get("Description")
+    )
+
+    # Schema compatibility check: actual collection schema controls whether
+    # VikingDB full-text grep can be used. Missing content/FullText should only
+    # disable the vikingdb grep path, not block server startup.
+    if (
+        "Fields" in existing_meta or "FullText" in existing_meta
+    ) and not _collection_has_content_fulltext(existing_meta):
+        logger.warning(
+            "Collection schema does not support VikingDB full-text grep "
+            "Missing 'content' field or FullText config. "
+            "grep engine=auto will fall back to fs. "
+            "Recreate the collection to enable vikingdb-based grep."
+        )
+
+    if _embedding_metadata_compatible(existing_embedding_meta, embedding_meta):
+        await _update_local_schema()
+        return False
+
+    existing_count = await storage.count() if hasattr(storage, "count") else 0
+    if existing_embedding_meta is None and existing_count == 0:
+        if hasattr(storage, "update_collection_description"):
+            await storage.update_collection_description(
+                _encode_collection_description(
+                    base_description or "Unified context collection",
+                    embedding_meta,
+                )
+            )
+            await _update_local_schema()
+            return False
+
+    if existing_embedding_meta is None:
+        logger.warning(
+            "Existing collection has %d vector(s) but no embedding metadata "
+            "(created by an older version). Backfilling with current config and continuing.",
+            existing_count,
+        )
+        if hasattr(storage, "update_collection_description"):
+            await storage.update_collection_description(
+                _encode_collection_description(
+                    base_description or "Unified context collection",
+                    embedding_meta,
+                )
+            )
+        await _update_local_schema()
+        return False
+
+    if existing_count == 0 and hasattr(storage, "update_collection_description"):
+        await storage.update_collection_description(
+            _encode_collection_description(
+                base_description or "Unified context collection",
+                embedding_meta,
+            )
+        )
+        await _update_local_schema()
+        return False
+
+    # Embedding metadata differs from current config and the collection is
+    # non-empty. Decide whether the user has explicitly opted in to keep the
+    # existing vectors despite the metadata drift.
+    existing_dimension = (
+        existing_embedding_meta.get("dimension") if existing_embedding_meta else None
+    )
+    current_dimension = embedding_meta.get("dimension")
+    dimension_changed = (
+        existing_dimension is not None
+        and current_dimension is not None
+        and existing_dimension != current_dimension
+    )
+
+    allow_override = bool(getattr(config.embedding, "allow_metadata_override", False))
+    if (
+        allow_override
+        and not dimension_changed
+        and hasattr(storage, "update_collection_description")
+    ):
+        logger.warning(
+            "Embedding metadata changed (provider/model) but dimension is "
+            "unchanged; embedding.allow_metadata_override=true, so the existing "
+            "collection metadata will be rewritten and existing vectors kept. "
+            "old=%s new=%s",
+            existing_embedding_meta,
+            embedding_meta,
+        )
+        await storage.update_collection_description(
+            _encode_collection_description(
+                base_description or "Unified context collection",
+                embedding_meta,
+            )
+        )
+        await _update_local_schema()
+        return False
+
+    if dimension_changed:
+        raise EmbeddingRebuildRequiredError(
+            "Existing collection embedding dimension "
+            f"({existing_dimension}) does not match current configuration "
+            f"({current_dimension}). Vectors are incompatible; rebuild is required."
+        )
+
+    raise EmbeddingRebuildRequiredError(
+        "Existing collection embedding metadata does not match current configuration. "
+        "Rebuild is required before using the current embedding model, or set "
+        "embedding.allow_metadata_override=true to keep existing vectors when "
+        "only provider/model changed (dimension must remain the same)."
+    )
 
 
 class TextEmbeddingHandler(DequeueHandlerBase):
@@ -163,48 +488,27 @@ class TextEmbeddingHandler(DequeueHandlerBase):
     _request_stats_order: List[str] = []
     _max_cached_stats = 1024
 
-    def __init__(self, vikingdb: VikingVectorIndexBackend):
+    def __init__(self, vikingdb: VikingVectorIndexBackend, embedding_provider=None):
         """Initialize the text embedding handler.
 
         Args:
             vikingdb: VikingVectorIndexBackend instance for writing to vector database
         """
-        from openviking_cli.utils.config import get_openviking_config
-
         self._vikingdb = vikingdb
-        self._embedder = None
-        config = get_openviking_config()
-        self._collection_name = config.storage.vectordb.name
-        self._vector_dim = config.embedding.dimension
-        self._initialize_embedder(config)
-        breaker_cfg = config.embedding.circuit_breaker
-        self._circuit_breaker = CircuitBreaker(
-            failure_threshold=breaker_cfg.failure_threshold,
-            reset_timeout=breaker_cfg.reset_timeout,
-            max_reset_timeout=breaker_cfg.max_reset_timeout,
-        )
-        self._breaker_open_last_log_at = 0.0
-        self._breaker_open_suppressed_count = 0
+        self._embedding_provider = embedding_provider
+        self._breaker_open_last_log_at: Dict[str, float] = {}
         self._breaker_open_log_interval = 30.0
 
-    def _initialize_embedder(self, config: "OpenVikingConfig"):
-        """Initialize the embedder instance from config."""
-        self._embedder = config.embedding.get_embedder()
-
-    def _log_breaker_open_reenqueue_summary(self) -> None:
+    def _log_breaker_open_reenqueue_summary(self, account_id: str) -> None:
         """Log a throttled warning when embeddings are re-enqueued due to an open circuit breaker."""
         now = time.monotonic()
-        if self._breaker_open_last_log_at == 0.0:
-            logger.warning("Embedding circuit breaker is open; re-enqueueing messages")
-            self._breaker_open_last_log_at = now
-            self._breaker_open_suppressed_count = 0
-            return
-
-        self._breaker_open_suppressed_count += 1
-        if now - self._breaker_open_last_log_at >= self._breaker_open_log_interval:
-            logger.warning("Embedding circuit breaker is open; re-enqueueing messages")
-            self._breaker_open_last_log_at = now
-            self._breaker_open_suppressed_count = 0
+        last = self._breaker_open_last_log_at.get(account_id)
+        if last is None or now - last >= self._breaker_open_log_interval:
+            logger.warning(
+                "Embedding circuit breaker is open; re-enqueueing messages account=%s",
+                account_id,
+            )
+            self._breaker_open_last_log_at[account_id] = now
 
     @classmethod
     def _merge_request_stats(
@@ -238,34 +542,159 @@ class TextEmbeddingHandler(DequeueHandlerBase):
             return cls._request_stats_by_telemetry_id.pop(telemetry_id, None)
 
     @staticmethod
-    def _seed_uri_for_id(uri: str, level: Any) -> str:
-        """Build deterministic id seed URI from canonical uri + hierarchy level."""
-        try:
-            level_int = int(level)
-        except (TypeError, ValueError):
-            level_int = 2
+    def _embedding_msg_log_context(embedding_msg: Optional[EmbeddingMsg]) -> str:
+        """Return the URI-safe context retained in public error messages."""
+        if embedding_msg is None:
+            return "uri=<unknown>"
 
-        if level_int == 0:
-            return uri if uri.endswith("/.abstract.md") else f"{uri}/.abstract.md"
-        if level_int == 1:
-            return uri if uri.endswith("/.overview.md") else f"{uri}/.overview.md"
-        return uri
+        context_data = embedding_msg.context_data or {}
+        return f"uri={context_data.get('uri') or '<unknown>'}"
 
-    async def on_dequeue(self, data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    @classmethod
+    def _embedding_delivery_log_context(cls, embedding_msg: Optional[EmbeddingMsg]) -> str:
+        """Return request/message IDs plus the safe embedding URI for logs."""
+        if embedding_msg is None:
+            return f"{log_correlation()} {cls._embedding_msg_log_context(None)}"
+        return (
+            f"{log_correlation(telemetry_id=embedding_msg.telemetry_id, message_id=embedding_msg.id)} "
+            f"{cls._embedding_msg_log_context(embedding_msg)}"
+        )
+
+    @classmethod
+    def _embedding_error_msg(
+        cls,
+        embedding_msg: Optional[EmbeddingMsg],
+        message: str,
+    ) -> str:
+        return f"{message} ({cls._embedding_msg_log_context(embedding_msg)})"
+
+    @classmethod
+    def _log_embedding_error(
+        cls, level: int, message: str, embedding_msg: Optional[EmbeddingMsg]
+    ) -> None:
+        """Log an internal correlation suffix without changing public errors."""
+        logger.log(level, "%s [%s]", message, cls._embedding_delivery_log_context(embedding_msg))
+
+    @staticmethod
+    async def _materialize_content(
+        embedding_msg: EmbeddingMsg,
+        ctx: RequestContext,
+    ) -> str:
+        inserted_data = embedding_msg.context_data
+        materialized = inserted_data.pop("_materialized_content", None)
+        if isinstance(materialized, str):
+            return materialized[:VIKINGDB_CONTENT_MAX_SIZE]
+        if inserted_data.get("is_leaf") and inserted_data.get("context_type") in (
+            ContextType.RESOURCE.value,
+            ContextType.SKILL.value,
+        ):
+            from openviking.parse.parsers.upload_utils import is_text_file
+            from openviking.storage.viking_fs import get_viking_fs
+            from openviking.utils.embedding_utils import (
+                _coerce_text_file_content,
+                _resolve_resource_content_type,
+            )
+
+            viking_fs = get_viking_fs()
+            source_uri = inserted_data["uri"]
+            source_name = source_uri.rsplit("/", 1)[-1]
+            source_type = await _resolve_resource_content_type(
+                source_uri,
+                source_name,
+                viking_fs,
+                ctx,
+            )
+            if source_type == ResourceContentType.TEXT or (
+                source_type is None and is_text_file(source_name)
+            ):
+                source_content = _coerce_text_file_content(
+                    await viking_fs.read_file(source_uri, ctx=ctx)
+                )
+                return source_content[:VIKINGDB_CONTENT_MAX_SIZE]
+
+        return (
+            embedding_msg.message[:VIKINGDB_CONTENT_MAX_SIZE]
+            if isinstance(embedding_msg.message, str)
+            else inserted_data["abstract"][:VIKINGDB_CONTENT_MAX_SIZE]
+        )
+
+    async def _apply_non_embedding_operation(
+        self,
+        embedding_msg: EmbeddingMsg,
+        ctx: RequestContext,
+    ) -> Dict[str, Any]:
+        if embedding_msg.action is IndexAction.DELETE:
+            deleted_count = await self._vikingdb.strict_delete(
+                embedding_msg.record_ids,
+                ctx=ctx,
+            )
+            return {"deleted_count": deleted_count}
+
+        record_id = embedding_msg.record_ids[0]
+        field_patch = embedding_msg.field_patch
+        assert field_patch is not None
+        # UPDATE_FIELDS is a read-modify-write patch.  The exact read happens at
+        # execution time so append semantics use the latest stored tags rather
+        # than the inventory snapshot that produced the durable plan.
+        existing_records = await self._vikingdb.get_strict([record_id], ctx=ctx)
+        if existing_records:
+            existing = dict(existing_records[0])
+            resolved = field_patch.resolve(existing)
+            changed_fields = {
+                field: resolved.get(field)
+                for field in field_patch.values
+                if resolved.get(field) != existing.get(field)
+            }
+            if not changed_fields:
+                return {"id": record_id, "status": "skipped"}
+            changed_fields["updated_at"] = get_current_timestamp()
+            updated_record = {"id": record_id, **changed_fields}
+            result = await self._vikingdb.update(updated_record, ctx=ctx)
+            if not result.ok:
+                raise RuntimeError(
+                    result.error_message or f"failed to update vector record: {record_id}"
+                )
+            return updated_record
+
+        initial_record = field_patch.apply({**field_patch.seed_fields, "id": record_id})
+        missing_fields = missing_initial_record_fields(initial_record)
+        if missing_fields:
+            raise IncompleteInitialRecordError(record_id, missing_fields)
+        created_id = await self._vikingdb.upsert(initial_record, ctx=ctx)
+        if not created_id:
+            raise RuntimeError(f"failed to create missing vector record: {record_id}")
+        return {"id": record_id, "status": "created"}
+
+    async def on_dequeue(self, data: Optional[Dict[str, Any]]) -> ProcessResult:
         """Process dequeued message and add embedding vector(s)."""
         if not data:
-            return None
+            return ProcessResult.success()
 
         embedding_msg: Optional[EmbeddingMsg] = None
-        collector = None
-        report_success = False
-        report_error_args: Optional[tuple[str, Optional[Dict[str, Any]]]] = None
         request_failed_message: Optional[str] = None
+        execute_started_at: float | None = None
+        queue_wait_ms = 0.0
+        execute_status = "ok"
         try:
-            queue_data = json.loads(data["data"])
-            # Parse EmbeddingMsg from data
-            embedding_msg = EmbeddingMsg.from_dict(queue_data)
-            inserted_data = embedding_msg.context_data
+            embedding_msg = EmbeddingMsg.from_json(data["data"])
+            execute_started_at = time.perf_counter()
+            if embedding_msg.queue_enqueued_at > 0:
+                queue_wait_ms = max((time.time() - embedding_msg.queue_enqueued_at) * 1000.0, 0.0)
+            inserted_data = dict(embedding_msg.context_data)
+            inserted_data.pop("_write_source", None)  # Ignore sources in already queued messages.
+            inserted_data.pop("_write_lease", None)  # Ignore leases in already queued messages.
+            logger.debug(
+                "Processing embedding message: %s action=%s",
+                self._embedding_delivery_log_context(embedding_msg),
+                embedding_msg.action.value,
+            )
+            account_id = inserted_data.get("account_id")
+            if not isinstance(account_id, str) or not account_id.strip():
+                raise ValueError("Embedding message requires account_id")
+            context_user = inserted_data.get("user") or {}
+            user_id = context_user.get("user_id") or inserted_data.get("owner_user_id") or "default"
+            user = UserIdentifier(account_id=account_id, user_id=user_id)
+            ctx = RequestContext(user=user, role=Role.USER, bypass_acl=True)
             collector = resolve_telemetry(embedding_msg.telemetry_id)
             telemetry_ctx = bind_telemetry(collector) if collector is not None else nullcontext()
 
@@ -273,122 +702,129 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 if self._vikingdb.is_closing:
                     logger.debug("Skip embedding dequeue during shutdown")
                     self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
-                    self._record_request_success(embedding_msg)
-                    report_success = True
-                    return None
+                    return ProcessResult.success()
 
-                # Only process string messages
-                if not isinstance(embedding_msg.message, str):
-                    logger.debug(f"Skipping non-string message type: {type(embedding_msg.message)}")
+                if embedding_msg.action is IndexAction.NONE:
                     self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
-                    self._record_request_success(embedding_msg)
-                    report_success = True
-                    return data
+                    logger.debug("Skipping no-op embedding message: %s", embedding_msg.id)
+                    return ProcessResult.success()
+
+                if embedding_msg.action not in {IndexAction.UPSERT, IndexAction.MERGE}:
+                    result = await self._apply_non_embedding_operation(embedding_msg, ctx)
+                    self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
+                    return ProcessResult.success(result)
+
+                if not isinstance(embedding_msg.message, (str, list)):
+                    logger.debug(
+                        f"Skipping unsupported message type: {type(embedding_msg.message)}"
+                    )
+                    self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
+                    return ProcessResult.success(data)
 
                 # Circuit breaker: if API is known-broken, re-enqueue and wait
-                try:
-                    self._circuit_breaker.check()
-                    self._breaker_open_last_log_at = 0.0
-                    self._breaker_open_suppressed_count = 0
-                except CircuitBreakerOpen:
-                    self._log_breaker_open_reenqueue_summary()
-                    if self._vikingdb.has_queue_manager:
-                        wait = self._circuit_breaker.retry_after
-                        if wait > 0:
-                            await asyncio.sleep(wait)
-                        await self._vikingdb.enqueue_embedding_msg(embedding_msg)
-                        self._merge_request_stats(
-                            embedding_msg.telemetry_id,
-                            requeue_count=1,
-                        )
-                        get_request_wait_tracker().record_embedding_requeue(
-                            embedding_msg.telemetry_id
-                        )
-                        self.report_requeue()
-                        report_success = True
-                        return None
-                    # No queue manager — cannot re-enqueue, drop with error
-                    request_failed_message = "Circuit breaker open and no queue manager"
-                    report_error_args = ("Circuit breaker open and no queue manager", data)
-                    return None
-
-                # Initialize embedder if not already initialized
-                if not self._embedder:
-                    from openviking_cli.utils.config import get_openviking_config
-
-                    config = get_openviking_config()
-                    self._initialize_embedder(config)
+                provider = self._embedding_provider
+                if provider is None:
+                    raise RuntimeError("Account embedding provider is not initialized")
+                embedder = provider.bind(account_id)
 
                 # Generate embedding vector(s)
-                if self._embedder:
+                if embedder:
                     try:
                         import time as _time
 
                         _embed_t0 = _time.monotonic()
-                        result: EmbedResult = await embed_compat(
-                            self._embedder, embedding_msg.message
-                        )
+                        with bind_ingestion_source_type(embedding_msg.source_type):
+                            result = await embed_compat(
+                                embedder,
+                                embedding_msg.message,
+                                is_query=False,
+                            )
+                        self._breaker_open_last_log_at.pop(account_id, None)
                         _embed_elapsed = _time.monotonic() - _embed_t0
                         try:
-                            from openviking.storage.observers.prometheus_observer import (
-                                get_prometheus_observer,
-                            )
+                            from openviking.metrics.datasources import EmbeddingEventDataSource
 
-                            _prom = get_prometheus_observer()
-                            if _prom is not None:
-                                _prom.record_embedding(_embed_elapsed)
+                            EmbeddingEventDataSource.record_success(
+                                latency_seconds=float(_embed_elapsed),
+                                account_id=embedding_msg.context_data.get("account_id"),
+                            )
                         except Exception:
                             pass
+                    except CircuitBreakerOpen as embed_err:
+                        self._log_breaker_open_reenqueue_summary(account_id)
+                        if self._vikingdb.has_queue_manager:
+                            execute_status = "requeued"
+                            wait = getattr(embed_err, "retry_after", 0)
+                            if wait > 0:
+                                await asyncio.sleep(wait)
+                            await self._reenqueue_embedding_msg(embedding_msg)
+                            self._merge_request_stats(embedding_msg.telemetry_id, requeue_count=1)
+                            return ProcessResult.requeued()
+                        execute_status = "error"
+                        request_failed_message = self._embedding_error_msg(
+                            embedding_msg, "Circuit breaker open and no queue manager"
+                        )
+                        return ProcessResult.failed(request_failed_message)
                     except Exception as embed_err:
-                        error_msg = f"Failed to generate embedding: {embed_err}"
-                        error_class = classify_api_error(embed_err)
+                        error_msg = self._embedding_error_msg(
+                            embedding_msg,
+                            f"Failed to generate embedding: {embed_err}",
+                        )
+                        kind = model_error_kind(embed_err)
+                        try:
+                            from openviking.metrics.datasources import EmbeddingEventDataSource
 
-                        if error_class == "permanent":
-                            logger.critical(error_msg)
-                            self._circuit_breaker.record_failure(embed_err)
+                            EmbeddingEventDataSource.record_error(
+                                error_code=kind.value if kind is not None else "unknown",
+                                account_id=embedding_msg.context_data.get("account_id"),
+                            )
+                        except Exception:
+                            pass
+
+                        if kind is ModelErrorKind.INPUT_TOO_LARGE:
+                            execute_status = "error"
+                            self._log_embedding_error(logging.ERROR, error_msg, embedding_msg)
                             self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
                             request_failed_message = error_msg
-                            report_error_args = (error_msg, data)
-                            return None
+                            return ProcessResult.failed(error_msg)
 
-                        # Transient or unknown — re-enqueue for retry
-                        logger.warning(error_msg)
-                        self._circuit_breaker.record_failure(embed_err)
-                        if self._vikingdb.has_queue_manager:
-                            try:
-                                await self._vikingdb.enqueue_embedding_msg(embedding_msg)
-                                self._merge_request_stats(
-                                    embedding_msg.telemetry_id,
-                                    requeue_count=1,
-                                )
-                                get_request_wait_tracker().record_embedding_requeue(
-                                    embedding_msg.telemetry_id
-                                )
-                                self.report_requeue()
-                                logger.info(
-                                    f"Re-enqueued embedding message after transient error: {embedding_msg.id}"
-                                )
-                                report_success = True
-                                return None
-                            except Exception as requeue_err:
-                                logger.error(f"Failed to re-enqueue message: {requeue_err}")
+                        if kind in {
+                            ModelErrorKind.MODEL_NOT_FOUND,
+                            ModelErrorKind.UNSUPPORTED,
+                            ModelErrorKind.INVALID_REQUEST,
+                            ModelErrorKind.CONTENT_SAFETY,
+                        }:
+                            execute_status = "error"
+                            self._log_embedding_error(logging.CRITICAL, error_msg, embedding_msg)
+                            self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
+                            request_failed_message = error_msg
+                            return ProcessResult.failed(error_msg)
+
+                        if kind in {
+                            ModelErrorKind.AUTHENTICATION_ERROR,
+                            ModelErrorKind.PERMISSION_DENIED,
+                        }:
+                            execute_status = "error"
+                            # Bad/expired credential: retrying cannot succeed. Fail
+                            # terminally instead of re-enqueueing, which would cycle
+                            # forever and hold this resource's tree lock and its
+                            # add-resource --wait open. Don't trip the breaker: an open
+                            # breaker re-enqueues later messages and reintroduces the
+                            # same leak. See #2916.
+                            self._log_embedding_error(logging.ERROR, error_msg, embedding_msg)
+                            self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
+                            request_failed_message = error_msg
+                            return ProcessResult.failed(error_msg)
 
                         self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
+                        execute_status = "error"
+                        self._log_embedding_error(logging.ERROR, error_msg, embedding_msg)
                         request_failed_message = error_msg
-                        report_error_args = (error_msg, data)
-                        return None
+                        return ProcessResult.failed(error_msg)
 
                     # Add dense vector
                     if result.dense_vector:
                         inserted_data["vector"] = result.dense_vector
-                        # Validate vector dimension
-                        if len(result.dense_vector) != self._vector_dim:
-                            error_msg = f"Dense vector dimension mismatch: expected {self._vector_dim}, got {len(result.dense_vector)}"
-                            logger.error(error_msg)
-                            self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
-                            request_failed_message = error_msg
-                            report_error_args = (error_msg, data)
-                            return None
 
                     # Add sparse vector if present
                     if result.sparse_vector:
@@ -397,107 +833,190 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                             f"Generated sparse vector with {len(result.sparse_vector)} terms"
                         )
                 else:
-                    error_msg = "Embedder not initialized, skipping vector generation"
-                    logger.warning(error_msg)
+                    error_msg = self._embedding_error_msg(
+                        embedding_msg,
+                        "Embedder not initialized, skipping vector generation",
+                    )
+                    self._log_embedding_error(logging.WARNING, error_msg, embedding_msg)
+                    try:
+                        from openviking.metrics.datasources import EmbeddingEventDataSource
+
+                        EmbeddingEventDataSource.record_error(error_code="not_initialized")
+                    except Exception:
+                        pass
                     self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
+                    execute_status = "error"
                     request_failed_message = error_msg
-                    report_error_args = (error_msg, data)
-                    return None
+                    return ProcessResult.failed(error_msg)
 
                 # Write to vector database
                 try:
-                    # Ensure vector DB has deterministic IDs per semantic layer.
+                    raw_upsert_options = inserted_data.pop("_upsert_options", {})
+                    extracted_memory_type = raw_upsert_options.pop("extracted_memory_type", None)
+                    # Reuse the actual vector-store ID when a semantic plan
+                    # rebuilds an existing same-level record. Only genuinely new
+                    # records derive an ID locally from (account, uri, level).
+                    existing_record_id = inserted_data.pop("_upsert_record_id", None)
                     uri = inserted_data.get("uri")
-                    account_id = inserted_data.get("account_id", "default")
-                    if uri:
-                        seed_uri = self._seed_uri_for_id(uri, inserted_data.get("level", 2))
-                        id_seed = f"{account_id}:{seed_uri}"
-                        inserted_data["id"] = hashlib.md5(id_seed.encode("utf-8")).hexdigest()
+                    if existing_record_id:
+                        inserted_data["id"] = str(existing_record_id)
+                    elif uri:
+                        inserted_data["id"] = vector_record_id(
+                            account_id, uri, inserted_data.get("level", 2)
+                        )
 
-                    user = UserIdentifier(
-                        account_id=account_id,
-                        user_id="default",
-                        agent_id="default",
+                    if await self._vikingdb.account_uses_content_field(account_id):
+                        inserted_data["content"] = await self._materialize_content(
+                            embedding_msg,
+                            ctx,
+                        )
+                    inserted_data.pop("_materialized_content", None)
+                    if embedding_msg.action is IndexAction.MERGE:
+                        field_patch = embedding_msg.field_patch
+                        merge_fields = dict(field_patch.values) if field_patch is not None else {}
+                        merge_modes = dict(field_patch.modes) if field_patch is not None else {}
+                        # Legacy MERGE producers encoded tag intent in context_data
+                        # plus _upsert_options. Normalize them to the explicit patch
+                        # protocol before the exact read.
+                        if "search_tags" in inserted_data and "search_tags" not in merge_fields:
+                            merge_fields["search_tags"] = inserted_data.pop("search_tags")
+                            merge_modes["search_tags"] = str(
+                                raw_upsert_options.get("search_tag_mode", "replace")
+                            )
+                        existing_records = await self._vikingdb.get_strict(
+                            [inserted_data["id"]], ctx=ctx
+                        )
+                        base = (
+                            dict(existing_records[0])
+                            if existing_records
+                            else dict(field_patch.seed_fields)
+                            if field_patch is not None
+                            else {}
+                        )
+                        # Fresh content/model outputs win over the stored record;
+                        # scalar patches are then interpreted against that latest
+                        # exact-get result.
+                        inserted_data = FieldPatch(merge_fields, merge_modes).apply(
+                            {**base, **inserted_data}
+                        )
+                        if extracted_memory_type:
+                            inserted_data["search_tags"] = merge_search_tags(
+                                inserted_data.get("search_tags"),
+                                [f"memory_type={extracted_memory_type}"],
+                            )
+                        if not existing_records:
+                            missing_fields = missing_initial_record_fields(inserted_data)
+                            if missing_fields:
+                                raise RuntimeError(
+                                    "merge could not create missing vector record: "
+                                    f"record_id={inserted_data.get('id')} "
+                                    f"missing_fields={missing_fields}"
+                                )
+                    upsert_options = normalize_upsert_options(
+                        {**raw_upsert_options, "partial_update": False}
                     )
-                    ctx = RequestContext(user=user, role=Role.ROOT)
-                    record_id = await self._vikingdb.upsert(inserted_data, ctx=ctx)
+                    if inserted_data.get("context_type") == ContextType.SKILL.value:
+                        # Cancelling the waiter cannot stop a threaded DB write.
+                        # Keep this task active until that write has settled.
+                        result = await run_to_completion(
+                            lambda: self._vikingdb.upsert(
+                                inserted_data, ctx=ctx, options=upsert_options
+                            )
+                        )
+                    else:
+                        result = await self._vikingdb.upsert(
+                            inserted_data, ctx=ctx, options=upsert_options
+                        )
+                    record_id = result
                     if record_id:
                         logger.debug(
-                            f"Successfully wrote embedding to database: {record_id} abstract {inserted_data['abstract']} vector {inserted_data['vector'][:5]}"
+                            "Successfully wrote embedding: %s",
+                            self._embedding_delivery_log_context(embedding_msg),
                         )
                 except CollectionNotFoundError as db_err:
                     # During shutdown, queue workers may finish one dequeued item.
                     if self._vikingdb.is_closing:
                         logger.debug(f"Skip embedding write during shutdown: {db_err}")
                         self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
-                        self._record_request_success(embedding_msg)
-                        report_success = True
-                        return None
-                    logger.error(f"Failed to write to vector database: {db_err}")
-                    self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
-                    request_failed_message = str(db_err)
-                    report_error_args = (str(db_err), data)
-                    return None
-                except Exception as db_err:
-                    if self._vikingdb.is_closing:
-                        logger.debug(f"Skip embedding write during shutdown: {db_err}")
-                        self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
-                        self._record_request_success(embedding_msg)
-                        report_success = True
-                        return None
-                    logger.error(f"Failed to write to vector database: {db_err}")
+                        return ProcessResult.success()
+                    error_msg = self._embedding_error_msg(
+                        embedding_msg,
+                        f"Failed to write to vector database: {db_err}",
+                    )
+                    self._log_embedding_error(logging.ERROR, error_msg, embedding_msg)
                     import traceback
 
                     traceback.print_exc()
                     self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
-                    request_failed_message = str(db_err)
-                    report_error_args = (str(db_err), data)
-                    return None
+                    execute_status = "error"
+                    request_failed_message = error_msg
+                    return ProcessResult.failed(error_msg)
+                except Exception as db_err:
+                    if self._vikingdb.is_closing:
+                        logger.debug(f"Skip embedding write during shutdown: {db_err}")
+                        self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
+                        return ProcessResult.success()
+                    error_msg = self._embedding_error_msg(
+                        embedding_msg,
+                        f"Failed to write to vector database: {db_err}",
+                    )
+                    self._log_embedding_error(logging.ERROR, error_msg, embedding_msg)
+                    self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
+                    execute_status = "error"
+                    request_failed_message = error_msg
+                    return ProcessResult.failed(error_msg)
 
                 self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
-                self._record_request_success(embedding_msg)
-                report_success = True
-                self._circuit_breaker.record_success()
-                return inserted_data
+                return ProcessResult.success({"vector_written": bool(record_id)})
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.error(f"Error processing embedding message: {e}")
+            error_msg = self._embedding_error_msg(
+                embedding_msg,
+                f"Error processing embedding message: {e}",
+            )
+            logger.error(error_msg)
             import traceback
 
             traceback.print_exc()
             if embedding_msg is not None:
                 self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
-                request_failed_message = str(e)
-            report_error_args = (str(e), data)
-            return None
+                execute_status = "error"
+                request_failed_message = error_msg
+            return ProcessResult.failed(error_msg)
         finally:
-            if embedding_msg is not None and request_failed_message is not None:
-                self._record_request_failure(embedding_msg, request_failed_message)
-            if embedding_msg and embedding_msg.semantic_msg_id:
-                from openviking.storage.queuefs.embedding_tracker import EmbeddingTaskTracker
+            if embedding_msg is not None and execute_started_at is not None:
+                from openviking.metrics.datasources.resource import ResourceIngestionEventDataSource
 
-                tracker = EmbeddingTaskTracker.get_instance()
-                try:
-                    await tracker.decrement(embedding_msg.semantic_msg_id)
-                except Exception as tracker_err:
-                    logger.warning(f"Failed to decrement embedding tracker: {tracker_err}")
-            if report_error_args is not None:
-                self.report_error(*report_error_args)
-            elif report_success:
-                self.report_success()
+                ResourceIngestionEventDataSource.record_stage(
+                    stage="embedding_queue_wait",
+                    status=execute_status,
+                    duration_seconds=queue_wait_ms / 1000.0,
+                    account_id=embedding_msg.context_data.get("account_id"),
+                )
+                ResourceIngestionEventDataSource.record_stage(
+                    stage="embedding_execute",
+                    status=execute_status,
+                    duration_seconds=(time.perf_counter() - execute_started_at),
+                    account_id=embedding_msg.context_data.get("account_id"),
+                )
 
-    @staticmethod
-    def _record_request_success(embedding_msg: EmbeddingMsg) -> None:
-        tracker = get_request_wait_tracker()
-        if embedding_msg.semantic_msg_id:
-            tracker.record_embedding_processed(embedding_msg.telemetry_id)
+    async def on_cancelled(self, data: Optional[Dict[str, Any]]) -> ProcessResult:
+        """Settle request-scoped waiting when a queued embedding is cancelled."""
+        try:
+            if data:
+                payload = data.get("data", data)
+                if isinstance(payload, str):
+                    payload = json.loads(payload)
+                EmbeddingMsg.from_dict(payload)
+        except (KeyError, TypeError, ValueError) as exc:
+            return ProcessResult.failed(str(exc))
+
+        return ProcessResult.cancelled()
+
+    async def _reenqueue_embedding_msg(self, msg: EmbeddingMsg) -> None:
+        if msg.context_data.get("context_type") == ContextType.SKILL.value:
+            await run_to_completion(lambda: self._vikingdb.enqueue_embedding_msg(msg))
         else:
-            tracker.mark_embedding_done(embedding_msg.telemetry_id, embedding_msg.id)
-
-    @staticmethod
-    def _record_request_failure(embedding_msg: EmbeddingMsg, message: str) -> None:
-        tracker = get_request_wait_tracker()
-        if embedding_msg.semantic_msg_id:
-            tracker.record_embedding_error(embedding_msg.telemetry_id, message)
-        else:
-            tracker.mark_embedding_failed(embedding_msg.telemetry_id, embedding_msg.id, message)
+            await self._vikingdb.enqueue_embedding_msg(msg)

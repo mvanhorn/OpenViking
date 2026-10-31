@@ -6,13 +6,13 @@ import asyncio
 import json
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 from loguru import logger
 
-from vikingbot.bus.events import OutboundMessage
+from vikingbot.bus.events import OutboundEventType, OutboundMessage
 from vikingbot.bus.queue import MessageBus
 from vikingbot.channels.base import BaseChannel
 from vikingbot.config.schema import MochatChannelConfig
@@ -115,7 +115,7 @@ def _make_synthetic_event(
         payload["authorInfo"] = _safe_dict(author_info)
     return {
         "type": "message.add",
-        "timestamp": timestamp or datetime.utcnow().isoformat(),
+        "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
         "payload": payload,
     }
 
@@ -186,7 +186,7 @@ def resolve_was_mentioned(payload: dict[str, Any], agent_user_id: str) -> bool:
     return f"<@{agent_user_id}>" in content or f"@{agent_user_id}" in content
 
 
-def resolve_require_mention(config: MochatConfig, session_id: str, group_id: str) -> bool:
+def resolve_require_mention(config: MochatChannelConfig, session_id: str, group_id: str) -> bool:
     """Resolve mention requirement for group/panel conversations."""
     groups = config.groups or {}
     for key in (group_id, session_id, "*"):
@@ -314,6 +314,13 @@ class MochatChannel(BaseChannel):
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send outbound message to session or panel."""
+        if msg.event_type in (
+            OutboundEventType.RESPONSE_COMPLETED,
+            OutboundEventType.FEEDBACK_SUBMITTED,
+            OutboundEventType.RESPONSE_OUTCOME_EVALUATED,
+        ):
+            return
+
         if not self.config.claw_token:
             logger.warning("Mochat claw_token missing, skip send")
             return
@@ -840,6 +847,7 @@ class MochatChannel(BaseChannel):
         body = build_buffered_body(entries, is_group) or "[empty message]"
         await self._handle_message(
             sender_id=last.author,
+            sender_name=last.sender_name or last.sender_username or last.author,
             chat_id=target_id,
             content=body,
             metadata={
@@ -949,7 +957,7 @@ class MochatChannel(BaseChannel):
                 json.dumps(
                     {
                         "schemaVersion": 1,
-                        "updatedAt": datetime.utcnow().isoformat(),
+                        "updatedAt": datetime.now(timezone.utc).isoformat(),
                         "cursors": self._session_cursor,
                     },
                     ensure_ascii=False,

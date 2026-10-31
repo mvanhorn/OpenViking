@@ -69,19 +69,5 @@ jobs:
       if: runner.os == 'Windows'
       run: echo "C:\mingw64\bin" >> $env:GITHUB_PATH
 
-    - name: Install Python dependencies
-      run: uv sync --frozen --extra test
-
-    - name: Install build dependencies
-      run: uv pip install setuptools setuptools_scm cmake wheel
-
-    - name: Build C++ extensions
-      run: uv run python setup.py build_ext --inplace
-
-    # TODO: Once unit tests are fixed, switch this back to running the full test suite
-    # run: uv run pytest tests/ -v --cov=openviking --cov-report=term
-    - name: Run Lite Integration Test (Temporary Replacement)
-      shell: bash
-      run: |
-        export PYTHONPATH=$PYTHONPATH:$(pwd)
-        uv run python tests/integration/test_quick_start_lite.py
+    - name: Prepare native runtime
+      uses: ./.github/actions/native-runtime

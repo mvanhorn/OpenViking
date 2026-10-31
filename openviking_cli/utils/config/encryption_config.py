@@ -2,19 +2,31 @@
 # SPDX-License-Identifier: AGPL-3.0
 from typing import Any, Dict, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class LocalEncryptionProviderConfig(BaseModel):
-    """Local file encryption provider configuration.
+    """Local encryption provider configuration.
 
-    Uses a local file to store the Root Key.
+    Reads the Root Key from a local file or directly from configuration.
     Suitable for single-user or development environments.
     """
 
-    key_file: str = Field(
-        default="~/.openviking/master.key", description="Path to local root key file"
+    key_file: Optional[str] = Field(
+        default="~/.openviking/master.key",
+        description="Path to local root key file",
     )
+    root_key: Optional[str] = Field(
+        default=None,
+        repr=False,
+        description="32-byte root key encoded as 64 hexadecimal characters",
+    )
+
+    @model_validator(mode="after")
+    def use_inline_key_without_implicit_file(self) -> "LocalEncryptionProviderConfig":
+        if self.root_key is not None and "key_file" not in self.model_fields_set:
+            self.key_file = None
+        return self
 
 
 class VaultEncryptionProviderConfig(BaseModel):
@@ -30,6 +42,24 @@ class VaultEncryptionProviderConfig(BaseModel):
         default="transit", description="HashiCorp Vault transit secrets engine mount point"
     )
     key_name: str = Field(default="openviking-root", description="HashiCorp Vault key name")
+    kv_mount_point: str = Field(
+        default="secret",
+        description="KV secrets engine mount point for persisting the encrypted root key",
+    )
+    kv_version: int = Field(
+        default=1,
+        ge=1,
+        le=2,
+        description="KV secrets engine version (1 or 2)",
+    )
+    root_key_name: str = Field(
+        default="openviking-root-key",
+        description="Transit engine key name used for envelope encryption (primary, preferred over key_name)",
+    )
+    encrypted_root_key_key: str = Field(
+        default="openviking-encrypted-root-key",
+        description="KV path under which the encrypted root key is stored",
+    )
 
 
 class VolcengineKMSEncryptionProviderConfig(BaseModel):
@@ -43,6 +73,24 @@ class VolcengineKMSEncryptionProviderConfig(BaseModel):
     region: str = Field(default="cn-beijing", description="Volcengine KMS region")
     access_key: Optional[str] = Field(default=None, description="Volcengine access key ID")
     secret_key: Optional[str] = Field(default=None, description="Volcengine secret access key")
+    key_file: Optional[str] = Field(default=None, description="Path to encrypted root key file")
+
+
+class APIKeyHashingConfig(BaseModel):
+    """API key hashing configuration.
+
+    Controls whether API keys are hashed using Argon2id before storage.
+    When disabled (default), API keys are stored in plaintext within
+    AES-GCM encrypted files, allowing admin users to retrieve full keys.
+    When enabled, API keys are hashed with Argon2id (one-way),
+    providing maximum security but preventing key recovery.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Whether API key Argon2id hashing is enabled. "
+        "Default: false - rely on file-level AES encryption for protection.",
+    )
 
 
 class EncryptionConfig(BaseModel):
@@ -84,25 +132,29 @@ class EncryptionConfig(BaseModel):
     )
 
     local: LocalEncryptionProviderConfig = Field(
-        default_factory=lambda: LocalEncryptionProviderConfig(),
+        default_factory=LocalEncryptionProviderConfig,
         description="Local provider configuration",
     )
 
     vault: VaultEncryptionProviderConfig = Field(
-        default_factory=lambda: VaultEncryptionProviderConfig(),
+        default_factory=VaultEncryptionProviderConfig,
         description="Vault provider configuration",
     )
 
     volcengine_kms: VolcengineKMSEncryptionProviderConfig = Field(
-        default_factory=lambda: VolcengineKMSEncryptionProviderConfig(),
+        default_factory=VolcengineKMSEncryptionProviderConfig,
         description="Volcengine KMS provider configuration",
+    )
+
+    api_key_hashing: APIKeyHashingConfig = Field(
+        default_factory=APIKeyHashingConfig,
+        description="API key hashing configuration. "
+        "Controls whether API keys are hashed using Argon2id before storage.",
     )
 
     params: Dict[str, Any] = Field(
         default_factory=dict, description="Additional encryption-specific parameters"
     )
-
-    model_config = {"extra": "forbid"}
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "EncryptionConfig":

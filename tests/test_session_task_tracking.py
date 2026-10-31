@@ -9,30 +9,29 @@ from typing import AsyncGenerator, Tuple
 import httpx
 import pytest_asyncio
 
-from openviking import AsyncOpenViking
+from openviking.core.namespace import canonical_session_uri
 from openviking.server.app import create_app
+from openviking.server.auth.plugins import DevAuthPlugin
 from openviking.server.config import ServerConfig
 from openviking.server.dependencies import set_service
 from openviking.service.core import OpenVikingService
-from openviking.service.task_tracker import get_task_tracker, reset_task_tracker
+from openviking.service.task_tracker import get_task_tracker
 
 
 @pytest_asyncio.fixture
-async def api_client(temp_dir) -> AsyncGenerator[Tuple[httpx.AsyncClient, OpenVikingService], None]:
+async def api_client(
+    service: OpenVikingService,
+) -> AsyncGenerator[Tuple[httpx.AsyncClient, OpenVikingService], None]:
     """Create in-process HTTP client for API endpoint tests."""
-    reset_task_tracker()
-    service = OpenVikingService(path=str(temp_dir / "api_data"))
-    await service.initialize()
     app = create_app(config=ServerConfig(), service=service)
     set_service(service)
+    app.state.auth_plugin = DevAuthPlugin()
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         yield client, service
 
-    await service.close()
-    await AsyncOpenViking.reset()
-    reset_task_tracker()
+    set_service(None)
 
 
 async def _new_session_with_message(client: httpx.AsyncClient) -> str:
@@ -64,18 +63,18 @@ def _make_tracked_commit(behavior="instant", result_overrides=None, gate=None, s
         started: asyncio.Event to set when background task starts (for "gated")
     """
 
-    async def mock_commit(_sid, _ctx):
+    async def mock_commit(_sid, _ctx, **_kwargs):
         tracker = get_task_tracker()
-        task = tracker.create(
+        task = await tracker.create(
             "session_commit",
             resource_id=_sid,
-            owner_account_id=_ctx.account_id,
-            owner_user_id=_ctx.user.user_id,
+            account_id=_ctx.account_id,
+            user_id=_ctx.user.user_id,
         )
-        archive_uri = f"viking://session/test/{_sid}/history/archive_001"
+        archive_uri = f"{canonical_session_uri(_ctx, _sid)}/history/archive_001"
 
         async def _background():
-            tracker.start(task.task_id)
+            await tracker.start(task.task_id, account_id=_ctx.account_id, user_id=_ctx.user.user_id)
             try:
                 if started:
                     started.set()
@@ -92,13 +91,22 @@ def _make_tracked_commit(behavior="instant", result_overrides=None, gate=None, s
                     "session_id": _sid,
                     "archive_uri": archive_uri,
                     "memories_extracted": {},
-                    "active_count_updated": 0,
                 }
                 if result_overrides:
                     final_result.update(result_overrides)
-                tracker.complete(task.task_id, final_result)
+                await tracker.complete(
+                    task.task_id,
+                    final_result,
+                    account_id=_ctx.account_id,
+                    user_id=_ctx.user.user_id,
+                )
             except Exception as e:
-                tracker.fail(task.task_id, str(e))
+                await tracker.fail(
+                    task.task_id,
+                    str(e),
+                    account_id=_ctx.account_id,
+                    user_id=_ctx.user.user_id,
+                )
 
         asyncio.create_task(_background())
 
@@ -200,33 +208,6 @@ async def test_task_lifecycle_failure(api_client):
     assert "LLM provider timeout" in result["error"]
 
 
-async def test_task_failed_when_memory_extraction_raises(api_client):
-    """Extractor failures should propagate to task error instead of silent completed+0."""
-    client, service = api_client
-    session_id = await _new_session_with_message(client)
-
-    async def failing_extract(_context, _user, _session_id):
-        raise RuntimeError("memory_extraction_failed: synthetic extractor error")
-
-    service.sessions._session_compressor.extractor.extract = failing_extract
-
-    resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
-    task_id = resp.json()["result"]["task_id"]
-
-    result = None
-    for _ in range(120):
-        await asyncio.sleep(0.1)
-        task_resp = await client.get(f"/api/v1/tasks/{task_id}")
-        assert task_resp.status_code == 200
-        result = task_resp.json()["result"]
-        if result["status"] in {"completed", "failed"}:
-            break
-
-    assert result is not None
-    assert result["status"] == "failed"
-    assert "memory_extraction_failed" in result["error"]
-
-
 # ── Duplicate commit acceptance ──
 
 
@@ -283,6 +264,34 @@ async def test_list_tasks(api_client):
     assert tasks[0]["task_type"] == "session_commit"
 
 
+async def test_list_tasks_hides_internal_tasks_by_default(api_client):
+    client, _ = api_client
+    tracker = get_task_tracker()
+    visible = await tracker.create(
+        "add_resource",
+        account_id="default",
+        user_id="default",
+    )
+    internal = await tracker.create(
+        "add_resource",
+        account_id="default",
+        user_id="default",
+        meta={"internal": True},
+    )
+
+    resp = await client.get("/api/v1/tasks", params={"task_type": "add_resource"})
+    task_ids = {task["task_id"] for task in resp.json()["result"]}
+    assert visible.task_id in task_ids
+    assert internal.task_id not in task_ids
+
+    resp = await client.get(
+        "/api/v1/tasks",
+        params={"task_type": "add_resource", "include_internal": True},
+    )
+    assert internal.task_id in {task["task_id"] for task in resp.json()["result"]}
+    assert (await client.get(f"/api/v1/tasks/{internal.task_id}")).status_code == 200
+
+
 async def test_list_tasks_filter_status(api_client):
     client, service = api_client
 
@@ -321,3 +330,227 @@ async def test_error_sanitized_in_task(api_client):
     error = task_resp.json()["result"]["error"]
     assert "superSecretKey" not in error
     assert "[REDACTED]" in error
+
+
+# ── add_resource task tracking ──
+
+
+async def test_add_resource_async_returns_task_id(api_client):
+    """add_resource with wait=False should return a task_id."""
+    client, service = api_client
+
+    async def fake_add_resource(**kwargs):
+        tracker = get_task_tracker()
+        root_uri = "viking://resources/async-test"
+        task = await tracker.create(
+            "add_resource",
+            resource_id=root_uri,
+            account_id=kwargs["ctx"].account_id,
+            user_id=kwargs["ctx"].user.user_id,
+        )
+        await tracker.start(
+            task.task_id,
+            account_id=kwargs["ctx"].account_id,
+            user_id=kwargs["ctx"].user.user_id,
+        )
+        await tracker.complete(
+            task.task_id,
+            {"root_uri": root_uri},
+            account_id=kwargs["ctx"].account_id,
+            user_id=kwargs["ctx"].user.user_id,
+        )
+        return {"status": "success", "root_uri": root_uri, "task_id": task.task_id}
+
+    service.resources.add_resource = fake_add_resource
+
+    from openviking.server.identity import RequestContext, Role
+    from openviking_cli.session.user_id import UserIdentifier
+
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
+    result = await service.resources.add_resource(ctx=ctx, reason="test async resource")
+
+    assert "task_id" in result
+    assert result["task_id"]
+
+    task_resp = await client.get(f"/api/v1/tasks/{result['task_id']}")
+    assert task_resp.status_code == 200
+    task_data = task_resp.json()["result"]
+    assert task_data["task_type"] == "add_resource"
+
+
+async def test_add_resource_sync_no_task_id(api_client):
+    """add_resource with wait=True should NOT return a task_id."""
+    client, service = api_client
+
+    async def fake_add_resource(**kwargs):
+        root_uri = "viking://resources/sync-test"
+        return {"status": "success", "root_uri": root_uri}
+
+    service.resources.add_resource = fake_add_resource
+
+    from openviking.server.identity import RequestContext, Role
+    from openviking_cli.session.user_id import UserIdentifier
+
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
+    result = await service.resources.add_resource(ctx=ctx, reason="test sync resource")
+
+    assert "task_id" not in result
+
+
+async def test_add_resource_async_task_lifecycle(api_client):
+    """Async add_resource task should transition pending→running→completed."""
+    client, service = api_client
+
+    async def fake_add_resource(**kwargs):
+        tracker = get_task_tracker()
+        root_uri = "viking://resources/test-resource"
+        task = await tracker.create(
+            "add_resource",
+            resource_id=root_uri,
+            account_id=kwargs["ctx"].account_id,
+            user_id=kwargs["ctx"].user.user_id,
+        )
+
+        async def _background():
+            await tracker.start(
+                task.task_id,
+                account_id=kwargs["ctx"].account_id,
+                user_id=kwargs["ctx"].user.user_id,
+            )
+            await asyncio.sleep(0.05)
+            await tracker.complete(
+                task.task_id,
+                {"root_uri": root_uri},
+                account_id=kwargs["ctx"].account_id,
+                user_id=kwargs["ctx"].user.user_id,
+            )
+
+        asyncio.create_task(_background())
+        return {"status": "success", "root_uri": root_uri, "task_id": task.task_id}
+
+    service.resources.add_resource = fake_add_resource
+
+    from openviking.server.identity import RequestContext, Role
+    from openviking_cli.session.user_id import UserIdentifier
+
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
+    result = await service.resources.add_resource(ctx=ctx, reason="test lifecycle")
+
+    task_id = result["task_id"]
+
+    task_resp = await client.get(f"/api/v1/tasks/{task_id}")
+    assert task_resp.status_code == 200
+    assert task_resp.json()["result"]["status"] in {"pending", "running"}
+
+    await asyncio.sleep(0.2)
+
+    task_resp = await client.get(f"/api/v1/tasks/{task_id}")
+    assert task_resp.status_code == 200
+    task_data = task_resp.json()["result"]
+    assert task_data["status"] == "completed"
+    assert task_data["task_type"] == "add_resource"
+
+
+async def test_add_resource_task_list_filter(api_client):
+    """add_resource tasks should appear in task list filtered by type."""
+    client, service = api_client
+
+    async def fake_add_resource(**kwargs):
+        tracker = get_task_tracker()
+        root_uri = "viking://resources/filter-test"
+        task = await tracker.create(
+            "add_resource",
+            resource_id=root_uri,
+            account_id=kwargs["ctx"].account_id,
+            user_id=kwargs["ctx"].user.user_id,
+        )
+        await tracker.start(
+            task.task_id,
+            account_id=kwargs["ctx"].account_id,
+            user_id=kwargs["ctx"].user.user_id,
+        )
+        await tracker.complete(
+            task.task_id,
+            {"root_uri": root_uri},
+            account_id=kwargs["ctx"].account_id,
+            user_id=kwargs["ctx"].user.user_id,
+        )
+        return {"status": "success", "root_uri": root_uri, "task_id": task.task_id}
+
+    service.resources.add_resource = fake_add_resource
+
+    from openviking.server.identity import RequestContext, Role
+    from openviking_cli.session.user_id import UserIdentifier
+
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
+    result = await service.resources.add_resource(ctx=ctx, reason="test list filter")
+    task_id = result["task_id"]
+
+    resp = await client.get("/api/v1/tasks", params={"task_type": "add_resource"})
+    assert resp.status_code == 200
+    tasks = resp.json()["result"]
+    matching = [t for t in tasks if t["task_id"] == task_id]
+    assert len(matching) >= 1
+    assert matching[0]["task_type"] == "add_resource"
+
+
+# ── add_skill task tracking ──
+
+
+async def test_add_skill_async_returns_task_id(api_client):
+    """add_skill with wait=False should return a task_id."""
+    client, service = api_client
+
+    async def fake_add_skill(**kwargs):
+        tracker = get_task_tracker()
+        task = await tracker.create(
+            "add_skill",
+            account_id=kwargs["ctx"].account_id,
+            user_id=kwargs["ctx"].user.user_id,
+        )
+        await tracker.start(
+            task.task_id,
+            account_id=kwargs["ctx"].account_id,
+            user_id=kwargs["ctx"].user.user_id,
+        )
+        await tracker.complete(
+            task.task_id,
+            {},
+            account_id=kwargs["ctx"].account_id,
+            user_id=kwargs["ctx"].user.user_id,
+        )
+        return {"status": "success", "task_id": task.task_id}
+
+    service.resources.add_skill = fake_add_skill
+
+    from openviking.server.identity import RequestContext, Role
+    from openviking_cli.session.user_id import UserIdentifier
+
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
+    result = await service.resources.add_skill(data="test skill", ctx=ctx)
+
+    assert "task_id" in result
+    assert result["task_id"]
+
+    task_resp = await client.get(f"/api/v1/tasks/{result['task_id']}")
+    assert task_resp.status_code == 200
+    task_data = task_resp.json()["result"]
+    assert task_data["task_type"] == "add_skill"
+
+
+async def test_add_skill_sync_no_task_id(api_client):
+    """add_skill with wait=True should NOT return a task_id."""
+    client, service = api_client
+
+    async def fake_add_skill(**kwargs):
+        return {"status": "success"}
+
+    service.resources.add_skill = fake_add_skill
+
+    from openviking.server.identity import RequestContext, Role
+    from openviking_cli.session.user_id import UserIdentifier
+
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
+    result = await service.resources.add_skill(data="test skill", ctx=ctx, wait=True)
+
+    assert "task_id" not in result

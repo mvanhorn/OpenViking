@@ -2,681 +2,426 @@
 
 <a href="https://openviking.ai/" target="_blank">
   <picture>
-    <img alt="OpenViking" src="docs/images/ov-logo.png" width="200px" height="auto">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/volcengine/OpenViking/main/docs/images/readme-logo-dark.png">
+    <img alt="OpenViking" src="https://raw.githubusercontent.com/volcengine/OpenViking/main/docs/images/readme-logo-light.png" width="300" height="56">
   </picture>
 </a>
 
-### OpenViking: The Context Database for AI Agents
+### The Context Database for AI Agents
 
-English / [中文](README_CN.md) / [日本語](README_JA.md)
+English / [中文](docs/repository/README_CN.md) / [日本語](docs/repository/README_JA.md)
 
-<a href="https://www.openviking.ai">Website</a> · <a href="https://github.com/volcengine/OpenViking">GitHub</a> · <a href="https://github.com/volcengine/OpenViking/issues">Issues</a> · <a href="./docs">Docs</a>
+<a href="https://www.openviking.ai">Website</a> · <a href="https://studio.openviking.ai">Live Demo</a> · <a href="https://github.com/volcengine/OpenViking">GitHub</a> · <a href="https://github.com/volcengine/OpenViking/issues">Issues</a> · <a href="https://docs.openviking.ai/">Docs</a> · <a href="https://blog.openviking.ai/">Blog</a>
 
-[![][release-shield]][release-link]
-[![][github-stars-shield]][github-stars-link]
-[![][github-issues-shield]][github-issues-shield-link]
-[![][github-contributors-shield]][github-contributors-link]
-[![][license-shield]][license-shield-link]
-[![][last-commit-shield]][last-commit-shield-link]
+<p>
+  <a href="https://github.com/volcengine/OpenViking/releases"><img src="https://img.shields.io/github/v/release/volcengine/OpenViking?color=369eff&labelColor=black&logo=github&style=flat-square" alt="release"></a>
+  <a href="https://github.com/volcengine/OpenViking"><img src="https://img.shields.io/github/stars/volcengine/OpenViking?labelColor&style=flat-square&color=ffcb47" alt="stars"></a>
+  <a href="https://github.com/volcengine/OpenViking/issues"><img src="https://img.shields.io/github/issues/volcengine/OpenViking?labelColor=black&style=flat-square&color=ff80eb" alt="issues"></a>
+  <a href="https://github.com/volcengine/OpenViking/graphs/contributors"><img src="https://img.shields.io/github/contributors/volcengine/OpenViking?color=c4f042&labelColor=black&style=flat-square" alt="contributors"></a>
+  <a href="https://github.com/volcengine/OpenViking/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPLv3-white?labelColor=black&style=flat-square" alt="license"></a>
+  <a href="https://github.com/volcengine/OpenViking/commits/main"><img src="https://img.shields.io/github/last-commit/volcengine/OpenViking?color=c4f042&labelColor=black&style=flat-square" alt="last commit"></a>
+</p>
 
-👋 Join our Community
+<p>
+  <a href="https://railway.com/deploy/openviking"><img src="https://railway.com/button.svg" alt="Deploy on Railway" height="30"></a>
+</p>
 
-📱 <a href="./docs/en/about/01-about-us.md#lark-group">Lark Group</a> · <a href="./docs/en/about/01-about-us.md#wechat-group">WeChat</a> · <a href="https://discord.com/invite/eHvx8E9XF3">Discord</a> · <a href="https://x.com/openvikingai">X</a>
+<p>
+  <a href="https://docs.openviking.ai/en/about/01-about-us#lark-group"><img src="docs/images/community/lark.svg" width="18" height="18" alt="Lark">&nbsp;Lark</a> ·
+  <a href="https://docs.openviking.ai/en/about/01-about-us#wechat-group"><img src="docs/images/community/wechat.svg" width="18" height="18" alt="WeChat">&nbsp;WeChat</a> ·
+  <a href="https://discord.com/invite/eHvx8E9XF3"><img src="docs/images/community/discord.svg" width="18" height="18" alt="Discord">&nbsp;Discord</a> ·
+  <a href="https://x.com/openvikingai"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/community/x-dark.svg"><img src="docs/images/community/x.svg" width="16" height="16" alt="X"></picture>&nbsp;X</a>
+</p>
 
 <a href="https://trendshift.io/repositories/19668" target="_blank"><img src="https://trendshift.io/api/badge/repositories/19668" alt="volcengine%2FOpenViking | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 
 </div>
 
----
+***
 
-## Overview
+## What is OpenViking
 
-### Challenges in Agent Development
+OpenViking is an open-source context database for AI agents — one filesystem for everything an agent knows: knowledge, memory, and skills.
 
-In the AI era, data is abundant, but high-quality context is hard to come by. When building AI Agents, developers often face these challenges:
+Most agent memory is a black box: text goes in, embeddings come out, and nobody can see what was actually stored. OpenViking organizes context as a virtual filesystem under `viking://` instead. Agents navigate it like files — `ls`, `tree`, `read`, `write`, `grep` — and you can open any directory to inspect and edit what your agent knows. Every directory carries a generated summary, so agents can scan summaries first and decide what to read.
 
-- **Fragmented Context**: Memories are in code, resources are in vector databases, and skills are scattered, making them difficult to manage uniformly.
-- **Surging Context Demand**: An Agent's long-running tasks produce context at every execution. Simple truncation or compression leads to information loss.
-- **Poor Retrieval Effectiveness**: Traditional RAG uses flat storage, lacking a global view and making it difficult to understand the full context of information.
-- **Unobservable Context**: The implicit retrieval chain of traditional RAG is like a black box, making it hard to debug when errors occur.
-- **Limited Memory Iteration**: Current memory is just a record of user interactions, lacking Agent-related task memory.
+<a href="https://studio.openviking.ai" target="_blank" rel="noopener noreferrer">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/studio-filesystem-dark.png">
+    <img src="docs/images/studio-filesystem.png" alt="OpenViking Studio Filesystem: browse personal memories and resources">
+  </picture>
+</a>
 
-### The OpenViking Solution
+[Try OpenViking Studio](https://studio.openviking.ai) in your browser, no installation required. [Self-host Web Studio](web-studio/README.md).
 
-**OpenViking** is an open-source **Context Database** designed specifically for AI Agents.
+## Why OpenViking
 
-We aim to define a minimalist context interaction paradigm for Agents, allowing developers to completely say goodbye to the hassle of context management. OpenViking abandons the fragmented vector storage model of traditional RAG and innovatively adopts a **"file system paradigm"** to unify the structured organization of memories, resources, and skills needed by Agents.
+- **One filesystem for knowledge, memory, and skills.** Resources hold documents and code; memories retain user preferences and experience; skills define how to perform tasks — not just extracted facts, but the full context, each with a `viking://` URI for browsing and retrieval. → [Viking URI](https://docs.openviking.ai/en/concepts/04-viking-uri) · [Context types](https://docs.openviking.ai/en/concepts/02-context-types)
+- **Search a directory, not the whole index.** Scope semantic search to a project or memory subtree instead of scanning a flat vector pool. `find` runs a query directly; `search` plans retrieval from session context. → [Retrieval](https://docs.openviking.ai/en/concepts/07-retrieval)
+- **Read the summary before the source.** Generated directory abstracts (L0) and overviews (L1) let agents judge relevance before opening full content (L2). → [Context layers](https://docs.openviking.ai/en/concepts/03-context-layers)
+- **Sessions become files you can read.** Committing a session archives the conversation and extracts memories as Markdown you can inspect, edit, and merge. With VikingBot enabled, `ov compile` organizes source material into a wiki, knowledge graph, or report. → [Sessions](https://docs.openviking.ai/en/concepts/08-session) · [Context compilation](https://docs.openviking.ai/en/context-compilation/01-overview)
 
-With OpenViking, developers can build an Agent's brain just like managing local files:
-
-- **Filesystem Management Paradigm** → **Solves Fragmentation**: Unified context management of memories, resources, and skills based on a filesystem paradigm.
-- **Tiered Context Loading** → **Reduces Token Consumption**: L0/L1/L2 three-tier structure, loaded on demand, significantly saving costs.
-- **Directory Recursive Retrieval** → **Improves Retrieval Effect**: Supports native filesystem retrieval methods, combining directory positioning with semantic search to achieve recursive and precise context acquisition.
-- **Visualized Retrieval Trajectory** → **Observable Context**: Supports visualization of directory retrieval trajectories, allowing users to clearly observe the root cause of issues and guide retrieval logic optimization.
-- **Automatic Session Management** → **Context Self-Iteration**: Automatically compresses content, resource references, tool calls, etc., in conversations, extracting long-term memory, making the Agent smarter with use.
-
----
-
-## Quick Start
-
-### Prerequisites
-
-Before starting with OpenViking, please ensure your environment meets the following requirements:
-
-- **Python Version**: 3.10 or higher
-- **Go Version**: 1.22 or higher (Required for building AGFS components)
-- **C++ Compiler**: GCC 9+ or Clang 11+ (Required for building core extensions)
-- **Operating System**: Linux, macOS, Windows
-- **Network Connection**: A stable network connection is required (for downloading dependencies and accessing model services)
-
-### 1. Installation
-
-#### Python Package
-
-```bash
-pip install openviking --upgrade --force-reinstall
-```
-
-#### Rust CLI (Optional)
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/crates/ov_cli/install.sh | bash
-```
-
-Or build from source:
-
-```bash
-cargo install --git https://github.com/volcengine/OpenViking ov_cli
-```
-
-### 2. Model Preparation
-
-OpenViking requires the following model capabilities:
-- **VLM Model**: For image and content understanding
-- **Embedding Model**: For vectorization and semantic retrieval
-
-#### Supported VLM Providers
-
-OpenViking supports three VLM providers:
-
-| Provider | Description | Get API Key |
-|----------|-------------|-------------|
-| `volcengine` | Volcengine Doubao Models | [Volcengine Console](https://console.volcengine.com/ark/region:ark+cn-beijing/overview?briefPage=0&briefType=introduce&type=new&utm_content=OpenViking&utm_medium=devrel&utm_source=OWO&utm_term=OpenViking) |
-| `openai` | OpenAI Official API | [OpenAI Platform](https://platform.openai.com) |
-| `litellm` | Unified access to various third-party models (Anthropic, DeepSeek, Gemini, vLLM, Ollama, etc.) | See [LiteLLM Providers](https://docs.litellm.ai/docs/providers) |
-
-> 💡 **Tip**:
-> - `litellm` supports unified access to various models. The `model` field must follow the [LiteLLM format specification](https://docs.litellm.ai/docs/providers)
-> - The system auto-detects common models (e.g., `claude-*`, `deepseek-*`, `gemini-*`, `hosted_vllm/*`, `ollama/*`, etc.). For other models, use the full prefix according to LiteLLM format
-
-#### Provider-Specific Notes
-
-<details>
-<summary><b>Volcengine (Doubao)</b></summary>
-
-Volcengine supports both model names and endpoint IDs. Using model names is recommended for simplicity:
-
-```json
-{
-  "vlm": {
-    "provider": "volcengine",
-    "model": "doubao-seed-2-0-pro-260215",
-    "api_key": "your-api-key",
-    "api_base": "https://ark.cn-beijing.volces.com/api/v3"
-  }
-}
-```
-
-You can also use endpoint IDs (found in [Volcengine ARK Console](https://console.volcengine.com/ark/region:ark+cn-beijing/overview?briefPage=0&briefType=introduce&type=new&utm_content=OpenViking&utm_medium=devrel&utm_source=OWO&utm_term=OpenViking):
-
-```json
-{
-  "vlm": {
-    "provider": "volcengine",
-    "model": "ep-20241220174930-xxxxx",
-    "api_key": "your-api-key",
-    "api_base": "https://ark.cn-beijing.volces.com/api/v3"
-  }
-}
-```
-
-</details>
-
-<details>
-<summary><b>OpenAI</b></summary>
-
-Use OpenAI's official API:
-
-```json
-{
-  "vlm": {
-    "provider": "openai",
-    "model": "gpt-4o",
-    "api_key": "your-api-key",
-    "api_base": "https://api.openai.com/v1"
-  }
-}
-```
-
-You can also use a custom OpenAI-compatible endpoint:
-
-```json
-{
-  "vlm": {
-    "provider": "openai",
-    "model": "gpt-4o",
-    "api_key": "your-api-key",
-    "api_base": "https://your-custom-endpoint.com/v1"
-  }
-}
-```
-
-</details>
-
-<details>
-<summary><b>LiteLLM (Anthropic, DeepSeek, Gemini, Qwen, vLLM, Ollama, etc.)</b></summary>
-
-LiteLLM provides unified access to various models. The `model` field should follow LiteLLM's naming convention. Here we use Claude and Qwen as examples:
-
-**Anthropic:**
-
-```json
-{
-  "vlm": {
-    "provider": "litellm",
-    "model": "claude-3-5-sonnet-20240620",
-    "api_key": "your-anthropic-api-key"
-  }
-}
-```
-
-**Qwen (DashScope):**
-
-```json
-{
-  "vlm": {
-    "provider": "litellm",
-    "model": "dashscope/qwen-turbo", // see https://docs.litellm.ai/docs/providers/dashscope for more details
-    "api_key": "your-dashscope-api-key",
-    "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1"
-  }
-}
-```
-
-> 💡 **Tip for Qwen**: 
-> - For **China/Beijing** region, use `api_base`: `https://dashscope.aliyuncs.com/compatible-mode/v1`
-> - For **International** region, use `api_base`: `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`
-
-**Common model formats:**
-
-| Provider | Model Example | Notes |
-|----------|---------------|-------|
-| Anthropic | `claude-3-5-sonnet-20240620` | Auto-detected, uses `ANTHROPIC_API_KEY` |
-| DeepSeek | `deepseek-chat` | Auto-detected, uses `DEEPSEEK_API_KEY` |
-| Gemini | `gemini-pro` | Auto-detected, uses `GEMINI_API_KEY` |
-| Qwen | `dashscope/qwen-turbo` | Set `api_base` based on region (see above) |
-| OpenRouter | `openrouter/openai/gpt-4o` | Full prefix required |
-| vLLM | `hosted_vllm/llama-3.1-8b` | Set `api_base` to vLLM server |
-| Ollama | `ollama/llama3.1` | Set `api_base` to Ollama server |
-
-**Local Models (vLLM / Ollama):**
-
-```bash
-
-# Start Ollama
-ollama serve
-```
-
-```json
-// Ollama
-{
-  "vlm": {
-    "provider": "litellm",
-    "model": "ollama/llama3.1",
-    "api_base": "http://localhost:11434"
-  }
-}
-```
-
-For complete model support, see [LiteLLM Providers Documentation](https://docs.litellm.ai/docs/providers).
-
-</details>
-
-### 3. Environment Configuration
-
-#### Server Configuration Template
-
-Create a configuration file `~/.openviking/ov.conf`, remove the comments before copy:
-
-```json
-{
-  "storage": {
-    "workspace": "/home/your-name/openviking_workspace"
-  },
-  "log": {
-    "level": "INFO",
-    "output": "stdout"                 // Log output: "stdout" or "file"
-  },
-  "embedding": {
-    "dense": {
-      "api_base" : "<api-endpoint>",   // API endpoint address
-      "api_key"  : "<your-api-key>",   // Model service API Key
-      "provider" : "<provider-type>",  // Provider type: "volcengine" or "openai" (currently supported)
-      "dimension": 1024,               // Vector dimension
-      "model"    : "<model-name>"      // Embedding model name (e.g., doubao-embedding-vision-250615 or text-embedding-3-large)
-    },
-    "max_concurrent": 10               // Max concurrent embedding requests (default: 10)
-  },
-  "vlm": {
-    "api_base" : "<api-endpoint>",     // API endpoint address
-    "api_key"  : "<your-api-key>",     // Model service API Key
-    "provider" : "<provider-type>",    // Provider type (volcengine, openai, deepseek, anthropic, etc.)
-    "model"    : "<model-name>",       // VLM model name (e.g., doubao-seed-2-0-pro-260215 or gpt-4-vision-preview)
-    "max_concurrent": 100              // Max concurrent LLM calls for semantic processing (default: 100)
-  }
-}
-```
-
-> **Note**: For embedding models, supported providers are `volcengine` (Doubao), `openai`, `jina`, `voyage`, `minimax`, `vikingdb`, and `gemini` (requires `pip install "google-genai>=1.0.0"`). For VLM models, we support three providers: `volcengine`, `openai`, and `litellm`. The `litellm` provider supports various models including Anthropic (Claude), DeepSeek, Gemini, Moonshot, Zhipu, DashScope, MiniMax, vLLM, Ollama, and more.
-
-#### Server Configuration Examples
-
-👇 Expand to see the configuration example for your model service:
-
-<details>
-<summary><b>Example 1: Using Volcengine (Doubao Models)</b></summary>
-
-```json
-{
-  "storage": {
-    "workspace": "/home/your-name/openviking_workspace"
-  },
-  "log": {
-    "level": "INFO",
-    "output": "stdout"                 // Log output: "stdout" or "file"
-  },
-  "embedding": {
-    "dense": {
-      "api_base" : "https://ark.cn-beijing.volces.com/api/v3",
-      "api_key"  : "your-volcengine-api-key",
-      "provider" : "volcengine",
-      "dimension": 1024,
-      "model"    : "doubao-embedding-vision-250615"
-    },
-    "max_concurrent": 10
-  },
-  "vlm": {
-    "api_base" : "https://ark.cn-beijing.volces.com/api/v3",
-    "api_key"  : "your-volcengine-api-key",
-    "provider" : "volcengine",
-    "model"    : "doubao-seed-2-0-pro-260215",
-    "max_concurrent": 100
-  }
-}
-```
-
-</details>
-
-<details>
-<summary><b>Example 2: Using OpenAI Models</b></summary>
-
-```json
-{
-  "storage": {
-    "workspace": "/home/your-name/openviking_workspace"
-  },
-  "log": {
-    "level": "INFO",
-    "output": "stdout"                 // Log output: "stdout" or "file"
-  },
-  "embedding": {
-    "dense": {
-      "api_base" : "https://api.openai.com/v1",
-      "api_key"  : "your-openai-api-key",
-      "provider" : "openai",
-      "dimension": 3072,
-      "model"    : "text-embedding-3-large"
-    },
-    "max_concurrent": 10
-  },
-  "vlm": {
-    "api_base" : "https://api.openai.com/v1",
-    "api_key"  : "your-openai-api-key",
-    "provider" : "openai",
-    "model"    : "gpt-4-vision-preview",
-    "max_concurrent": 100
-  }
-}
-```
-
-</details>
-
-<details>
-<summary><b>Example 3: Using Google Gemini Embedding</b></summary>
-
-Install the required package first:
-
-```bash
-pip install "google-genai>=1.0.0"
-```
-
-```json
-{
-  "storage": {
-    "workspace": "/home/your-name/openviking_workspace"
-  },
-  "embedding": {
-    "dense": {
-      "provider": "gemini",
-      "api_key": "your-google-api-key",
-      "model": "gemini-embedding-2-preview",
-      "dimension": 3072
-    },
-    "max_concurrent": 10
-  },
-  "vlm": {
-    "api_base" : "https://api.openai.com/v1",
-    "api_key"  : "your-openai-api-key",
-    "provider" : "openai",
-    "model"    : "gpt-4o",
-    "max_concurrent": 100
-  }
-}
-```
-
-Get your Google API key at https://aistudio.google.com/apikey
-
-</details>
-
-#### Set Server Configuration Environment Variable
-
-After creating the configuration file, set the environment variable to point to it (Linux/macOS):
-
-```bash
-export OPENVIKING_CONFIG_FILE=~/.openviking/ov.conf # by default
-```
-
-On Windows, use one of the following:
-
-PowerShell:
-
-```powershell
-$env:OPENVIKING_CONFIG_FILE = "$HOME/.openviking/ov.conf"
-```
-
-Command Prompt (cmd.exe):
-
-```bat
-set "OPENVIKING_CONFIG_FILE=%USERPROFILE%\.openviking\ov.conf"
-```
-
-> 💡 **Tip**: You can also place the configuration file in other locations, just specify the correct path in the environment variable.
-
-#### CLI/Client Configuration Examples
-
-👇 Expand to see the configuration example for your CLI/Client:
-
-Example: ovcli.conf for visiting localhost server
-
-```json
-{
-  "url": "http://localhost:1933",
-  "timeout": 60.0,
-  "output": "table"
-}
-```
-
-After creating the configuration file, set the environment variable to point to it (Linux/macOS):
-
-```bash
-export OPENVIKING_CLI_CONFIG_FILE=~/.openviking/ovcli.conf # by default
-```
-
-On Windows, use one of the following:
-
-PowerShell:
-
-```powershell
-$env:OPENVIKING_CLI_CONFIG_FILE = "$HOME/.openviking/ovcli.conf"
-```
-
-Command Prompt (cmd.exe):
-
-```bat
-set "OPENVIKING_CLI_CONFIG_FILE=%USERPROFILE%\.openviking\ovcli.conf"
-```
-
-### 4. Run Your First Example
-
-> 📝 **Prerequisite**: Ensure you have completed the configuration (ov.conf and ovcli.conf) in the previous step.
-
-Now let's run a complete example to experience the core features of OpenViking.
-
-#### Launch Server
-
-```bash
-openviking-server
-```
-
-or you can run in background
-
-```bash
-nohup openviking-server > /data/log/openviking.log 2>&1 &
-```
-
-#### Run the CLI
-
-```bash
-ov status
-ov add-resource https://github.com/volcengine/OpenViking # --wait
-ov ls viking://resources/
-ov tree viking://resources/volcengine -L 2
-# wait some time for semantic processing if not --wait
-ov find "what is openviking"
-ov grep "openviking" --uri viking://resources/volcengine/OpenViking/docs/zh
-```
-
-Congratulations! You have successfully run OpenViking 🎉
-
-### VikingBot Quick Start
-
-VikingBot is an AI agent framework built on top of OpenViking. Here's how to get started:
-
-```bash
-# Option 1: Install VikingBot from PyPI (recommended for most users)
-pip install "openviking[bot]"
-
-# Option 2: Install VikingBot from source (for development)
-uv pip install -e ".[bot]"
-
-# Start OpenViking server with Bot enabled
-openviking-server --with-bot
-
-# In another terminal, start interactive chat
-ov chat
-```
-
-If you use the official Docker image, `vikingbot` is already bundled in the image and starts by default together with the OpenViking server and console UI. You can disable it at runtime with either `--without-bot` or `-e OPENVIKING_WITH_BOT=0`.
-
----
-
-## Server Deployment Details
-
-For production environments, we recommend running OpenViking as a standalone HTTP service to provide persistent, high-performance context support for your AI Agents.
-
-🚀 **Deploy OpenViking on Cloud**:
-To ensure optimal storage performance and data security, we recommend deploying on **Volcengine Elastic Compute Service (ECS)** using the **veLinux** operating system. We have prepared a detailed step-by-step guide to get you started quickly.
-
-👉 **[View: Server Deployment & ECS Setup Guide](./docs/en/getting-started/03-quickstart-server.md)**
-
-
-## OpenClaw Context Plugin Details
-
-* Test Dataset: Effect testing based on LoCoMo10 (https://github.com/snap-research/locomo) long-range dialogues (1,540 cases in total after removing category5 without ground truth)
-* Experimental Groups: Since users may not disable OpenClaw's native memory when using OpenViking, we added experimental groups with native memory enabled or disabled
-* OpenViking Version: 0.1.18
-* Model: seed-2.0-code
-* Evaluation Script: https://github.com/ZaynJarvis/openclaw-eval/tree/main
-
-| Experimental Group | Task Completion Rate | Cost: Input Tokens (Total) |
-|----------|------------------|------------------|
-| OpenClaw(memory-core) |	35.65% |	24,611,530 |
-| OpenClaw + LanceDB (-memory-core) |	44.55% |	51,574,530 |
-| OpenClaw + OpenViking Plugin (-memory-core) |	52.08% |	4,264,396 |
-| OpenClaw + OpenViking Plugin (+memory-core) |	51.23% |	2,099,622 |
-
-* Experimental Conclusions:
-After integrating OpenViking:
-- With native memory enabled: 43% improvement over original OpenClaw with 91% reduction in input token cost; 15% improvement over LanceDB with 96% reduction in input token cost.
-- With native memory disabled: 49% improvement over original OpenClaw with 83% reduction in input token cost; 17% improvement over LanceDB with 92% reduction in input token cost.
-
-👉 **[View: OpenClaw Context Plugin](examples/openclaw-plugin/README.md)**
-
-👉 **[View: OpenCode Memory Plugin Example](examples/opencode-memory-plugin/README.md)**
-
-👉 **[View: Claude Code Memory Plugin Example](examples/claude-code-memory-plugin/README.md)**
-
---
-
-## Core Concepts
-
-After running the first example, let's dive into the design philosophy of OpenViking. These five core concepts correspond one-to-one with the solutions mentioned earlier, together building a complete context management system:
-
-### 1. Filesystem Management Paradigm → Solves Fragmentation
-
-We no longer view context as flat text slices but unify them into an abstract virtual filesystem. Whether it's memories, resources, or capabilities, they are mapped to virtual directories under the `viking://` protocol, each with a unique URI.
-
-This paradigm gives Agents unprecedented context manipulation capabilities, enabling them to locate, browse, and manipulate information precisely and deterministically through standard commands like `ls` and `find`, just like a developer. This transforms context management from vague semantic matching into intuitive, traceable "file operations". Learn more: [Viking URI](./docs/en/concepts/04-viking-uri.md) | [Context Types](./docs/en/concepts/02-context-types.md)
+[Architecture](https://docs.openviking.ai/en/concepts/01-architecture) · [Design rationale](https://blog.openviking.ai/post/openviking-context-database/)
 
 ```
 viking://
 ├── resources/              # Resources: project docs, repos, web pages, etc.
-│   ├── my_project/
-│   │   ├── docs/
-│   │   │   ├── api/
-│   │   │   └── tutorials/
-│   │   └── src/
-│   └── ...
-├── user/                   # User: personal preferences, habits, etc.
-│   └── memories/
-│       ├── preferences/
-│       │   ├── writing_style
-│       │   └── coding_habits
-│       └── ...
-└── agent/                  # Agent: skills, instructions, task memories, etc.
-    ├── skills/
-    │   ├── search_code
-    │   ├── analyze_data
-    │   └── ...
-    ├── memories/
-    └── instructions/
+│   └── my_project/
+│       ├── docs/
+│       │   ├── api/
+│       │   └── tutorials/
+│       └── src/
+└── user/
+    └── {user_id}/
+        ├── memories/
+        │   └── preferences/
+        │       ├── writing_style
+        │       └── coding_habits
+        ├── resources/
+        │   └── private_project/
+        ├── skills/
+        │   ├── search_code
+        │   └── analyze_data
+        └── peers/
+            └── web-visitor-alice/
 ```
 
-### 2. Tiered Context Loading → Reduces Token Consumption
+The three loading tiers:
 
-Stuffing massive amounts of context into a prompt all at once is not only expensive but also prone to exceeding model windows and introducing noise. OpenViking automatically processes context into three levels upon writing:
-- **L0 (Abstract)**: A one-sentence summary for quick retrieval and identification.
-- **L1 (Overview)**: Contains core information and usage scenarios for Agent decision-making during the planning phase.
-- **L2 (Details)**: The full original data, for deep reading by the Agent when absolutely necessary.
+- **L0 (Abstract)**: a one-sentence summary for quick relevance checks.
+- **L1 (Overview)**: core information and usage scenarios for planning.
+- **L2 (Details)**: the full original data, read only when needed.
 
-Learn more: [Context Layers](./docs/en/concepts/03-context-layers.md)
+Semantically processed directories carry L0/L1 summaries, so agents can judge relevance before reading full files:
 
 ```
 viking://resources/my_project/
-├── .abstract               # L0 Layer: Abstract (~100 tokens) - Quick relevance check
-├── .overview               # L1 Layer: Overview (~2k tokens) - Understand structure and key points
-├── docs/
-│   ├── .abstract          # Each directory has corresponding L0/L1 layers
-│   ├── .overview
-│   ├── api/
-│   │   ├── .abstract
-│   │   ├── .overview
-│   │   ├── auth.md        # L2 Layer: Full content - Load on demand
-│   │   └── endpoints.md
-│   └── ...
-└── src/
-    └── ...
+├── .abstract.md           # L0: quick relevance check
+├── .overview.md           # L1: structure and key points
+└── docs/
+    ├── .abstract.md
+    ├── .overview.md
+    └── api/
+        ├── auth.md         # L2: full content, loaded on demand
+        └── endpoints.md
 ```
 
-### 3. Directory Recursive Retrieval → Improves Retrieval Effect
+## Proof it works
 
-Single vector retrieval struggles with complex query intents. OpenViking has designed an innovative **Directory Recursive Retrieval Strategy** that deeply integrates multiple retrieval methods:
+OpenViking 0.3.22 has been evaluated on long-conversation user memory (LoCoMo) and multi-turn agent tasks (tau2-bench). Full results and setup details, including knowledge-base QA, are in the [benchmark report](https://blog.openviking.ai/post/openviking-benchmark-results/); reproduction scripts live in [./benchmark](./benchmark).
 
-1. **Intent Analysis**: Generate multiple retrieval conditions through intent analysis.
-2. **Initial Positioning**: Use vector retrieval to quickly locate the high-score directory where the initial slice is located.
-3. **Refined Exploration**: Perform a secondary retrieval within that directory and update high-score results to the candidate set.
-4. **Recursive Drill-down**: If subdirectories exist, recursively repeat the secondary retrieval steps layer by layer.
-5. **Result Aggregation**: Finally, obtain the most relevant context to return.
+To run your own experiments, follow the [RAG and Memory evaluation guide](benchmark/README.md) for routine VikingBot memory evaluation, published LoCoMo reproduction, separate mem0 prompt comparisons, and RAG evaluation.
 
-This "lock high-score directory first, then refine content exploration" strategy not only finds the semantically best-matching fragments but also understands the full context where the information resides, thereby improving the globality and accuracy of retrieval. Learn more: [Retrieval Mechanism](./docs/en/concepts/07-retrieval.md)
+The memory evaluation used [Doubao 2.0 Pro](https://console.volcengine.com/ark/region:cn-beijing/model/detail?Id=doubao-seed-2-0-pro) as the VLM and [Doubao-embedding-vision-251215](https://console.volcengine.com/ark/region:cn-beijing/model/detail?Id=doubao-embedding-vision) as the embedding model.
 
-### 4. Visualized Retrieval Trajectory → Observable Context
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/benchmark-dark.svg">
+  <img alt="Benchmark results. LoCoMo accuracy: OpenClaw 24.20% native vs 82.08% with OpenViking; Hermes 33.38% vs 82.86%; Claude Code 57.21% vs 80.32%. tau2-bench task success: Retail 70.94% vs 77.81%; Airline 54.38% vs 66.25%." src="docs/images/benchmark-light.svg">
+</picture>
 
-OpenViking's organization uses a hierarchical virtual filesystem structure. All context is integrated in a unified format, and each entry corresponds to a unique URI (like a `viking://` path), breaking the traditional flat black-box management mode with a clear hierarchy that is easy to understand.
+- **User memory (LoCoMo)**: with OpenViking, all three agent integrations land at 80–83% accuracy — up from 24–57% on their native memory — while input tokens drop by 34.3–91.0% and query latency by 58.45–66.10%.
+- **Agent experience (tau2-bench)**: experience memory lifts task success by +6.87pp (retail) and +11.87pp (airline) over the same LLM without memory.
 
-The retrieval process adopts a directory recursive strategy. The trajectory of directory browsing and file positioning for each retrieval is fully preserved, allowing users to clearly observe the root cause of problems and guide the optimization of retrieval logic. Learn more: [Retrieval Mechanism](./docs/en/concepts/07-retrieval.md)
+## Quick start
 
-### 5. Automatic Session Management → Context Self-Iteration
+Set up an OpenViking server first; if you already have one, skip to [Use it with your agent](#use-it-with-your-agent). Deploying your own needs uv, Python 3.10+ and a model provider with an embedding model and a VLM.
 
-OpenViking has a built-in memory self-iteration loop. At the end of each session, developers can actively trigger the memory extraction mechanism. The system will asynchronously analyze task execution results and user feedback, and automatically update them to the User and Agent memory directories.
+<details open>
+<summary><strong>Let your agent deploy it</strong></summary>
 
-- **User Memory Update**: Update memories related to user preferences, making Agent responses better fit user needs.
-- **Agent Experience Accumulation**: Extract core content such as operational tips and tool usage experience from task execution experience, aiding efficient decision-making in subsequent tasks.
+```text
+Follow this guide to install and start an OpenViking Server for me:
 
-This allows the Agent to get "smarter with use" through interactions with the world, achieving self-evolution. Learn more: [Session Management](./docs/en/concepts/08-session.md)
+https://docs.openviking.ai/en/getting-started/04-setup-for-agent
 
----
+Ask me for the model provider, the models, the workspace directory and whether
+other machines need to reach the server; don't guess. When you ask for the model
+API key, tell me how to hand it over if I'd rather not paste it into this chat,
+and never repeat it back.
 
-## Advanced Reading
+When it's running, tell me the server's address and whether auth is turned on.
+```
 
-### Documentation
+Your agent will first ask which model provider to use and for its API key.
 
-For more details, please visit our [Full Documentation](./docs/en/).
+</details>
 
-### Community & Team
+<details>
+<summary><strong>Deploy it yourself</strong></summary>
 
-For more details, please see: **[About Us](./docs/en/about/01-about-us.md)**
+Install OpenViking and run the setup wizard, which configures the models:
 
-### Join the Community
+```bash
+uv tool install openviking --upgrade && openviking-server init
+```
 
-OpenViking is still in its early stages, and there are many areas for improvement and exploration. We sincerely invite every developer passionate about AI Agent technology:
+`init` writes `~/.openviking/ov.conf` and supports Volcengine, OpenAI, Codex OAuth, Kimi, GLM and local Ollama; see the [configuration guide](https://docs.openviking.ai/en/guides/01-configuration). The server runs in the foreground, so keep this terminal open.
 
-- Light up a precious **Star** for us to give us the motivation to move forward.
-- Visit our [**Website**](https://www.openviking.ai) to understand the philosophy we convey, and use it in your projects via the [**Documentation**](https://www.openviking.ai/docs). Feel the change it brings and give us feedback on your truest experience.
-- Join our community to share your insights, help answer others' questions, and jointly create an open and mutually helpful technical atmosphere:
-  - 📱 **Lark Group**: Scan the QR code to join → [View QR Code](./docs/en/about/01-about-us.md#lark-group)
-  - 💬 **WeChat Group**: Scan the QR code to add assistant → [View QR Code](./docs/en/about/01-about-us.md#wechat-group)
-  - 🎮 **Discord**: [Join Discord Server](https://discord.com/invite/eHvx8E9XF3)
-  - 🐦 **X (Twitter)**：[Follow us](https://x.com/openvikingai)
-- Become a **Contributor**, whether submitting a bug fix or contributing a new feature, every line of your code will be an important cornerstone of OpenViking's growth.
+</details>
 
-Let's work together to define and build the future of AI Agent context management. The journey has begun, looking forward to your participation!
+<details>
+<summary><strong>Use OpenViking Service (hosted by Volcengine)</strong></summary>
 
-### Star Trend
+The same OpenViking service, run for you by Volcengine. The first 50 files are free. Activate it on the [Volcengine product page](https://www.volcengine.com/product/openviking-service?utm_source=github&utm_medium=referral&utm_campaign=readme), then create an API key in the console under User Management → API Key. The server address is `https://api.vikingdb.cn-beijing.volces.com/openviking`; you'll need it and the API key when you connect your agent.
 
-[![Star History Chart](https://api.star-history.com/svg?repos=volcengine/OpenViking&type=timeline&legend=top-left)](https://www.star-history.com/#volcengine/OpenViking&type=timeline&legend=top-left)
+</details>
+
+### Explore with the CLI
+
+The `openviking` package includes the `ov` CLI. With the server running, import a repository and search it:
+
+```bash
+ov status
+ov add-resource https://github.com/volcengine/OpenViking
+# Replace TASK_ID with the returned task_id; repeat until status is completed
+ov task status TASK_ID
+ov ls viking://resources/
+ov tree viking://resources/volcengine -L 2
+ov find "what is openviking"
+ov grep "openviking" --uri viking://resources/volcengine/OpenViking/docs/en
+```
+
+`ov find` returns matching context with URIs you can inspect. For client configuration (`ov config`), standalone CLI installs, and index maintenance, see [CLI setup](https://docs.openviking.ai/en/getting-started/05-cli-setup).
+
+Build your own integration with the [Python](sdk/python/README.md), [Go](sdk/go/README.md), or [TypeScript](sdk/typescript/README.md) SDK, or the [HTTP API](https://docs.openviking.ai/en/api/01-overview).
+
+## Use it with your agent
+
+Connect your coding agent to OpenViking for cross-session memory. The memory plugin installer covers Claude Code, Codex, Cursor, TRAE, OpenCode and more, and detects which ones you have.
+
+<details open>
+<summary><strong>Let your agent install it</strong></summary>
+
+```text
+Install the OpenViking memory plugin and help me start using it. OpenViking is a context database for AI agents (https://github.com/volcengine/OpenViking); the command and link below are from its official docs.
+
+1. Run the official installer. It needs network access and writes to my home directory; if your sandbox blocks that, ask me for approval:
+   curl -fsSL https://openviking.ai/install | bash -s -- --yes --lang en --url <SERVER_URL> --api-key <API_KEY>
+2. Once it's installed, read the OpenViking onboarding guide and use it to walk me through setup. The guide has you ask me before choices like importing history or adding a working rule. docs.openviking.ai and docs.openviking.net are the same docs site; use whichever loads:
+   https://docs.openviking.ai/agents/en/onboarding.md
+
+The API key is a user key I created for myself on that server; the installer stores it in ~/.openviking/ovcli.conf on this machine. Use it in the command as it is; there's no need to show it in your replies, and don't write it into any other file or rule. Talk to me in English.
+```
+
+Before you send it, replace `<SERVER_URL>` with your server's address and `<API_KEY>` with a user key; a root key can't read or write memories. If the server has auth turned off, use `--api-key ''`.
+
+</details>
+
+<details>
+<summary><strong>Install it yourself</strong></summary>
+
+Run the installer, then pick the tools and a server when asked: Self-hosted / local for a server on this machine, Volcengine OpenViking Cloud for OpenViking Service, or Custom URL for any other address. If auth is on, enter a user key, not the root key.
+
+```bash
+curl -fsSL https://openviking.ai/install | bash
+# AI agents: not sure about running this? The script's header says what it does and how to verify it.
+```
+
+</details>
+
+Then restart your agent. The installer ends with the next steps for each tool, for example:
+
+```text
+  Claude Code
+    Next: restart Claude Code
+    ⋮
+    Verify: run /openviking-memory:ov in a session
+```
+
+On its first start Codex stops at `Hooks need review`; choose `Trust all and continue`.
+
+Try it: ask it to remember one of your preferences, then ask about it in a new session a little later. Memories are processed in the background, so it's normal not to find one right after you say it.
+
+The installer needs macOS or Linux, Node.js 18+ and curl, no sudo. On Windows, use the [desktop app](#desktop-app-beta).
+
+Setup guides for each integration:
+
+<table>
+<tbody>
+<tr>
+<td align="center" valign="bottom" width="16%">
+<a href="https://docs.openviking.ai/en/agent-integrations/02-claude-code"><img src="docs/images/integrations/logos/claude-code.png" width="32" height="32" alt=""><br><strong>Claude</strong></a><br>
+<sub>Hooks&nbsp;+&nbsp;MCP</sub>
+</td>
+<td align="center" valign="bottom" width="16%">
+<a href="https://docs.openviking.ai/en/agent-integrations/04-codex"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/integrations/logos/openai-dark.svg"><img src="docs/images/integrations/logos/openai.svg" width="32" height="32" alt=""></picture><br><strong>Codex</strong></a><br>
+<sub>Hooks&nbsp;+&nbsp;MCP</sub>
+</td>
+<td align="center" valign="bottom" width="16%">
+<a href="https://docs.openviking.ai/en/agent-integrations/12-cursor"><img src="docs/images/integrations/logos/cursor.png" width="32" height="32" alt=""><br><strong>Cursor</strong></a><br>
+<sub>Hooks&nbsp;+&nbsp;MCP</sub>
+</td>
+<td align="center" valign="bottom" width="16%">
+<a href="https://docs.openviking.ai/en/agent-integrations/13-trae"><img src="docs/images/integrations/logos/trae.png" width="32" height="32" alt=""><br><strong>TRAE</strong></a><br>
+<sub>Hooks&nbsp;+&nbsp;MCP</sub>
+</td>
+<td align="center" valign="bottom" width="16%">
+<a href="https://docs.openviking.ai/en/agent-integrations/03-openclaw"><img src="docs/images/integrations/logos/openclaw.png" width="32" height="32" alt=""><br><strong>OpenClaw</strong></a><br>
+<sub>Context&nbsp;engine</sub>
+</td>
+<td align="center" valign="bottom" width="16%">
+<a href="https://docs.openviking.ai/en/agent-integrations/05-hermes"><img src="docs/images/integrations/logos/hermes-agent.png" width="32" height="32" alt=""><br><strong>Hermes</strong></a><br>
+<sub>Built-in</sub>
+</td>
+</tr>
+</tbody>
+<tbody>
+<tr>
+<td align="center" valign="bottom" width="16%">
+<a href="https://docs.openviking.ai/en/agent-integrations/10-opencode"><img src="docs/images/integrations/logos/opencode.png" width="32" height="32" alt=""><br><strong>OpenCode</strong></a><br>
+<sub>Plugin&nbsp;+&nbsp;MCP</sub>
+</td>
+<td align="center" valign="bottom" width="16%">
+<a href="https://docs.openviking.ai/en/agent-integrations/11-pi"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/integrations/logos/pi-dark.svg"><img src="docs/images/integrations/logos/pi.svg" width="32" height="32" alt=""></picture><br><strong>pi</strong></a><br>
+<sub>Native&nbsp;extension</sub>
+</td>
+<td align="center" valign="bottom" width="16%">
+<a href="docs/images/agents/en/deerflow-memory-manager.md"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/integrations/logos/deerflow-dark.svg"><img src="docs/images/integrations/logos/deerflow.svg" width="32" height="32" alt=""></picture><br><strong>DeerFlow</strong></a><br>
+<sub>Plugin&nbsp;+&nbsp;MCP</sub>
+</td>
+<td align="center" valign="bottom" width="16%">
+<a href="https://docs.openviking.ai/en/agent-integrations/17-dsh"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/integrations/logos/dsh-dark.svg"><img src="docs/images/integrations/logos/dsh.svg" width="32" height="32" alt=""></picture><br><strong>DSH</strong></a><br>
+<sub>Plugin&nbsp;+&nbsp;MCP</sub>
+</td>
+<td align="center" valign="bottom" width="16%">
+<a href="docs/images/agents/en/doubao-work.md"><img src="docs/images/integrations/logos/doubao-work.png" width="32" height="32" alt=""><br><strong>Doubao&nbsp;Work</strong></a><br>
+<sub>Connector</sub>
+</td>
+<td align="center" valign="bottom" width="16%">
+<a href="https://docs.openviking.ai/en/agent-integrations/07-langchain-langgraph"><img src="docs/images/integrations/logos/langchain.svg" width="32" height="32" alt=""><br><strong>LangChain</strong></a><br>
+<sub>Tools&nbsp;+&nbsp;store</sub>
+</td>
+</tr>
+</tbody>
+</table>
+
+**General integrations**
+
+<table>
+<tr>
+<td align="center" valign="bottom" width="50%">
+<a href="https://docs.openviking.ai/en/agent-integrations/15-agent-plugins"><img src="docs/images/integrations/logos/agent-plugins.svg" width="32" height="32" alt=""><br><strong>Agent&nbsp;Plugins&nbsp;1.0</strong></a>
+</td>
+<td align="center" valign="bottom" width="50%">
+<a href="https://docs.openviking.ai/en/agent-integrations/06-mcp-clients"><img src="docs/images/integrations/logos/mcp.svg" width="32" height="32" alt=""><br><strong>MCP&nbsp;clients</strong></a>
+</td>
+</tr>
+</table>
+
+For setup instructions and integration details, see [Integrations](https://openviking.ai/integrations).
+
+For framework applications, see the [LangChain/LangGraph and Microsoft Agent Framework packages](integrations/frameworks/README.md), with a guide to adding other adapters.
+
+## Desktop App (Beta)
+
+The desktop app is a console for macOS and Windows x64 (beta). It configures supported local agent integrations, inspects recall and capture events in sessions, and syncs local memories and skills to OpenViking.
+
+Download:
+
+- [macOS Apple Silicon (arm64)](https://lf3-cdn-tos.bytegoofy.com/obj/tron-demo/7654844610543360265/420238785/0.0.19/darwin-arm64/openviking-helper-0.0.19-arm64.dmg)
+- [macOS Intel (x64)](https://lf3-cdn-tos.bytegoofy.com/obj/tron-demo/7654844610543360265/420238785/0.0.19/darwin-x64/openviking-helper-0.0.19-x64.dmg)
+- [Windows (x64)](https://lf3-cdn-tos.bytegoofy.com/obj/tron-demo/7654844610543360265/420238785/0.0.19/win32-x64/openviking-helper-0.0.19-x64.exe)
+
+## VikingBot
+
+VikingBot is an AI agent framework built on top of OpenViking:
+
+```bash
+pip install "openviking[bot]"
+openviking-server --with-bot
+ov chat   # in another terminal
+```
+
+The official Docker image bundles VikingBot and starts it by default alongside the server and console UI. Details: [VikingBot guide](https://docs.openviking.ai/en/guides/17-vikingbot).
+
+## Deploy in production
+
+Run the open-source server in your own environment under [AGPLv3](LICENSE). It requires no activation key. Start with [server setup](https://docs.openviking.ai/en/getting-started/03-quickstart-server) or the [Docker and deployment guide](https://docs.openviking.ai/en/guides/03-deployment).
+
+The server supports [accounts and user isolation](https://docs.openviking.ai/en/concepts/11-multi-tenant) and opt-in [resource ACLs](https://docs.openviking.ai/en/concepts/15-acl). Configure [authentication](https://docs.openviking.ai/en/guides/04-authentication) before exposing it beyond localhost.
+
+## Commercial editions
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+<img src="docs/images/commercial-saas.png" alt="Managed SaaS" width="100%" />
+
+<h3>☁️ Managed SaaS</h3>
+<p><a href="https://www.volcengine.com/product/openviking-service?utm_source=github&amp;utm_medium=referral&amp;utm_campaign=readme">Volcano Engine</a> hosts and operates OpenViking. Personal and Enterprise plans cover individual and team use, with migration tooling for open-source deployments. See the <a href="https://docs.volcengine.com/docs/84313/2374478">service documentation</a> for plans and limits. Hosting outside China is planned on <a href="https://www.byteplus.com">BytePlus</a>.</p>
+
+</td>
+<td width="50%" valign="top">
+
+<img src="docs/images/commercial-self-hosted.png" alt="Self-Managed" width="100%" />
+
+<h3>🏢 Self-Managed</h3>
+<p>Deploy in your own cloud account / VPC (BYOC) or an offline environment. This edition adds distributed deployment and official support, activated by a license key. <a href="https://docs.google.com/forms/d/e/1FAIpQLScQqwsm7fvKdjtNiW5rWNXJjoHPtedVzLsKSMJgObtsj2_udA/viewform">Contact the team</a>.</p>
+
+</td>
+</tr>
+</table>
+
+## Research
+
+**Memory that evolves with your agent.** VikingMem develops an event-driven approach to extracting, updating, and consolidating long-term memory, giving stateful agents a way to retain useful experience as interactions accumulate. OpenViking open-sources a subset of these core capabilities.
+
+> **VikingMem: A Memory Base Management System for Stateful LLM-based Applications**<br>
+> Jiajie Fu, Junwen Chen, Mengzhao Wang, Aoxiang He, Maojia Sheng, Xiangyu Ke, Yifan Zhu, and Yunjun Gao.<br>
+> arXiv:2605.29640, 2026. Presented at VLDB 2026 in September.<br>
+> 📄 [Read the paper on arXiv](https://arxiv.org/abs/2605.29640) · [Read PDF](https://arxiv.org/pdf/2605.29640)
+
+**Directory structure as retrieval context.** This paper provides the formal foundations, index design, and experimental evidence behind OpenViking’s directory-aware retrieval. It defines directory-scoped query and maintenance operations and introduces TrieHI, which OpenViking integrates to resolve directory scopes before vector ranking. This connects the filesystem paradigm to retrieval: agents can search a project or memory subtree, retain its surrounding context, and reorganize it as knowledge evolves.
+
+> **Directory-Aware Query and Maintenance in Vector Databases**<br>
+> Mengzhao Wang, Zheng Gong, Jingpei Hu, Jiajie Fu, Maojia Sheng, Junwen Chen, and Yifan Zhu.<br>
+> arXiv:2606.16903, 2026. Accepted by ICDE.<br>
+> 📄 [Read the paper on arXiv](https://arxiv.org/abs/2606.16903) · [Read PDF](https://arxiv.org/pdf/2606.16903)
+
+**Retrieve the evidence you need with fewer tokens.** VikingRAG combines semantic search with document structure, exposing relevant directory segments as evidence gaps arise. Its core mechanisms are integrated into OpenViking. The paper further explores reusing retrieval traces and escalating to multi-round retrieval only when needed, reducing repeated exploration while preserving answer quality.
+
+> **VikingRAG: Accurate and Token-efficient Retrieval-augmented Generation over Structured Documents**<br>
+> Peiyuan Gao, Gaoyuan Zhang, Haojie Qin, Yahui Sun, Qianyi Zhang, Yunhao Zhang, Zeyu Wang, and Wei Lu.<br>
+> arXiv:2609.11390, 2026. Submitted.<br>
+> 📄 [Read the paper on arXiv](https://arxiv.org/abs/2609.11390) · [Read PDF](https://arxiv.org/pdf/2609.11390)
+
+## Partner Projects
+
+- [deer-flow](https://github.com/bytedance/deer-flow) - Open-source long-horizon SuperAgent harness
+- [NoKV](https://github.com/NoKV-Lab/NoKV) - AI native distributed file system
+- [loopx](https://github.com/huangruiteng/loopx) - Lightweight loop engineering state kernel
+- [Hermes Agent](https://github.com/NousResearch/hermes-agent) - The agent that grows with you
+- [NVIDIA cuVS](https://github.com/NVIDIA/cuvs) - GPU-accelerated vector search and clustering library
+
+To propose a partnership, [open an issue](https://github.com/volcengine/OpenViking/issues).
+
+## Community & Contributing
+
+- **Docs**: [docs.openviking.ai](https://docs.openviking.ai/) · [FAQ](https://docs.openviking.ai/en/faq/faq)
+- **Blog**: [blog.openviking.ai](https://blog.openviking.ai/)
+- **Team**: [About us](https://docs.openviking.ai/en/about/01-about-us)
+- **Chat**: <a href="https://docs.openviking.ai/en/about/01-about-us#lark-group"><img src="docs/images/community/lark.svg" width="18" height="18" alt="Lark">&nbsp;Lark</a> · <a href="https://docs.openviking.ai/en/about/01-about-us#wechat-group"><img src="docs/images/community/wechat.svg" width="18" height="18" alt="WeChat">&nbsp;WeChat</a> · <a href="https://discord.com/invite/eHvx8E9XF3"><img src="docs/images/community/discord.svg" width="18" height="18" alt="Discord">&nbsp;Discord</a> · <a href="https://x.com/openvikingai"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/community/x-dark.svg"><img src="docs/images/community/x.svg" width="16" height="16" alt="X"></picture>&nbsp;X</a>
+- **Contribute**: bug fixes and new features are both welcome — see [CONTRIBUTING.md](CONTRIBUTING.md)
+
+<a href="https://github.com/volcengine/OpenViking/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=volcengine/OpenViking&amp;columns=15&amp;max=120" alt="OpenViking contributors" />
+</a>
+
+## Security and privacy
+
+For vulnerability reporting and supported versions, see [SECURITY.md](SECURITY.md)
 
 ## License
+
+Copyright © 2026 Volcano Engine (火山引擎) and the OpenViking contributors.
 
 The OpenViking project uses different licenses for different components:
 
 - **Main Project**: AGPLv3 - see the [LICENSE](./LICENSE) file for details
-- **crates/ov_cli**: Apache 2.0 - see the [LICENSE](./crates/ov_cli/LICENSE) for details
-- **examples**: Apache 2.0 - see the [LICENSE](./examples/LICENSE) for details
-- **third_party**: Respective original licenses of third-party projects
+- **crates/ov\_cli**: Apache 2.0 - see the [LICENSE](./crates/LICENSE) for details
+- **examples**: Apache 2.0 - see the [LICENSE](./examples/LICENSE) for details. The Hermes plugin in `examples/hermes-plugin` retains its [MIT license](./examples/hermes-plugin/LICENSE).
+- **integrations/frameworks**: the LangChain/LangGraph adapter uses AGPLv3 and the Microsoft Agent Framework adapter uses MIT; see each package's `LICENSE`. Their runnable examples retain Apache 2.0; see each package's `examples/LICENSE`.
+- **third\_party**: Respective original licenses of third-party projects
 
-
-<!-- Link Definitions -->
-
-[release-shield]: https://img.shields.io/github/v/release/volcengine/OpenViking?color=369eff&labelColor=black&logo=github&style=flat-square
-[release-link]: https://github.com/volcengine/OpenViking/releases
-[license-shield]: https://img.shields.io/badge/license-AGPLv3-white?labelColor=black&style=flat-square
-[license-shield-link]: https://github.com/volcengine/OpenViking/blob/main/LICENSE
-[last-commit-shield]: https://img.shields.io/github/last-commit/volcengine/OpenViking?color=c4f042&labelColor=black&style=flat-square
-[last-commit-shield-link]: https://github.com/volcengine/OpenViking/commits/main
-[github-stars-shield]: https://img.shields.io/github/stars/volcengine/OpenViking?labelColor&style=flat-square&color=ffcb47
-[github-stars-link]: https://github.com/volcengine/OpenViking
-[github-issues-shield]: https://img.shields.io/github/issues/volcengine/OpenViking?labelColor=black&style=flat-square&color=ff80eb
-[github-issues-shield-link]: https://github.com/volcengine/OpenViking/issues
-[github-contributors-shield]: https://img.shields.io/github/contributors/volcengine/OpenViking?color=c4f042&labelColor=black&style=flat-square
-[github-contributors-link]: https://github.com/volcengine/OpenViking/graphs/contributors
+Please also note: any wholesale rewriting and subsequent re-open-sourcing of this project is prohibited; any request to translate all or a substantial portion of the project code into another coding language requires prior written authorization from Volcano Engine. For permission requests, please contact the Volcano Engine team — see [Community & Contributing](#community--contributing) for contact channels.

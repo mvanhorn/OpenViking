@@ -2,235 +2,19 @@
 
 OpenViking 提供类 Unix 的文件系统操作来管理上下文。
 
+<a id="webdav"></a><a id="webdav-phase-1"></a>
+
+读取或写入文件正文见[内容 API](12-content.md)。通过 WebDAV 客户端访问文件见 [WebDAV](20-webdav.md)。
+
+`viking://system` 的文件系统和内容 API 对所有角色开放读取；ROOT 和 ADMIN
+只能修改 `viking://system/memory/memory_templates/custom/` 下的具体资产。
+`builtin/` 内置模板和 `viking://system/compile/example-skills/` 官方示例由服务自动同步，
+API 不允许写入、追加、删除、移动或覆盖复制，也不能通过操作其父目录绕过限制。
+自定义模板也可以通过[模板管理 API](08-admin.md)发布。
+
 ## API 参考
 
-### abstract()
-
-读取 L0 摘要（约 100 token 的概要）。
-
-**参数**
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| uri | str | 是 | - | Viking URI（必须是目录） |
-
-**Python SDK (Embedded / HTTP)**
-
-```python
-abstract = client.abstract("viking://resources/docs/")
-print(f"Abstract: {abstract}")
-# Output: "Documentation for the project API, covering authentication, endpoints..."
-```
-
-**HTTP API**
-
-```
-GET /api/v1/content/abstract?uri={uri}
-```
-
-```bash
-curl -X GET "http://localhost:1933/api/v1/content/abstract?uri=viking://resources/docs/" \
-  -H "X-API-Key: your-key"
-```
-
-**CLI**
-
-```bash
-openviking abstract viking://resources/docs/
-```
-
-**响应**
-
-```json
-{
-  "status": "ok",
-  "result": "Documentation for the project API, covering authentication, endpoints...",
-  "time": 0.1
-}
-```
-
----
-
-### overview()
-
-读取 L1 概览，适用于目录。
-
-**参数**
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| uri | str | 是 | - | Viking URI（必须是目录） |
-
-**Python SDK (Embedded / HTTP)**
-
-```python
-overview = client.overview("viking://resources/docs/")
-print(f"Overview:\n{overview}")
-```
-
-**HTTP API**
-
-```
-GET /api/v1/content/overview?uri={uri}
-```
-
-```bash
-curl -X GET "http://localhost:1933/api/v1/content/overview?uri=viking://resources/docs/" \
-  -H "X-API-Key: your-key"
-```
-
-**CLI**
-
-```bash
-openviking overview viking://resources/docs/
-```
-
-**响应**
-
-```json
-{
-  "status": "ok",
-  "result": "## docs/\n\nContains API documentation and guides...",
-  "time": 0.1
-}
-```
-
----
-
-### read()
-
-读取 L2 完整内容。
-
-**参数**
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| uri | str | 是 | - | Viking URI |
-
-**Python SDK (Embedded / HTTP)**
-
-```python
-content = client.read("viking://resources/docs/api.md")
-print(f"Content:\n{content}")
-```
-
-**HTTP API**
-
-```
-GET /api/v1/content/read?uri={uri}
-```
-
-```bash
-curl -X GET "http://localhost:1933/api/v1/content/read?uri=viking://resources/docs/api.md" \
-  -H "X-API-Key: your-key"
-```
-
-**CLI**
-
-```bash
-openviking read viking://resources/docs/api.md
-```
-
-**响应**
-
-```json
-{
-  "status": "ok",
-  "result": "# API Documentation\n\nFull content of the file...",
-  "time": 0.1
-}
-```
-
----
-
-### write()
-
-修改一个已存在的文件，并自动刷新相关语义与向量。
-
-**参数**
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| uri | str | 是 | - | 已存在文件的 URI |
-| content | str | 是 | - | 要写入的新内容 |
-| mode | str | 否 | `replace` | `replace` 或 `append` |
-| wait | bool | 否 | `false` | 是否等待后台语义/向量刷新完成 |
-| timeout | float | 否 | `null` | 当 `wait=true` 时的超时时间（秒） |
-
-**说明**
-
-- 只支持已存在文件；目录会被拒绝。
-- 不允许直接写入派生语义文件：`.abstract.md`、`.overview.md`、`.relations.json`。
-- 公共 API 已不再接受 `regenerate_semantics` 或 `revectorize`；写入后一定会自动刷新相关语义与向量。
-
-**Python SDK (Embedded / HTTP)**
-
-```python
-result = client.write(
-    "viking://resources/docs/api.md",
-    "# Updated API\n\nFresh content.",
-    mode="replace",
-    wait=True,
-)
-print(result["root_uri"])
-```
-
-**HTTP API**
-
-```
-POST /api/v1/content/write
-```
-
-```bash
-curl -X POST "http://localhost:1933/api/v1/content/write" \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key" \
-  -d '{
-    "uri": "viking://resources/docs/api.md",
-    "content": "# Updated API\n\nFresh content.",
-    "mode": "replace",
-    "wait": true
-  }'
-```
-
-**CLI**
-
-```bash
-openviking write viking://resources/docs/api.md \
-  --content "# Updated API\n\nFresh content." \
-  --wait
-```
-
-**响应**
-
-```json
-{
-  "status": "ok",
-  "result": {
-    "uri": "viking://resources/docs/api.md",
-    "root_uri": "viking://resources/docs",
-    "context_type": "resource",
-    "mode": "replace",
-    "written_bytes": 29,
-    "semantic_updated": true,
-    "vector_updated": true,
-    "queue_status": {
-      "Semantic": {
-        "processed": 1,
-        "error_count": 0,
-        "errors": []
-      },
-      "Embedding": {
-        "processed": 2,
-        "error_count": 0,
-        "errors": []
-      }
-    }
-  }
-}
-```
-
----
+<a id="abstract"></a><a id="overview"></a><a id="read"></a><a id="write"></a>
 
 ### ls()
 
@@ -243,6 +27,22 @@ openviking write viking://resources/docs/api.md \
 | uri | str | 是 | - | Viking URI |
 | simple | bool | 否 | False | 仅返回相对路径 |
 | recursive | bool | 否 | False | 递归列出所有子目录 |
+| output | str | 否 | HTTP：`agent`；SDK：`original` | 输出格式：`agent` 或 `original` |
+| abs_limit | int | 否 | 256 | 返回的摘要最大长度 |
+| include_abstract | bool | 否 | 未设置 | 是否返回目录 L0 摘要。未设置时沿用旧 `output` 语义（`agent` 返回，`original` 不返回） |
+| include_overview | bool | 否 | 未设置 | 是否返回目录 L1 概览。未设置时不返回 |
+| overview_limit | int | 否 | 4000 | 返回的概览最大长度 |
+| show_all_hidden | bool | 否 | False | 像 `-a` 一样包含隐藏文件 |
+| node_limit | int | 否 | 1000 | 最大返回节点数 |
+| offset | int | 否 | 0 | 跳过的可见节点数 |
+| limit | int | 否 | None | `node_limit` 的别名 |
+| sort_by | str | 否 | None | 在分页前，分别按 `name` 或 `mtime` 排序目录组和文件组；目录仍优先 |
+| sort_order | str | 否 | `asc` | 排序方向：`asc` 或 `desc` |
+| extra_fields | list[str] | 否 | None | 额外返回的字段：`locked`、`id`、`count` |
+| include_tags | bool | 否 | False | 不按标签过滤时，也返回 tags |
+| tags | string[] | 否 | 未设置 | 仅返回同时匹配全部 `k=v` 检索标签的条目 |
+
+`tags` 使用 AND 语义，并在 `offset` 和 `limit` 前应用。L0/L1 内容只附加到分页选中的目录节点，不占用 `node_limit`。显式传入 `include_abstract=true|false` 会覆盖 `output` 隐含的旧行为。带 tags 过滤的响应会返回 `tags`；未过滤时需传 `include_tags=true`（CLI：`-f tags`）才返回它们。HTTP 的 `simple=true` 保持仅返回路径；CLI 同时指定 `--simple` 和 `--fields` 时会获取条目对象，再按指定列输出。
 
 **条目结构**
 
@@ -254,23 +54,90 @@ openviking write viking://resources/docs/api.md \
     "modTime": "2024-01-01T00:00:00Z",  # ISO 时间戳
     "isDir": True,            # 如果是目录则为 True
     "uri": "viking://resources/docs/",  # Viking URI
-    "meta": {}                # 可选元数据
+    "meta": {},               # 可选元数据
+    "tags": ["team=search"] # 显式检索标签；未设置时为空数组
 }
 ```
 
-**Python SDK (Embedded / HTTP)**
+如果调用方可以读取父目录，但没有某个直接子项的读取权限，`ls` 仍会返回该
+子项的名称占位，但不会返回大小、修改时间、摘要或存储元数据：
 
 ```python
-entries = client.ls("viking://resources/")
-for entry in entries:
+{
+    "name": "restricted",
+    "isDir": True,
+    "uri": "viking://resources/restricted",
+    "access": "denied"
+}
+```
+
+对这个 URI 调用 `stat`、`read` 等内容接口会返回 HTTP 403 `PermissionDenied`。递归
+列举会保留无权限目录本身，但不会继续展开其内容，搜索结果也不会包含无权读取的
+内容。该行为只适用于共享的
+`viking://resources` 命名空间；个人和 peer 私有命名空间仍按原有规则隐藏。
+
+在大小写不敏感的 `localfs` 上，目录名大小写别名可能影响 `ls`、`tree` 和 `glob`
+看到的内容。例如真实目录是 `viking://resources/bob-private/`，请求
+`viking://resources/BOB-PRIVATE/` 也可能列出同一目录；大小写敏感系统上，别名目录
+不存在时会返回 `NOT_FOUND`。
+
+
+**Python SDK (HTTP)**
+
+```python
+page = client.ls_page(
+    uri="viking://resources/",
+    offset=100,
+    limit=100,
+    sort_by="mtime",
+    sort_order="desc",
+    tags=["team=search", "env=prod"],
+    include_abstract=True,
+    include_overview=True,
+)
+for entry in page["result"]:
     type_str = "dir" if entry['isDir'] else "file"
     print(f"{entry['name']} - {type_str}")
+print("是否还有更多节点：", page["has_more"])
 ```
+
+**TypeScript SDK**
+
+```typescript
+const page = await client.listPage("viking://resources/docs/", {
+  tags: ["team=search", "env=prod"],
+  includeAbstract: true,
+  includeOverview: true,
+});
+console.log(page.result);
+console.log("是否还有更多节点：", page.hasMore);
+```
+
+**Go SDK**
+
+```go
+page, err := client.ListPage(ctx, "viking://resources/", &openviking.ListOptions{
+    Tags:            []string{"team=search", "env=prod"},
+    IncludeAbstract: openviking.Bool(true),
+    AbsLimit:        512,
+    IncludeOverview: openviking.Bool(true),
+    OverviewLimit:   4000,
+})
+if err != nil {
+    return err
+}
+for _, entry := range page.Result {
+    fmt.Println(entry)
+}
+fmt.Println("是否还有更多节点：", page.HasMore)
+```
+
+仅需要节点数组时可继续使用兼容接口：Python 使用 `ls`、TypeScript 使用 `list`、Go 使用 `List`。需要判断结果是否因 `limit` 或 `node_limit` 被截断时，分别使用 `ls_page`、`listPage`、`ListPage`。
 
 **HTTP API**
 
 ```
-GET /api/v1/fs/ls?uri={uri}&simple={bool}&recursive={bool}
+GET /api/v1/fs/ls?uri={uri}&offset={int}&limit={int}
 ```
 
 ```bash
@@ -285,15 +152,42 @@ curl -X GET "http://localhost:1933/api/v1/fs/ls?uri=viking://resources/&simple=t
 # 递归列表
 curl -X GET "http://localhost:1933/api/v1/fs/ls?uri=viking://resources/&recursive=true" \
   -H "X-API-Key: your-key"
+
+# 按全部 tags 过滤（重复 query 参数）
+curl -G "http://localhost:1933/api/v1/fs/ls" \
+  -H "X-API-Key: your-key" \
+  --data-urlencode "uri=viking://resources/" \
+  --data-urlencode "tags=team=search" \
+  --data-urlencode "tags=env=prod"
+
+# 不过滤、但在结果中携带 tags
+curl -G "http://localhost:1933/api/v1/fs/ls" \
+  -H "X-API-Key: your-key" \
+  --data-urlencode "uri=viking://resources/" \
+  --data-urlencode "include_tags=true"
 ```
 
 **CLI**
 
 ```bash
-openviking ls viking://resources/ [--simple] [--recursive]
+ov ls viking://resources/ [--simple] [--recursive] [--include-abstract[=true|false]] [--include-overview[=true|false]] [--tags team=search,env=prod] [-f FIELDS]
+ov tree viking://resources/my-project/ [--simple] [--tags team=search,env=prod] [-f FIELDS]
+ov glob "**/*.md" [--uri viking://resources/] [--simple] [--tags team=search,env=prod] [-f FIELDS]
+
+# 在对齐的表格中显示名称和 tags
+ov ls viking://resources/ --fields name,tags
+
+# 无表头，每行输出逗号分隔的 URI 和 tags
+ov ls viking://resources/ --simple --fields uri,tags
 ```
 
-**响应**
+`-f` / `--fields` 接受逗号分隔的列名。在默认的 table 输出模式下，结果为带表头、按列对齐的表格。支持的字段为 `name`、`uri`、`path`、`type`、`size`、`mode`、`mtime`、`locked`、`id`、`count`、`abstract`、`overview`、`tags`。同时指定 `--simple` 和 `-f` 时，每行输出逗号分隔的字段值，不带表头或树缩进；仅使用 `--simple` 时仍每行输出一个 URI。若未选择 `name`、`uri` 或 `path`，列表会自动补充 `name` 列，树会补充 `path` 列。
+
+CLI 会按所选列请求 `extra_fields`（`locked`、`id`、`count`）；选择 `tags` 列时会请求 `include_tags=true`。这些列选择不改变 `tags` 的 AND 过滤语义。
+
+HTTP 响应中的 `result` 保持为条目数组。`has_more=true` 表示在应用可见性、tags、offset 和 limit 后仍有后续匹配节点；Python、TypeScript 和 Go SDK 继续返回 `result` 数组。CLI 检测到后续节点时会在输出末尾显示翻页提示。
+
+**响应（`output=original`、`include_tags=true`）**
 
 ```json
 {
@@ -305,10 +199,11 @@ openviking ls viking://resources/ [--simple] [--recursive]
       "mode": 16877,
       "modTime": "2024-01-01T00:00:00Z",
       "isDir": true,
-      "uri": "viking://resources/docs/"
+      "uri": "viking://resources/docs/",
+      "tags": ["team=search"]
     }
   ],
-  "time": 0.1
+  "has_more": true
 }
 ```
 
@@ -323,34 +218,109 @@ openviking ls viking://resources/ [--simple] [--recursive]
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | uri | str | 是 | - | Viking URI |
+| output | str | 否 | HTTP：`agent`；SDK：`original` | 输出格式：`agent` 或 `original` |
+| abs_limit | int | 否 | HTTP：256；SDK：128 | 返回的摘要最大长度 |
+| include_abstract | bool | 否 | 未设置 | 是否返回目录 L0 摘要。未设置时沿用旧 `output` 语义（`agent` 返回，`original` 不返回） |
+| include_overview | bool | 否 | 未设置 | 是否返回目录 L1 概览。未设置时不返回 |
+| overview_limit | int | 否 | 4000 | 返回的概览最大长度 |
+| show_all_hidden | bool | 否 | False | 像 `-a` 一样包含隐藏文件 |
+| directories_only | bool | 否 | False | 仅返回目录节点 |
+| node_limit | int | 否 | 1000 | 最大返回节点数 |
+| offset | int | 否 | 0 | 跳过的可见节点数 |
+| limit | int | 否 | None | `node_limit` 的别名 |
+| level_limit | int | 否 | 3 | 最大目录遍历深度 |
+| extra_fields | list[str] | 否 | None | 额外返回的字段：`locked`、`id`、`count` |
+| include_tags | bool | 否 | False | 不按标签过滤时，也返回 tags |
+| tags | string[] | 否 | 未设置 | 仅保留同时匹配全部 `k=v` 检索标签的节点 |
 
-**Python SDK (Embedded / HTTP)**
+目录过滤和 `tags` 均在 `offset`、`limit` 前应用。L0/L1 内容只附加到分页选中的目录节点，不占用 `node_limit`。显式传入 `include_abstract=true|false` 会覆盖 `output` 隐含的旧行为。带 tags 过滤的响应会返回 `tags`；未过滤时需传 `include_tags=true` 才返回它们。
+
+
+**Python SDK (HTTP)**
 
 ```python
-entries = client.tree("viking://resources/")
-for entry in entries:
+page = client.tree_page(
+    uri="viking://resources/",
+    offset=100,
+    limit=100,
+    tags=["team=search", "env=prod"],
+    include_abstract=True,
+    include_overview=True,
+    directories_only=True,
+)
+for entry in page["result"]:
     type_str = "dir" if entry['isDir'] else "file"
     print(f"{entry['rel_path']} - {type_str}")
+print("是否还有更多节点：", page["has_more"])
 ```
+
+**TypeScript SDK**
+
+```typescript
+const page = await client.treePage("viking://resources/docs/", {
+  nodeLimit: 100,
+  tags: ["team=search", "env=prod"],
+  includeAbstract: true,
+  includeOverview: true,
+});
+console.log(page.result);
+console.log("是否还有更多节点：", page.hasMore);
+```
+
+**Go SDK**
+
+```go
+page, err := client.TreePage(ctx, "viking://resources/", &openviking.TreeOptions{
+    Tags:            []string{"team=search", "env=prod"},
+    DirectoriesOnly: true,
+    IncludeAbstract: openviking.Bool(true),
+    IncludeOverview: openviking.Bool(true),
+})
+if err != nil {
+    return err
+}
+for _, entry := range page.Result {
+    fmt.Println(entry["rel_path"], entry["isDir"])
+}
+fmt.Println("是否还有更多节点：", page.HasMore)
+```
+
+仅需要节点数组时可继续使用兼容接口：Python/TypeScript 使用 `tree`、Go 使用 `Tree`。需要判断结果是否因 `limit` 或 `node_limit` 被截断时，分别使用 `tree_page`、`treePage`、`TreePage`。
 
 **HTTP API**
 
 ```
-GET /api/v1/fs/tree?uri={uri}
+GET /api/v1/fs/tree?uri={uri}&offset={int}&limit={int}
 ```
 
 ```bash
 curl -X GET "http://localhost:1933/api/v1/fs/tree?uri=viking://resources/" \
   -H "X-API-Key: your-key"
+
+# 仅返回同时包含 team=search 和 env=prod 的节点
+curl -G "http://localhost:1933/api/v1/fs/tree" \
+  -H "X-API-Key: your-key" \
+  --data-urlencode "uri=viking://resources/" \
+  --data-urlencode "tags=team=search" \
+  --data-urlencode "tags=env=prod"
 ```
 
 **CLI**
 
 ```bash
-openviking tree viking://resources/my-project/
+ov tree viking://resources/my-project/ --fields path,type,tags
+
+# 与 ls、glob 一样支持 --simple 和列选择组合
+ov tree viking://resources/my-project/ --simple --fields path,tags
+
+# 仅返回目录，并附加 L0/L1 内容
+ov tree viking://resources/my-project/ \
+  --directories-only --include-abstract --include-overview
 ```
 
-**响应**
+与 `ls` 一致，HTTP 响应中的 `result` 保持为节点数组，`has_more` 位于响应顶层。CLI 检测到 `has_more=true` 时会在树输出末尾显示后续节点提示。
+
+**响应（`output=original`、`include_tags=true`）**
 
 ```json
 {
@@ -361,17 +331,19 @@ openviking tree viking://resources/my-project/
       "size": 4096,
       "isDir": true,
       "rel_path": "docs/",
-      "uri": "viking://resources/docs/"
+      "uri": "viking://resources/docs/",
+      "tags": ["team=search"]
     },
     {
       "name": "api.md",
       "size": 1024,
       "isDir": false,
       "rel_path": "docs/api.md",
-      "uri": "viking://resources/docs/api.md"
+      "uri": "viking://resources/docs/api.md",
+      "tags": ["team=search", "env=prod"]
     }
   ],
-  "time": 0.1
+  "has_more": true
 }
 ```
 
@@ -379,20 +351,43 @@ openviking tree viking://resources/my-project/
 
 ### stat()
 
-获取文件或目录的状态信息。
+获取文件或目录的状态信息。对于目录，会返回目录下的项目计数。
 
 **参数**
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| uri | str | 是 | - | Viking URI |
+| uri | str | 是 | - | Viking URI（如 `viking://resources/docs/api.md`）或 32 字符十六进制向量记录 `id` |
 
-**Python SDK (Embedded / HTTP)**
+
+**Python SDK (HTTP)**
 
 ```python
-info = client.stat("viking://resources/docs/api.md")
+info = client.stat(uri="viking://resources/docs/api.md")
 print(f"Size: {info['size']}")
 print(f"Is directory: {info['isDir']}")
+
+# 对于目录，会返回项目计数
+dir_info = client.stat(uri="viking://resources/docs")
+if dir_info.get('isDir'):
+    print(f"Item count: {dir_info.get('count')}")
+```
+
+**TypeScript SDK**
+
+```typescript
+const metadata = await client.stat("viking://resources/docs/api.md");
+console.log(metadata);
+```
+
+**Go SDK**
+
+```go
+info, err := client.Stat(ctx, "viking://resources/docs/api.md")
+if err != nil {
+    return err
+}
+fmt.Println(info["size"], info["isDir"])
 ```
 
 **HTTP API**
@@ -409,10 +404,12 @@ curl -X GET "http://localhost:1933/api/v1/fs/stat?uri=viking://resources/docs/ap
 **CLI**
 
 ```bash
-openviking stat viking://resources/my-project/docs/api.md
+ov stat viking://resources/my-project/docs/api.md
+ov stat viking://resources/my-project/docs
 ```
 
-**响应**
+
+**响应（文件）**
 
 ```json
 {
@@ -423,11 +420,144 @@ openviking stat viking://resources/my-project/docs/api.md
     "mode": 33188,
     "modTime": "2024-01-01T00:00:00Z",
     "isDir": false,
+    "isLocked": false,
+    "id": "a1b2c3d4e5f678901234567890abcdef",
     "uri": "viking://resources/docs/api.md"
-  },
-  "time": 0.1
+  }
 }
 ```
+
+**响应（目录）**
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "name": "docs",
+    "size": 4096,
+    "mode": 16877,
+    "modTime": "2024-01-01T00:00:00Z",
+    "isDir": true,
+    "isLocked": false,
+    "uri": "viking://resources/docs",
+    "count": 42
+  }
+}
+```
+
+`isLocked` 字段反映路径当前是否被路径锁持有：路径自身存在有效锁（包括目标路径对应的 exact-path lock），或者任一祖先目录持有 TreeLock。当 LockManager 不可用或查询失败时返回 `false`。这只是状态查询，不会预留锁；查询后仍可能有其他写入者取得锁，写入时仍需处理 `ResourceBusyError`。
+
+`id` 字段（仅文件）是 VikingDB 中向量记录的确定性主键，对 level 2（常规文件）记录按 `md5(f"{account_id}:{uri}")` 计算。该值与向量集合 schema 中的 `id` 字段一致，可用于直接交叉引用向量记录而无需额外查询。目录不返回此字段，因为一个目录在多个语义层（L0 abstract、L1 overview）下可能对应多条向量记录，id 不唯一。由于索引是异步生成的，新返回的 ID 可能暂时无法解析；对应向量记录被删除后，按 ID 查询也会失败。这两种情况下，`stat(id)` 都会返回 `NOT_FOUND`，并在原因中提示数据可能尚未索引或已经删除。
+
+`count` 字段（仅目录）包含该目录下的项目（文件和子目录）估计数量（来自向量索引）。
+
+在大小写不敏感的 `localfs` 上，`stat` 也可能通过大小写别名返回真实文件或目录的元数据。例如 `viking://resources/docs/REPORT.md` 可能命中真实的 `viking://resources/docs/report.md`；大小写敏感系统上，别名目标不存在时返回 `NOT_FOUND`。
+
+---
+
+### attrs()
+
+获取文件或目录的逻辑扩展属性。
+
+**参数**
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| uri | str | 是 | - | Viking URI |
+
+
+**Python SDK (HTTP)**
+
+```python
+attrs = client.attrs(uri="viking://resources/docs/api.md")
+print(attrs["attrs"]["tags"])
+```
+
+**TypeScript SDK**
+
+```typescript
+const attributes = await client.attrs("viking://resources/docs/api.md");
+console.log(attributes);
+```
+
+**Go SDK**
+
+```go
+attrs, err := client.Attrs(ctx, "viking://resources/docs/api.md")
+if err != nil {
+    return err
+}
+metadata := attrs["attrs"].(map[string]any)
+fmt.Println(metadata["tags"])
+```
+
+**HTTP API**
+
+```
+GET /api/v1/fs/attrs?uri={uri}
+POST /api/v1/fs/attrs/set_tags
+```
+
+```bash
+curl -X GET "http://localhost:1933/api/v1/fs/attrs?uri=viking://resources/docs/api.md" \
+  -H "X-API-Key: your-key"
+
+curl -X POST "http://localhost:1933/api/v1/fs/attrs/set_tags" \
+  -H "X-API-Key: your-key" \
+  -H "Content-Type: application/json" \
+  -d '{"uri":"viking://resources/docs","tags":["team=search"],"mode":"append","recursive":true}'
+```
+
+**CLI**
+
+```bash
+ov attrs get viking://resources/docs/api.md
+ov attrs get viking://resources/docs/api.md tags
+ov attrs get viking://user/alice/memories/experiences/foo.md memory.resource_refs
+ov attrs set-tags viking://resources/docs/api.md --tags team=search,env=prod
+ov attrs set-tags viking://resources/docs --tags team=search --mode append --recursive
+```
+
+`set-tags` 的目录目标会更新目录语义记录；`recursive=true` 还会更新已有子文件和子目录语义记录。
+
+
+**响应（Resource）**
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "uri": "viking://resources/docs/api.md",
+    "context_type": "resource",
+    "attrs": {
+      "tags": ["team=search", "env=prod"]
+    }
+  }
+}
+```
+
+**响应（Memory）**
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "uri": "viking://user/alice/memories/experiences/foo.md",
+    "context_type": "memory",
+    "attrs": {
+      "memory": {
+        "memory_type": "experiences",
+        "name": "foo",
+        "tags": ["ui"],
+        "resource_refs": ["viking://resources/docs/api.md"]
+      },
+      "tags": ["team=search"]
+    }
+  }
+}
+```
+
+`attrs.memory` 来自 `MEMORY_FIELDS` 元信息，已去掉正文内容。`attrs.tags` 是 `attrs set-tags` 和搜索过滤使用的显式检索标签。
 
 ---
 
@@ -440,11 +570,28 @@ openviking stat viking://resources/my-project/docs/api.md
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | uri | str | 是 | - | 新目录的 Viking URI |
+| description | str | 否 | `null` | 目录初始说明。未传入时使用目录名作为默认 L0；传入后使用该说明。两种情况都会写入 `.abstract.md` 并进入 L0 向量化队列。 |
 
-**Python SDK (Embedded / HTTP)**
+
+**Python SDK (HTTP)**
 
 ```python
-client.mkdir("viking://resources/new-project/")
+client.mkdir(uri="viking://resources/new-project/")
+client.mkdir(uri="viking://resources/new-project/", description="接口文档目录")
+```
+
+**TypeScript SDK**
+
+```typescript
+await client.mkdir("viking://resources/docs/guides/", "Project guides");
+```
+
+**Go SDK**
+
+```go
+if err := client.Mkdir(ctx, "viking://resources/new-project/", "接口文档目录"); err != nil {
+    return err
+}
 ```
 
 **HTTP API**
@@ -458,15 +605,18 @@ curl -X POST http://localhost:1933/api/v1/fs/mkdir \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-key" \
   -d '{
-    "uri": "viking://resources/new-project/"
+    "uri": "viking://resources/new-project/",
+    "description": "接口文档目录"
   }'
 ```
 
 **CLI**
 
 ```bash
-openviking mkdir viking://resources/new-project/
+ov mkdir viking://resources/new-project/
+ov mkdir viking://resources/new-project/ --description "接口文档目录"
 ```
+
 
 **响应**
 
@@ -475,32 +625,56 @@ openviking mkdir viking://resources/new-project/
   "status": "ok",
   "result": {
     "uri": "viking://resources/new-project/"
-  },
-  "time": 0.1
+  }
 }
 ```
+
+在大小写不敏感的 `localfs` 上，创建仅大小写不同的目录可能命中已有目录。例如已存在 `viking://resources/docs/` 时，`ov mkdir viking://resources/DOCS/` 可能作用到同一个底层目录；大小写敏感系统上二者是不同路径。
 
 ---
 
 ### rm()
 
-删除文件或目录。
+删除文件或目录。递归删除目录时会返回删除的项目估计数量。
+
+`rm` 是幂等操作：删除一个合法但不存在的 URI 仍会成功。
+URI 格式非法、scheme 不支持，或使用 `temp`、`queue` 等内部作用域时返回 `INVALID_URI`。
 
 **参数**
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | uri | str | 是 | - | 要删除的 Viking URI |
+| wait | bool | 否 | False | 等待删除后的语义刷新完成 |
+| timeout | float | 否 | None | 已废弃：仅为兼容旧请求保留，传入值会被忽略；HTTP 超时使用客户端配置 |
 | recursive | bool | 否 | False | 递归删除目录 |
 
-**Python SDK (Embedded / HTTP)**
+
+**Python SDK (HTTP)**
 
 ```python
 # 删除单个文件
-client.rm("viking://resources/docs/old.md")
+client.rm(uri="viking://resources/docs/old.md")
 
 # 递归删除目录
-client.rm("viking://resources/old-project/", recursive=True)
+client.rm(uri="viking://resources/old-project/", recursive=True)
+```
+
+**TypeScript SDK**
+
+```typescript
+await client.remove("viking://resources/docs/old.md");
+```
+
+**Go SDK**
+
+```go
+err := client.Remove(ctx, "viking://resources/old-project/", &openviking.RemoveOptions{
+    Recursive: true,
+})
+if err != nil {
+    return err
+}
 ```
 
 **HTTP API**
@@ -522,7 +696,93 @@ curl -X DELETE "http://localhost:1933/api/v1/fs?uri=viking://resources/old-proje
 **CLI**
 
 ```bash
-openviking rm viking://resources/old.md [--recursive]
+ov rm viking://resources/old.md [--recursive]
+```
+
+
+**响应（单个文件）**
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "uri": "viking://resources/docs/old.md"
+  }
+}
+```
+
+**响应（递归删除）**
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "uri": "viking://resources/old-project/",
+    "estimated_deleted_count": 42
+  }
+}
+```
+
+`estimated_deleted_count` 字段（递归删除时）包含删除的项目（文件和目录）估计数量（来自向量索引）。CLI 会在输出中显示此信息。
+
+删除 `viking://resources/...` 时，响应可能包含 `memory_cleanup`，表示删除前已清理引用该资源 URI 的用户记忆。
+
+在大小写不敏感的 `localfs` 上，大小写别名可能影响删除目标。例如真实文件是 `viking://resources/bob-private/private.md`，执行 `ov rm viking://resources/BOB-PRIVATE/private.md` 可能删除同一个文件；大小写敏感系统上，别名目标不存在时该幂等删除仍会成功，但不会删除真实文件。
+
+---
+
+### cp()
+
+把文件或目录复制到新的 Viking URI，源内容保持不变。源 URI 下已有的向量记录会同步复制并改写为目标 URI，因此无需重新解析复制内容，也无需重新执行文件级 VLM 或 embedding。
+
+目标父目录必须已经存在。目标文件存在时直接覆盖；目标目录存在时递归合并，保留目标独有文件。`to_uri` 就是实际目标位置，不额外追加源目录名；文件与目录类型冲突时拒绝。复制目录时必须设置 `recursive=true`（CLI 中使用 `-r`）。源、目标不能相同或互为祖先与后代。覆盖时保留目标原有访问权限；新目标继承目标父级权限。
+
+文件使用源、目标双 Exact Lock，目录使用双 Tree Lock，不锁父目录整树。复制失败可能保留部分目标；向量复制失败时尝试清理目标向量和目标数据。旧目标不备份，合并后发生向量失败可能删除整个目标目录，包括其原有内容；该操作不是原子事务。
+
+**参数**
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| from_uri | str | 是 | - | 源 Viking URI |
+| to_uri | str | 是 | - | 目标 Viking URI，必须包含新的文件名或目录名 |
+| recursive | bool | 否 | False | 源为目录时必须设为 `true` |
+
+**HTTP API**
+
+```
+POST /api/v1/fs/cp
+```
+
+```bash
+# 复制单个文件
+curl -X POST http://localhost:1933/api/v1/fs/cp \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{
+    "from_uri": "viking://resources/docs/guide.md",
+    "to_uri": "viking://resources/archive/guide-copy.md",
+    "recursive": false
+  }'
+
+# 递归复制目录
+curl -X POST http://localhost:1933/api/v1/fs/cp \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{
+    "from_uri": "viking://resources/docs",
+    "to_uri": "viking://resources/docs-backup",
+    "recursive": true
+  }'
+```
+
+**CLI**
+
+```bash
+# 复制单个文件
+ov cp viking://resources/docs/guide.md viking://resources/archive/guide-copy.md
+
+# 递归复制目录
+ov cp -r viking://resources/docs viking://resources/docs-backup
 ```
 
 **响应**
@@ -531,17 +791,39 @@ openviking rm viking://resources/old.md [--recursive]
 {
   "status": "ok",
   "result": {
-    "uri": "viking://resources/docs/old.md"
-  },
-  "time": 0.1
+    "operation_id": "61ec2a80bf5f46a28aa3497fbdcb56dd",
+    "operation": "copy",
+    "from": "viking://resources/docs/guide.md",
+    "to": "viking://resources/archive/guide-copy.md",
+    "recursive": false,
+    "phase": "completed",
+    "files_created": 1,
+    "vectors": {
+      "scanned": 3,
+      "written": 3,
+      "deleted": 0,
+      "restored": 0,
+      "batches": 1
+    },
+    "semantic_root_uri": "viking://resources/archive",
+    "semantic_status": "queued"
+  }
 }
 ```
+
+`semantic_status: "queued"` 表示复制已经提交，目标父目录的 overview 和 abstract 将根据目标目录中已有的摘要异步重建，接口不会等待刷新完成。若语义刷新入队失败，响应可能包含 `semantic_status: "failed"` 和 `semantic_error`；已经完成的文件和向量复制不会因此回滚。
+
+常见错误包括：源或目标父目录不存在时返回 `NOT_FOUND`；路径锁繁忙时返回 `CONFLICT`；复制或删除目录但未设置 `recursive=true`、对文件执行目录操作、源和目标关系非法或类型冲突时返回 `INVALID_ARGUMENT`（HTTP 400）。
+
+在大小写不敏感的 `localfs` 上，`from_uri` 和 `to_uri` 都可能受大小写别名影响。例如 `ov cp viking://resources/BOB-PRIVATE/private.md viking://resources/archive/copy.md` 可能从真实的 `bob-private/private.md` 复制；`to_uri` 仅大小写不同也可能覆盖已有目标。大小写敏感系统上，大小写不同的源不存在时返回 `NOT_FOUND`，大小写不同的目标按独立路径处理。
 
 ---
 
 ### mv()
 
-移动文件或目录。
+移动文件或目录。目标文件存在时覆盖，目标目录存在时递归合并并保留目标独有内容；`to_uri` 为实际目标位置，不追加源目录名。文件与目录类型冲突、源目标相同或互相包含时拒绝。
+
+文件使用双 Exact Lock，目录使用源、目标双 Tree Lock，不锁父目录整树。执行顺序为复制目标、迁移向量、删除源。复制失败不统一清理部分目标；向量迁移或 ACL 更新失败时尝试恢复源向量并删除目标；最后删除源失败时保留目标与残余源，不重建源。旧目标不备份，合并目标可能在回滚清理中被整体删除，因此不保证失败后恢复原状。
 
 **参数**
 
@@ -550,13 +832,31 @@ openviking rm viking://resources/old.md [--recursive]
 | from_uri | str | 是 | - | 源 Viking URI |
 | to_uri | str | 是 | - | 目标 Viking URI |
 
-**Python SDK (Embedded / HTTP)**
+
+**Python SDK (HTTP)**
 
 ```python
 client.mv(
-    "viking://resources/old-name/",
-    "viking://resources/new-name/"
+    from_uri="viking://resources/old-name/",
+    to_uri="viking://resources/new-name/",
 )
+```
+
+**TypeScript SDK**
+
+```typescript
+await client.move(
+  "viking://resources/docs/old.md",
+  "viking://resources/docs/new.md",
+);
+```
+
+**Go SDK**
+
+```go
+if err := client.Move(ctx, "viking://resources/old-name/", "viking://resources/new-name/"); err != nil {
+    return err
+}
 ```
 
 **HTTP API**
@@ -578,8 +878,9 @@ curl -X POST http://localhost:1933/api/v1/fs/mv \
 **CLI**
 
 ```bash
-openviking mv viking://resources/old-name/ viking://resources/new-name/
+ov mv viking://resources/old-name/ viking://resources/new-name/
 ```
+
 
 **响应**
 
@@ -589,338 +890,15 @@ openviking mv viking://resources/old-name/ viking://resources/new-name/
   "result": {
     "from": "viking://resources/old-name/",
     "to": "viking://resources/new-name/"
-  },
-  "time": 0.1
+  }
 }
 ```
 
----
+在大小写不敏感的 `localfs` 上，`from_uri` 和 `to_uri` 都可能受大小写别名影响。例如 `ov mv viking://resources/BOB-PRIVATE/private.md viking://resources/archive/private.md` 可能移动真实的 `bob-private/private.md`；`to_uri` 仅大小写不同也可能覆盖或合并已有目标。大小写敏感系统上，大小写不同的源不存在时返回 `NOT_FOUND`，大小写不同的目标按独立路径处理。
 
-### grep()
+<a id="grep"></a><a id="glob"></a>
 
-按模式搜索内容。
-
-**参数**
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| uri | str | 是 | - | 要搜索的 Viking URI |
-| pattern | str | 是 | - | 搜索模式（正则表达式） |
-| case_insensitive | bool | 否 | False | 忽略大小写 |
-
-**Python SDK (Embedded / HTTP)**
-
-```python
-results = client.grep(
-    "viking://resources/",
-    "authentication",
-    case_insensitive=True
-)
-
-print(f"Found {results['count']} matches")
-for match in results['matches']:
-    print(f"  {match['uri']}:{match['line']}")
-    print(f"    {match['content']}")
-```
-
-**HTTP API**
-
-```
-POST /api/v1/search/grep
-```
-
-```bash
-curl -X POST http://localhost:1933/api/v1/search/grep \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key" \
-  -d '{
-    "uri": "viking://resources/",
-    "pattern": "authentication",
-    "case_insensitive": true
-  }'
-```
-
-**CLI**
-
-```bash
-openviking grep viking://resources/ "authentication" [--ignore-case]
-```
-
-**响应**
-
-```json
-{
-  "status": "ok",
-  "result": {
-    "matches": [
-      {
-        "uri": "viking://resources/docs/auth.md",
-        "line": 15,
-        "content": "User authentication is handled by..."
-      }
-    ],
-    "count": 1
-  },
-  "time": 0.1
-}
-```
-
----
-
-### glob()
-
-按模式匹配文件。
-
-**参数**
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| pattern | str | 是 | - | Glob 模式（例如 `**/*.md`） |
-| uri | str | 否 | "viking://" | 起始 URI |
-
-**Python SDK (Embedded / HTTP)**
-
-```python
-# 查找所有 Markdown 文件
-results = client.glob("**/*.md", "viking://resources/")
-print(f"Found {results['count']} markdown files:")
-for uri in results['matches']:
-    print(f"  {uri}")
-
-# 查找所有 Python 文件
-results = client.glob("**/*.py", "viking://resources/")
-print(f"Found {results['count']} Python files")
-```
-
-**HTTP API**
-
-```
-POST /api/v1/search/glob
-```
-
-```bash
-curl -X POST http://localhost:1933/api/v1/search/glob \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key" \
-  -d '{
-    "pattern": "**/*.md",
-    "uri": "viking://resources/"
-  }'
-```
-
-**CLI**
-
-```bash
-openviking glob "**/*.md" [--uri viking://resources/]
-```
-
-**响应**
-
-```json
-{
-  "status": "ok",
-  "result": {
-    "matches": [
-      "viking://resources/docs/api.md",
-      "viking://resources/docs/guide.md"
-    ],
-    "count": 2
-  },
-  "time": 0.1
-}
-```
-
----
-
-### link()
-
-创建资源之间的关联。
-
-**参数**
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| from_uri | str | 是 | - | 源 URI |
-| uris | str 或 List[str] | 是 | - | 目标 URI |
-| reason | str | 否 | "" | 关联原因 |
-
-**Python SDK (Embedded / HTTP)**
-
-```python
-# 单个关联
-client.link(
-    "viking://resources/docs/auth/",
-    "viking://resources/docs/security/",
-    reason="Security best practices for authentication"
-)
-
-# 多个关联
-client.link(
-    "viking://resources/docs/api/",
-    [
-        "viking://resources/docs/auth/",
-        "viking://resources/docs/errors/"
-    ],
-    reason="Related documentation"
-)
-```
-
-**HTTP API**
-
-```
-POST /api/v1/relations/link
-```
-
-```bash
-# 单个关联
-curl -X POST http://localhost:1933/api/v1/relations/link \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key" \
-  -d '{
-    "from_uri": "viking://resources/docs/auth/",
-    "to_uris": "viking://resources/docs/security/",
-    "reason": "Security best practices for authentication"
-  }'
-
-# 多个关联
-curl -X POST http://localhost:1933/api/v1/relations/link \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key" \
-  -d '{
-    "from_uri": "viking://resources/docs/api/",
-    "to_uris": ["viking://resources/docs/auth/", "viking://resources/docs/errors/"],
-    "reason": "Related documentation"
-  }'
-```
-
-**CLI**
-
-```bash
-openviking link viking://resources/docs/auth/ viking://resources/docs/security/ --reason "Security best practices"
-```
-
-**响应**
-
-```json
-{
-  "status": "ok",
-  "result": {
-    "from": "viking://resources/docs/auth/",
-    "to": "viking://resources/docs/security/"
-  },
-  "time": 0.1
-}
-```
-
----
-
-### relations()
-
-获取资源的关联关系。
-
-**参数**
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| uri | str | 是 | - | Viking URI |
-
-**Python SDK (Embedded / HTTP)**
-
-```python
-relations = client.relations("viking://resources/docs/auth/")
-for rel in relations:
-    print(f"Related: {rel['uri']}")
-    print(f"  Reason: {rel['reason']}")
-```
-
-**HTTP API**
-
-```
-GET /api/v1/relations?uri={uri}
-```
-
-```bash
-curl -X GET "http://localhost:1933/api/v1/relations?uri=viking://resources/docs/auth/" \
-  -H "X-API-Key: your-key"
-```
-
-**CLI**
-
-```bash
-openviking relations viking://resources/docs/auth/
-```
-
-**响应**
-
-```json
-{
-  "status": "ok",
-  "result": [
-    {"uri": "viking://resources/docs/security/", "reason": "Security best practices"},
-    {"uri": "viking://resources/docs/errors/", "reason": "Error handling"}
-  ],
-  "time": 0.1
-}
-```
-
----
-
-### unlink()
-
-移除关联关系。
-
-**参数**
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| from_uri | str | 是 | - | 源 URI |
-| uri | str | 是 | - | 要取消关联的目标 URI |
-
-**Python SDK (Embedded / HTTP)**
-
-```python
-client.unlink(
-    "viking://resources/docs/auth/",
-    "viking://resources/docs/security/"
-)
-```
-
-**HTTP API**
-
-```
-DELETE /api/v1/relations/link
-```
-
-```bash
-curl -X DELETE http://localhost:1933/api/v1/relations/link \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key" \
-  -d '{
-    "from_uri": "viking://resources/docs/auth/",
-    "to_uri": "viking://resources/docs/security/"
-  }'
-```
-
-**CLI**
-
-```bash
-openviking unlink viking://resources/docs/auth/ viking://resources/docs/security/
-```
-
-**响应**
-
-```json
-{
-  "status": "ok",
-  "result": {
-    "from": "viking://resources/docs/auth/",
-    "to": "viking://resources/docs/security/"
-  },
-  "time": 0.1
-}
-```
-
----
+<a id="export_ovpack"></a><a id="import_ovpack"></a><a id="backup_ovpack"></a><a id="restore_ovpack"></a>
 
 ## 相关文档
 

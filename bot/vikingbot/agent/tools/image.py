@@ -5,7 +5,6 @@ import logging
 import mimetypes
 import uuid
 from io import BytesIO
-from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import httpx
@@ -13,7 +12,7 @@ import litellm
 
 from vikingbot.agent.tools.base import Tool, ToolContext
 from vikingbot.bus.events import OutboundMessage
-from vikingbot.utils import get_data_path
+from vikingbot.utils import detect_image_format, get_data_path
 
 
 class ImageGenerationTool(Tool):
@@ -44,11 +43,11 @@ class ImageGenerationTool(Tool):
                 },
                 "base_image": {
                     "type": "string",
-                    "description": "Base image for edit/variation mode: base64 data URI or image file path (required for edit and variation modes)",
+                    "description": "Base image for edit/variation mode: base64 data URI, image URL, or sandbox-local image file path (required for edit and variation modes)",
                 },
                 "mask": {
                     "type": "string",
-                    "description": "Mask image for edit mode: base64 data URI or image URL (optional, transparent areas indicate where to edit)",
+                    "description": "Mask image for edit mode: base64 data URI, image URL, or sandbox-local image file path (optional, transparent areas indicate where to edit)",
                 },
                 "size": {
                     "type": "string",
@@ -84,6 +83,10 @@ class ImageGenerationTool(Tool):
             "required": [],
         }
 
+    @property
+    def resource_inputs(self) -> dict[str, str]:
+        return {"base_image": "local_file", "mask": "local_file"}
+
     def __init__(
         self,
         gen_image_model: str | None = None,
@@ -105,9 +108,11 @@ class ImageGenerationTool(Tool):
         """Check if the current model is a Seedream model."""
         return "seedream" in self.gen_image_model.lower()
 
-    async def _parse_image_data(self, image_str: str) -> tuple[str, str]:
+    async def _parse_image_data(
+        self, image_str: str, tool_context: "ToolContext | None" = None
+    ) -> tuple[str, str]:
         """
-        Parse image from base64 data URI, URL, or file path.
+        Parse image from base64 data URI, URL, or sandbox-local file path.
         Returns: (image_data, format_type) where format_type is "data" or "url"
         """
         if image_str.startswith("data:"):
@@ -115,19 +120,34 @@ class ImageGenerationTool(Tool):
         elif image_str.startswith("http://") or image_str.startswith("https://"):
             return image_str, "url"
         else:
+            if tool_context is None:
+                raise ValueError("Local image paths require a sandbox context")
             mime_type, _ = mimetypes.guess_type(image_str)
             if not mime_type:
                 mime_type = "application/octet-stream"
-            base64_str = base64.b64encode(Path(image_str).read_bytes()).decode("utf-8")
+            sandbox = await tool_context.sandbox_manager.get_sandbox(tool_context.session_key)
+            image_bytes = await sandbox.read_file_bytes(image_str)
+            base64_str = base64.b64encode(image_bytes).decode("utf-8")
             data_uri = f"data:{mime_type};base64,{base64_str}"
             return data_uri, "data"
 
     async def _url_to_base64(self, url: str) -> str:
-        """Download image from URL and convert to base64."""
+        """Download image from URL and convert to a data URI."""
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.get(url)
             response.raise_for_status()
-            return base64.b64encode(response.content).decode("utf-8")
+            mime_type = response.headers.get("content-type", "application/octet-stream")
+            encoded = base64.b64encode(response.content).decode("utf-8")
+            return f"data:{mime_type};base64,{encoded}"
+
+    @staticmethod
+    def _decode_image_payload(image_payload: str) -> tuple[bytes, str | None]:
+        """Decode a b64_json or data URI image payload."""
+        fallback_mime = None
+        if image_payload.startswith("data:"):
+            header, image_payload = image_payload.split(",", 1)
+            fallback_mime = header[5:].split(";", 1)[0] or None
+        return base64.b64decode(image_payload), fallback_mime
 
     def _build_common_kwargs(
         self,
@@ -157,6 +177,7 @@ class ImageGenerationTool(Tool):
 
     async def _seedream_image_to_image(
         self,
+        tool_context: "ToolContext",
         base_image: str,
         prompt: str,
         strength: float,
@@ -164,7 +185,7 @@ class ImageGenerationTool(Tool):
         n: int,
     ) -> Any:
         """Shared method for Seedream image-to-image generation (used by edit and variation modes)."""
-        base_image_data, base_format = await self._parse_image_data(base_image)
+        base_image_data, base_format = await self._parse_image_data(base_image, tool_context)
         kwargs = self._build_common_kwargs(
             size=size,
             n=n,
@@ -217,6 +238,7 @@ class ImageGenerationTool(Tool):
             elif mode == "edit":
                 if self._is_seedream_model:
                     response = await self._seedream_image_to_image(
+                        tool_context=tool_context,
                         base_image=base_image,  # type: ignore[arg-type]
                         prompt=prompt,  # type: ignore[arg-type]
                         strength=0.7,
@@ -224,12 +246,14 @@ class ImageGenerationTool(Tool):
                         n=n,
                     )
                 else:
-                    base_image_data, base_format = await self._parse_image_data(base_image)  # type: ignore[arg-type]
+                    base_image_data, base_format = await self._parse_image_data(
+                        base_image, tool_context
+                    )  # type: ignore[arg-type]
                     edit_kwargs = self._build_common_kwargs(size=size, n=n, include_style=False)
                     edit_kwargs["prompt"] = prompt
                     edit_kwargs["image"] = base_image_data
                     if mask:
-                        mask_data, mask_format = await self._parse_image_data(mask)
+                        mask_data, mask_format = await self._parse_image_data(mask, tool_context)
                         if mask_format == "bytes":
                             edit_kwargs["mask"] = BytesIO(mask_data)  # type: ignore
                         else:
@@ -239,6 +263,7 @@ class ImageGenerationTool(Tool):
             elif mode == "variation":
                 if self._is_seedream_model:
                     response = await self._seedream_image_to_image(
+                        tool_context=tool_context,
                         base_image=base_image,  # type: ignore[arg-type]
                         prompt="Create a variation of this image",
                         strength=0.3,
@@ -246,7 +271,9 @@ class ImageGenerationTool(Tool):
                         n=n,
                     )
                 else:
-                    base_image_data, base_format = await self._parse_image_data(base_image)  # type: ignore[arg-type]
+                    base_image_data, base_format = await self._parse_image_data(
+                        base_image, tool_context
+                    )  # type: ignore[arg-type]
                     var_kwargs = self._build_common_kwargs(size=size, n=n, include_style=False)
                     var_kwargs["image"] = base_image_data
                     response = await litellm.aimage_variation(**var_kwargs)
@@ -271,11 +298,10 @@ class ImageGenerationTool(Tool):
             saved_filenames = []
 
             for img in images:
-                random_filename = f"{uuid.uuid4().hex}.png"
+                image_bytes, fallback_mime = self._decode_image_payload(img)
+                image_format = detect_image_format(image_bytes, fallback_mime)
+                random_filename = f"{uuid.uuid4().hex}.{image_format.extension}"
                 image_path = images_dir / random_filename
-                if img.startswith("data:"):
-                    _, img = img.split(",", 1)
-                image_bytes = base64.b64decode(img)
                 with open(image_path, "wb") as f:
                     f.write(image_bytes)
                 saved_paths.append(f"send://{random_filename}")
@@ -286,7 +312,11 @@ class ImageGenerationTool(Tool):
             if send_to_user and self._send_callback:
                 try:
                     msg_content = "\n".join([f"send://{f}" for f in saved_filenames])
-                    msg = OutboundMessage(session_key=tool_context.session_key, content=msg_content)
+                    msg = OutboundMessage(
+                        session_key=tool_context.session_key,
+                        content=msg_content,
+                        metadata=dict(getattr(tool_context, "channel_metadata", None) or {}),
+                    )
                     await self._send_callback(msg)
                     sent_to_user = True
                 except Exception as e:

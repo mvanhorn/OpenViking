@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Memory health statistics endpoints for OpenViking HTTP Server."""
 
-import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Path, Query
@@ -11,10 +10,12 @@ from openviking.server.auth import get_request_context
 from openviking.server.dependencies import get_service
 from openviking.server.identity import RequestContext
 from openviking.server.models import ErrorInfo, Response
+from openviking.server.responses import error_response
 from openviking.storage.stats_aggregator import MEMORY_CATEGORIES, StatsAggregator
+from openviking_cli.utils import get_logger
 
 router = APIRouter(prefix="/api/v1/stats", tags=["stats"])
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def _get_aggregator() -> StatsAggregator:
@@ -37,12 +38,9 @@ async def get_memory_stats(
     Optionally filter by a single category.
     """
     if category and category not in MEMORY_CATEGORIES:
-        return Response(
-            status="error",
-            error=ErrorInfo(
-                code="INVALID_ARGUMENT",
-                message=f"Unknown category: {category}. Valid categories: {', '.join(MEMORY_CATEGORIES)}",
-            ),
+        return error_response(
+            code="INVALID_ARGUMENT",
+            message=f"Unknown category: {category}. Valid categories: {', '.join(MEMORY_CATEGORIES)}",
         )
 
     aggregator = _get_aggregator()
@@ -62,19 +60,12 @@ async def get_session_stats(
         result = await aggregator.get_session_extraction_stats(session_id, service, _ctx)
         return Response(status="ok", result=result)
     except KeyError:
-        return Response(
-            status="error",
-            error=ErrorInfo(
-                code="NOT_FOUND",
-                message=f"Session not found: {session_id}",
-            ),
+        return error_response(
+            code="NOT_FOUND", message=f"Session not found: {session_id}"
         )
     except Exception as e:
         logger.error("Failed to get session stats for %s: %s", session_id, e)
-        return Response(
-            status="error",
-            error=ErrorInfo(
-                code="INTERNAL_ERROR",
-                message=f"Failed to retrieve session stats: {type(e).__name__}",
-            ),
+        return error_response(
+            code="INTERNAL_ERROR",
+            message=f"Failed to retrieve session stats: {type(e).__name__}",
         )

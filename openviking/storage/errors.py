@@ -6,6 +6,24 @@
 class VikingDBException(Exception):
     """Base exception for vector-store operations."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        code: str | None = None,
+        error_type: str | None = None,
+        retryable: bool = False,
+        action: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        # 私有化下游需要结构化判定重试边界；默认值保持其他存储后端原有异常语义。
+        self.status_code = status_code
+        self.code = code
+        self.error_type = error_type
+        self.retryable = retryable
+        self.action = action
+
 
 class StorageException(VikingDBException):
     """Legacy alias for VikingDBException for backward compatibility."""
@@ -31,6 +49,14 @@ class SchemaError(StorageException):
     """Raised when schema validation fails."""
 
 
+class EmbeddingConfigurationError(StorageException):
+    """Raised when embedding provider setup is invalid or unavailable."""
+
+
+class EmbeddingRebuildRequiredError(StorageException):
+    """Raised when existing vector data is incompatible with current embedding config."""
+
+
 class LockError(VikingDBException):
     """Raised when a lock operation fails."""
 
@@ -39,5 +65,34 @@ class LockAcquisitionError(LockError):
     """Raised when lock acquisition fails."""
 
 
+class HandoffRecoveryRequired(LockAcquisitionError):
+    """A durable consumer must acquire fresh logical coverage before resuming."""
+
+    def __init__(self, reason: str):
+        super().__init__(f"handoff recovery required: {reason}")
+        self.reason = reason
+
+
+class HandoffRecoveryBlocked(LockAcquisitionError):
+    """Fresh acquisition failed; keep the durable work pending for retry."""
+
+
+class InvalidPathLockRequestError(ValueError):
+    """Raised when a native PathLock request or durable handoff is malformed."""
+
+
 class ResourceBusyError(LockError):
-    """Raised when a resource is locked by an ongoing operation (e.g. semantic processing)."""
+    """Raised when a resource is locked by an ongoing operation."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        uri: str | None = None,
+        conflict_type: str = "path_busy",
+        retryable: bool = True,
+    ):
+        super().__init__(message)
+        self.uri = uri
+        self.conflict_type = conflict_type
+        self.retryable = retryable

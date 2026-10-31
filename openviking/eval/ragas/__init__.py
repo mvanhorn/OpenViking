@@ -122,7 +122,7 @@ def _create_ragas_llm_from_config() -> Optional[Any]:
         api_base = env_config["api_base"]
         model_name = env_config["model"] or "gpt-4o-mini"
 
-        logger.info(f"Using RAGAS LLM from environment: model={model_name}, base_url={api_base}")
+        logger.info("Using RAGAS LLM from environment variables")
 
         openai_model = ChatOpenAI(
             model=model_name,
@@ -142,7 +142,9 @@ def _create_ragas_llm_from_config() -> Optional[Any]:
         logger.debug("OpenViking config file not found, skipping VLM config")
         return None
 
-    vlm_config = config.vlm
+    from openviking.config.vlm import ClusterVLMResolver
+
+    vlm_config = ClusterVLMResolver(lambda: config).get_vlm_sync()
 
     if not vlm_config.is_available():
         logger.warning(

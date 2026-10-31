@@ -7,11 +7,11 @@ use crate::client::HttpClient;
 pub struct FsEntry {
     pub uri: String,
     #[serde(default)]
-    pub size: Option<u64>,
+    pub _size: Option<u64>,
     #[serde(default)]
     pub is_dir: bool,
     #[serde(default)]
-    pub mod_time: Option<String>,
+    pub _mod_time: Option<String>,
 }
 
 impl FsEntry {
@@ -19,6 +19,11 @@ impl FsEntry {
         let path = self.uri.trim_end_matches('/');
         path.rsplit('/').next().unwrap_or(&self.uri)
     }
+}
+
+fn parse_ls_entries(result: serde_json::Value) -> Result<Vec<FsEntry>, String> {
+    let entries = result.get("result").unwrap_or(&result);
+    serde_json::from_value(entries.clone()).map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -69,9 +74,9 @@ impl TreeState {
             let mut root_node = TreeNode {
                 entry: FsEntry {
                     uri: "/".to_string(),
-                    size: None,
+                    _size: None,
                     is_dir: true,
-                    mod_time: None,
+                    _mod_time: None,
                 },
                 depth: 0,
                 expanded: true,
@@ -86,9 +91,9 @@ impl TreeState {
                 let mut node = TreeNode {
                     entry: FsEntry {
                         uri: scope_uri.clone(),
-                        size: None,
+                        _size: None,
                         is_dir: true,
-                        mod_time: None,
+                        _mod_time: None,
                     },
                     depth: 1,
                     expanded: false,
@@ -122,9 +127,9 @@ impl TreeState {
                     self.nodes = vec![TreeNode {
                         entry: FsEntry {
                             uri: format!("(error: {})", e),
-                            size: None,
+                            _size: None,
                             is_dir: false,
-                            mod_time: None,
+                            _mod_time: None,
                         },
                         depth: 0,
                         expanded: false,
@@ -139,17 +144,29 @@ impl TreeState {
 
     async fn fetch_children(client: &HttpClient, uri: &str) -> Result<Vec<TreeNode>, String> {
         let result = client
-            .ls(uri, false, false, "original", 256, false, 1000)
+            .ls(
+                uri,
+                false,
+                false,
+                "original",
+                256,
+                None,
+                None,
+                4000,
+                false,
+                1000,
+                0,
+                None,
+                None,
+                None,
+                &[],
+                &[],
+                false,
+            )
             .await
             .map_err(|e| e.to_string())?;
 
-        let entries: Vec<FsEntry> = if let Some(arr) = result.as_array() {
-            arr.iter()
-                .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                .collect()
-        } else {
-            serde_json::from_value(result).unwrap_or_default()
-        };
+        let entries = parse_ls_entries(result)?;
 
         let mut nodes: Vec<TreeNode> = entries
             .into_iter()
@@ -289,5 +306,69 @@ impl TreeState {
         } else if self.cursor >= self.scroll_offset + viewport_height {
             self.scroll_offset = self.cursor - viewport_height + 1;
         }
+    }
+
+    /// Expand a node by its URI
+    pub async fn expand_node_by_uri(&mut self, client: &HttpClient, uri: &str) {
+        // Find the node in visible rows
+        if let Some(row) = self.visible.iter().find(|r| r.uri == uri) {
+            // Get the node index path
+            let index_path = row.node_index.clone();
+            // Get the node and expand it
+            if let Some(node) = Self::get_node_mut(&mut self.nodes, &index_path) {
+                node.expanded = true;
+                // Ensure children are loaded if it's a directory
+                if node.entry.is_dir && !node.children_loaded {
+                    // Load children if not already loaded
+                    if let Ok(mut children) = Self::fetch_children(client, &node.entry.uri).await {
+                        let child_depth = node.depth + 1;
+                        for child in &mut children {
+                            child.depth = child_depth;
+                        }
+                        node.children = children;
+                        node.children_loaded = true;
+                    }
+                }
+                self.rebuild_visible();
+            }
+        }
+    }
+
+    pub fn allow_deletion(&self, selected_uri: &str) -> bool {
+        selected_uri != "/"
+            && !Self::ROOT_SCOPES
+                .iter()
+                .any(|s| selected_uri == format!("viking://{}", s))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_ls_entries_accepts_listing_envelope() {
+        let entries = parse_ls_entries(json!({
+            "result": [
+                {"uri": "viking://resources/a.md", "isDir": false}
+            ],
+            "has_more": false
+        }))
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].uri, "viking://resources/a.md");
+    }
+
+    #[test]
+    fn parse_ls_entries_accepts_legacy_array() {
+        let entries = parse_ls_entries(json!([
+            {"uri": "viking://resources/a.md", "isDir": false}
+        ]))
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].uri, "viking://resources/a.md");
     }
 }

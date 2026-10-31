@@ -19,20 +19,24 @@ Supported providers:
 """
 
 from openviking.models.embedder.base import (
+    AllCredentialsFailedError,
     CompositeHybridEmbedder,
     DenseEmbedderBase,
     EmbedderBase,
     EmbedResult,
+    FailoverEmbedder,
     HybridEmbedderBase,
     SparseEmbedderBase,
 )
 from openviking.models.embedder.cohere_embedders import CohereDenseEmbedder
+from openviking.models.embedder.dashscope_embedders import DashScopeDenseEmbedder
 
 try:
     from openviking.models.embedder.gemini_embedders import GeminiDenseEmbedder
 except ImportError:
     GeminiDenseEmbedder = None  # google-genai not installed
 from openviking.models.embedder.jina_embedders import JinaDenseEmbedder
+from openviking.models.embedder.local_embedders import LocalDenseEmbedder
 
 try:
     from openviking.models.embedder.litellm_embedders import LiteLLMDenseEmbedder
@@ -40,6 +44,7 @@ except ImportError:
     LiteLLMDenseEmbedder = None  # litellm not installed
 from openviking.models.embedder.minimax_embedders import MinimaxDenseEmbedder
 from openviking.models.embedder.openai_embedders import OpenAIDenseEmbedder
+from openviking.models.embedder.retry_embedder import RetryEmbedder
 from openviking.models.embedder.vikingdb_embedders import (
     VikingDBDenseEmbedder,
     VikingDBHybridEmbedder,
@@ -55,6 +60,8 @@ from openviking.models.embedder.voyage_embedders import VoyageDenseEmbedder
 __all__ = [
     # Cohere implementations
     "CohereDenseEmbedder",
+    # DashScope implementations
+    "DashScopeDenseEmbedder",
     # Base classes
     "EmbedResult",
     "EmbedderBase",
@@ -62,10 +69,14 @@ __all__ = [
     "SparseEmbedderBase",
     "HybridEmbedderBase",
     "CompositeHybridEmbedder",
+    "FailoverEmbedder",
+    "RetryEmbedder",
+    "AllCredentialsFailedError",
     # Google Gemini implementations
     "GeminiDenseEmbedder",
     # Jina AI implementations
     "JinaDenseEmbedder",
+    "LocalDenseEmbedder",
     # LiteLLM implementations
     "LiteLLMDenseEmbedder",
     # MiniMax implementations

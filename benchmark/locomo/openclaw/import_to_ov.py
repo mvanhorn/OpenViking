@@ -20,7 +20,7 @@ import time
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import openviking as ov
 
@@ -153,6 +153,7 @@ def write_success_record(
         "session",
         "date_time",
         "speakers",
+        "elapsed_seconds",
         "embedding_tokens",
         "vlm_tokens",
         "llm_input_tokens",
@@ -172,6 +173,7 @@ def write_success_record(
                 "session": record["session"],
                 "date_time": record.get("meta", {}).get("date_time", ""),
                 "speakers": record.get("meta", {}).get("speakers", ""),
+                "elapsed_seconds": f"{record.get('elapsed_seconds', 0.0):.3f}",
                 "embedding_tokens": record["token_usage"].get("embedding", 0),
                 "vlm_tokens": record["token_usage"].get("vlm", 0),
                 "llm_input_tokens": record["token_usage"].get("llm_input", 0),
@@ -243,7 +245,6 @@ async def viking_ingest(
     openviking_url: str,
     session_time: Optional[str] = None,
     user_id: Optional[str] = None,
-    agent_id: Optional[str] = None,
 ) -> Dict[str, int]:
     """Save messages to OpenViking via OpenViking SDK client.
     Returns token usage dict with embedding and vlm token counts.
@@ -253,7 +254,6 @@ async def viking_ingest(
         openviking_url: OpenViking service URL
         session_time: Session time string (e.g., "9:36 am on 2 April, 2023")
         user_id: User identifier for separate userspace (e.g., "conv-26")
-        agent_id: Agent identifier for separate agentspace (e.g., "conv-26")
     """
     # 解析 session_time - 为每条消息计算递增的时间戳
     base_datetime = None
@@ -267,8 +267,6 @@ async def viking_ingest(
     client_kwargs = {"url": openviking_url}
     if user_id is not None:
         client_kwargs["user"] = user_id
-    if agent_id is not None:
-        client_kwargs["agent_id"] = agent_id
     client = ov.AsyncHTTPClient(**client_kwargs)
     await client.initialize()
 
@@ -289,7 +287,7 @@ async def viking_ingest(
                 session_id=session_id,
                 role=msg["role"],
                 parts=[{"type": "text", "text": msg["text"]}],
-                created_at=msg_created_at,
+                options={"created_at": msg_created_at} if msg_created_at else None,
             )
 
         # Commit
@@ -304,7 +302,7 @@ async def viking_ingest(
         if task_id:
             # 轮询任务状态直到完成
             max_attempts = 3600  # 最多等待1小时
-            for attempt in range(max_attempts):
+            for _attempt in range(max_attempts):
                 task = await client.get_task(task_id)
                 status = task.get("status") if task else "unknown"
                 if status == "completed":
@@ -344,24 +342,23 @@ async def process_single_session(
     args: argparse.Namespace,
 ) -> Dict[str, Any]:
     """处理单个会话的导入任务"""
+    started_at = time.perf_counter()
     try:
-        # 根据参数决定是否使用 sample_id 作为 user_id 和 agent_id
-        user_id = str(sample_id) if not args.no_user_agent_id else None
-        agent_id = str(sample_id) if not args.no_user_agent_id else None
+        user_id = str(sample_id) if not args.no_user_id else None
         result = await viking_ingest(
             messages,
             args.openviking_url,
             meta.get("date_time"),
             user_id=user_id,
-            agent_id=agent_id,
         )
+        elapsed_seconds = time.perf_counter() - started_at
         token_usage = result["token_usage"]
         task_id = result.get("task_id")
         trace_id = result.get("trace_id", "")
         embedding_tokens = token_usage.get("embedding", 0)
         vlm_tokens = token_usage.get("vlm", 0)
         print(
-            f"    -> [COMPLETED] [{sample_id}/{session_key}] embed={embedding_tokens}, vlm={vlm_tokens}, task_id={task_id}, trace_id={trace_id}",
+            f"    -> [COMPLETED] [{sample_id}/{session_key}] elapsed={elapsed_seconds:.3f}s, embed={embedding_tokens}, vlm={vlm_tokens}, task_id={task_id}, trace_id={trace_id}",
             file=sys.stderr,
         )
 
@@ -372,6 +369,7 @@ async def process_single_session(
             "session": session_key,
             "status": "success",
             "meta": meta,
+            "elapsed_seconds": elapsed_seconds,
             "token_usage": token_usage,
             "embedding_tokens": embedding_tokens,
             "vlm_tokens": vlm_tokens,
@@ -385,7 +383,11 @@ async def process_single_session(
         return result
 
     except Exception as e:
-        print(f"    -> [ERROR] [{sample_id}/{session_key}] {e}", file=sys.stderr)
+        elapsed_seconds = time.perf_counter() - started_at
+        print(
+            f"    -> [ERROR] [{sample_id}/{session_key}] elapsed={elapsed_seconds:.3f}s, {e}",
+            file=sys.stderr,
+        )
         traceback.print_exc(file=sys.stderr)
 
         # Write error record
@@ -511,7 +513,7 @@ async def run_import(args: argparse.Namespace) -> None:
 
         # 不同 sample 之间并行执行
         tasks = [asyncio.create_task(process_sample(item)) for item in samples]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     else:
         # Plain text format
@@ -523,11 +525,9 @@ async def run_import(args: argparse.Namespace) -> None:
             print(f"\n=== Text Session {idx} ===", file=sys.stderr)
 
             # Skip already ingested sessions unless force-ingest is enabled
-            if not args.force_ingest and is_already_ingested(
-                "txt", session_key, success_keys
-            ):
+            if not args.force_ingest and is_already_ingested("txt", session_key, success_keys):
                 print(
-                    f"  [SKIP] already imported (use --force-ingest to reprocess)", file=sys.stderr
+                    "  [SKIP] already imported (use --force-ingest to reprocess)", file=sys.stderr
                 )
                 skipped_count += 1
                 continue
@@ -573,12 +573,12 @@ async def run_import(args: argparse.Namespace) -> None:
 
     # Final summary
     total_processed = success_count + error_count + skipped_count
-    print(f"\n=== Import summary ===", file=sys.stderr)
+    print("\n=== Import summary ===", file=sys.stderr)
     print(f"Total sessions: {total_processed}", file=sys.stderr)
     print(f"Successfully imported: {success_count}", file=sys.stderr)
     print(f"Failed: {error_count}", file=sys.stderr)
     print(f"Skipped (already imported): {skipped_count}", file=sys.stderr)
-    print(f"\n=== Token usage summary ===", file=sys.stderr)
+    print("\n=== Token usage summary ===", file=sys.stderr)
     print(f"Total Embedding tokens: {total_embedding_tokens}", file=sys.stderr)
     print(f"Total VLM tokens: {total_vlm_tokens}", file=sys.stderr)
     if success_count > 0:
@@ -587,7 +587,7 @@ async def run_import(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         print(f"Average VLM per session: {total_vlm_tokens // success_count}", file=sys.stderr)
-    print(f"\nResults saved to:", file=sys.stderr)
+    print("\nResults saved to:", file=sys.stderr)
     print(f"  - Success records: {args.success_csv}", file=sys.stderr)
     print(f"  - Error logs: {args.error_log}", file=sys.stderr)
 
@@ -647,10 +647,11 @@ def main():
         help="Force re-import even if already recorded as completed",
     )
     parser.add_argument(
-        "--no-user-agent-id",
+        "--no-user-id",
+        dest="no_user_id",
         action="store_true",
         default=False,
-        help="Do not pass user_id and agent_id to OpenViking client",
+        help="Do not pass user_id to OpenViking client",
     )
     args = parser.parse_args()
 

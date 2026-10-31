@@ -1,0 +1,460 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+"""Authentication and authorization middleware for OpenViking multi-tenant HTTP Server."""
+
+from typing import Optional
+
+from fastapi import Depends, Header, HTTPException, Query, Request
+
+from openviking.core.peer_id import normalize_peer_id
+from openviking.server.identity import (
+    AuthMode,
+    RequestContext,
+    ResolvedIdentity,
+    Role,
+)
+from openviking.server.upload_token_store import (
+    ConsumedUploadToken,
+    UploadTokenError,
+    download_token_store,
+    upload_token_store,
+)
+from openviking.telemetry.span_models import update_root_span_identity
+from openviking_cli.exceptions import (
+    FailedPreconditionError,
+    InvalidArgumentError,
+    PermissionDeniedError,
+    UnauthenticatedError,
+)
+from openviking_cli.session.user_id import UserIdentifier
+
+
+def _auth_mode(request: Request) -> str:
+    config = getattr(request.app.state, "config", None)
+    if config is not None and hasattr(config, "get_effective_auth_mode"):
+        mode = config.get_effective_auth_mode()
+        # AuthMode enum values are strings; custom modes are already strings
+        return mode.value if isinstance(mode, AuthMode) else str(mode)
+    return AuthMode.API_KEY.value
+
+
+def _extract_api_key(x_api_key: Optional[str], authorization: Optional[str]) -> Optional[str]:
+    if not isinstance(x_api_key, str):
+        x_api_key = None
+    if not isinstance(authorization, str):
+        authorization = None
+    if x_api_key:
+        return x_api_key
+    if authorization and authorization.startswith("Bearer "):
+        return authorization[7:]
+    return None
+
+
+def _normalize_header_value(value: Optional[str]) -> Optional[str]:
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+    return None
+
+
+def _normalize_request_value(value: object) -> Optional[str]:
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+    return None
+
+
+def normalize_actor_peer_header(value: Optional[str]) -> Optional[str]:
+    normalized = _normalize_header_value(value)
+    if normalized and ("/" in normalized or "\\" in normalized):
+        raise InvalidArgumentError("actor_peer_id must not contain path separators.")
+    try:
+        return normalize_peer_id(normalized)
+    except ValueError as exc:
+        raise InvalidArgumentError(str(exc)) from exc
+
+
+def _explicit_identity_from_request(request: Request) -> tuple[Optional[str], Optional[str]]:
+    path_params = getattr(request, "path_params", {}) or {}
+    query_params = request.query_params
+
+    account_id = _normalize_request_value(path_params.get("account_id"))
+    if account_id is None:
+        account_id = _normalize_request_value(query_params.get("account_id"))
+
+    user_id = _normalize_request_value(path_params.get("user_id"))
+    if user_id is None:
+        user_id = _normalize_request_value(query_params.get("user_id"))
+
+    return account_id, user_id
+
+
+def _get_plugin(request: Request):
+    """Get the active auth plugin from app state."""
+    plugin = getattr(request.app.state, "auth_plugin", None)
+    if plugin is None:
+        raise UnauthenticatedError("Auth plugin not initialized")
+    return plugin
+
+
+def _uses_local_account_store(plugin) -> bool:
+    """Whether request authorization is backed by server-managed identities."""
+    return plugin.auth_mode in (AuthMode.API_KEY.value, AuthMode.TRUSTED.value)
+
+
+async def resolve_group_ids(request: Request, account_id: str, user_id: str) -> tuple[str, ...]:
+    """Resolve server-managed account groups for a request identity."""
+    manager = getattr(request.app.state, "api_key_manager", None)
+    if manager is None or not hasattr(manager, "get_user_group_ids"):
+        return ()
+    return tuple(await manager.get_user_group_ids(account_id, user_id))
+
+
+async def _build_request_context(
+    request: Request,
+    identity: ResolvedIdentity,
+    *,
+    actor_peer_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> RequestContext:
+    plugin = _get_plugin(request)
+    plugin.get_request_context_checks(request.url.path, identity)
+    account_id = identity.account_id or "default"
+    user_id = identity.user_id or "default"
+    group_ids = identity.group_ids
+    if (
+        not group_ids
+        and identity.role != Role.ROOT
+        and _uses_local_account_store(plugin)
+    ):
+        group_ids = await resolve_group_ids(request, account_id, user_id)
+    ctx = RequestContext(
+        user=UserIdentifier(account_id, user_id),
+        role=identity.role,
+        group_ids=group_ids,
+        actor_peer_id=actor_peer_id,
+        from_oauth=identity.from_oauth,
+        api_key=api_key,
+    )
+    manager = getattr(request.app.state, "api_key_manager", None)
+    deletion = None
+    if (
+        _uses_local_account_store(plugin)
+        and ctx.role != Role.ROOT
+        and manager is not None
+        and hasattr(manager, "get_deletion")
+    ):
+        deletion = await manager.get_deletion(ctx.account_id, ctx.user.user_id)
+    if deletion is not None:
+        raise FailedPreconditionError(
+            "Identity deletion is in progress",
+            details={"task_id": deletion.get("task_id")},
+        )
+    update_root_span_identity(
+        request_state=request.state,
+        account_id=identity.account_id,
+        user_id=identity.user_id,
+    )
+    return ctx
+
+
+async def resolve_identity(
+    request: Request,
+    x_api_key: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+    x_openviking_account: Optional[str] = Header(None, alias="X-OpenViking-Account"),
+    x_openviking_user: Optional[str] = Header(None, alias="X-OpenViking-User"),
+) -> ResolvedIdentity:
+    """Resolve API key to identity via the active auth plugin."""
+    if x_api_key is None:
+        x_api_key = request.headers.get("X-API-Key")
+    if authorization is None:
+        authorization = request.headers.get("Authorization")
+    x_openviking_account = _normalize_header_value(x_openviking_account)
+    x_openviking_user = _normalize_header_value(x_openviking_user)
+    api_key = _extract_api_key(x_api_key, authorization)
+
+    plugin = _get_plugin(request)
+    return await plugin.resolve_identity(
+        request,
+        api_key=api_key,
+        x_openviking_account=x_openviking_account,
+        x_openviking_user=x_openviking_user,
+    )
+
+
+async def get_request_context(
+    request: Request,
+    identity: ResolvedIdentity = Depends(resolve_identity),
+    x_openviking_actor_peer: Optional[str] = Header(None, alias="X-OpenViking-Actor-Peer"),
+    x_api_key_ctx: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization_ctx: Optional[str] = Header(None, alias="Authorization"),
+) -> RequestContext:
+    """Convert ResolvedIdentity to RequestContext."""
+    return await _build_request_context(
+        request,
+        identity,
+        actor_peer_id=normalize_actor_peer_header(x_openviking_actor_peer),
+        api_key=_extract_api_key(x_api_key_ctx, authorization_ctx),
+    )
+
+
+async def get_session_request_context(
+    request: Request,
+    identity: ResolvedIdentity = Depends(resolve_identity),
+    x_api_key_ctx: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization_ctx: Optional[str] = Header(None, alias="Authorization"),
+) -> RequestContext:
+    """Build a Session context without accepting an actor peer view."""
+    return await _build_request_context(
+        request,
+        identity,
+        api_key=_extract_api_key(x_api_key_ctx, authorization_ctx),
+    )
+
+
+async def _context_from_signed_token(
+    request: Request, consumed: ConsumedUploadToken
+) -> RequestContext:
+    """Rebuild the request context bound to a consumed upload/download token.
+
+    In API-key mode the saved authorization role must remain compatible with the
+    registered account role. Other auth modes retain their USER token context.
+    """
+    if _auth_mode(request) == AuthMode.API_KEY:
+        manager = get_api_key_manager_or_raise(request)
+        registered_account_role = await manager.get_registered_user_role(
+            consumed.account_id, consumed.user_id
+        )
+        if registered_account_role is None:
+            raise UnauthenticatedError("Signed token's user no longer exists")
+        try:
+            authorized_account_role = Role.parse(consumed.role)
+        except ValueError:
+            raise UnauthenticatedError("Invalid signed-token authorization role") from None
+        if not registered_account_role.allows_token_role(authorized_account_role):
+            raise UnauthenticatedError(
+                "Signed token's role exceeds the user's current role; request a new token"
+            )
+        return await _build_request_context(
+            request,
+            ResolvedIdentity(
+                role=authorized_account_role,
+                account_id=consumed.account_id,
+                user_id=consumed.user_id,
+                from_oauth=consumed.from_oauth,
+            ),
+            actor_peer_id=consumed.actor_peer_id or None,
+        )
+    try:
+        ctx = RequestContext(
+            user=UserIdentifier(consumed.account_id, consumed.user_id),
+            role=Role.USER,
+            group_ids=await resolve_group_ids(request, consumed.account_id, consumed.user_id),
+            # Actor peer comes from the token (bound at mint time from the trusted MCP
+            # context), never from this request's headers, so server-side
+            # auto-ingest keeps the caller's peer scope for reason-memory routing.
+            actor_peer_id=consumed.actor_peer_id or None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"invalid identity in token: {exc}") from exc
+    update_root_span_identity(
+        request_state=request.state,
+        account_id=consumed.account_id,
+        user_id=consumed.user_id,
+    )
+    return ctx
+
+
+async def get_upload_request_context(
+    request: Request,
+    token: Optional[str] = Query(None),
+    x_api_key: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+    x_openviking_account: Optional[str] = Header(None, alias="X-OpenViking-Account"),
+    x_openviking_user: Optional[str] = Header(None, alias="X-OpenViking-User"),
+    x_openviking_actor_peer: Optional[str] = Header(None, alias="X-OpenViking-Actor-Peer"),
+) -> RequestContext:
+    """Two-layer auth for the ``temp_upload`` route: API key first, else a signed token.
+
+    When an API key (``X-API-Key`` / ``Authorization: Bearer``) is present, resolve identity
+    normally — an authenticated caller is never downgraded to the token path. Otherwise, if a
+    ``?token=`` is present, consume it (single-use) and rebuild the bound identity/business
+    params. In API-key mode the issuing role is retained only while the account user
+    exists and has not been downgraded. Other auth modes retain their USER token context.
+    Spoofed identity headers are ignored. The consumed token is stashed on
+    ``request.state.signed_upload`` so the handler can finish ingestion.
+    """
+    api_key = _extract_api_key(x_api_key, authorization)
+    if token and not api_key:
+        try:
+            consumed = upload_token_store.consume(token)
+        except UploadTokenError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        request.state.signed_upload = consumed
+        return await _context_from_signed_token(request, consumed)
+
+    identity = await resolve_identity(
+        request, x_api_key, authorization, x_openviking_account, x_openviking_user
+    )
+    return await get_request_context(request, identity, x_openviking_actor_peer)
+
+
+async def get_download_request_context(
+    request: Request,
+    token: Optional[str] = Query(None),
+    x_api_key: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+    x_openviking_account: Optional[str] = Header(None, alias="X-OpenViking-Account"),
+    x_openviking_user: Optional[str] = Header(None, alias="X-OpenViking-User"),
+    x_openviking_actor_peer: Optional[str] = Header(None, alias="X-OpenViking-Actor-Peer"),
+) -> RequestContext:
+    """Two-layer auth for ``GET /content/download``: API key first, else a signed token.
+
+    Mirrors :func:`get_upload_request_context`. A download token (minted by the MCP
+    ``download`` tool) is single-use and bound to one resolved URI, which is stashed on
+    ``request.state.signed_download_uri``; the handler serves only that URI.
+    """
+    api_key = _extract_api_key(x_api_key, authorization)
+    if token and not api_key:
+        try:
+            consumed = download_token_store.consume(token)
+        except UploadTokenError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        request.state.signed_download_uri = consumed.uri
+        return await _context_from_signed_token(request, consumed)
+
+    identity = await resolve_identity(
+        request, x_api_key, authorization, x_openviking_account, x_openviking_user
+    )
+    return await get_request_context(
+        request, identity, x_openviking_actor_peer, x_api_key, authorization
+    )
+
+
+def require_role(*allowed_roles: Role):
+    """Dependency factory that checks role permission.
+
+    Usage:
+        @router.post("/admin/accounts")
+        async def create_account(ctx: RequestContext = Depends(require_role(Role.ROOT))):
+            ...
+    """
+
+    async def _check(ctx: RequestContext = Depends(get_request_context)):
+        if ctx.role not in allowed_roles:
+            raise PermissionDeniedError(
+                f"Requires role: {', '.join(str(r) for r in allowed_roles)}"
+            )
+        return ctx
+
+    return Depends(_check)
+
+
+# Convenience dependency factories for common role requirements
+require_root = require_role(Role.ROOT)
+require_admin = require_role(Role.ADMIN)
+require_user = require_role(Role.USER)
+
+
+_DEV_MODE_ADMIN_API_MESSAGE = (
+    "Admin API requires api_key mode with root_api_key configured. Development mode does not "
+    'support account or user management. You should set server.auth_mode = "api_key" in ov.conf'
+)
+
+
+def require_auth_role(*allowed_roles: str):
+    """Decorator for Admin API routes with mode-aware errors.
+
+    Usage:
+        @router.post("/admin/accounts")
+        @require_auth_role(Role.ROOT)
+        async def create_account(body: CreateAccountRequest, request: Request, ctx: RequestContext):
+            ...
+    """
+    from functools import wraps
+
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            # Extract request and ctx from kwargs or args
+            request = kwargs.get("request")
+            ctx = kwargs.get("ctx")
+
+            # Find request and ctx in args if not in kwargs
+            if request is None or ctx is None:
+                import inspect
+
+                sig = inspect.signature(func)
+                bound_args = sig.bind(*args, **kwargs)
+                bound_args.apply_defaults()
+                request = bound_args.arguments.get("request")
+                ctx = bound_args.arguments.get("ctx")
+
+            if request is None or ctx is None:
+                raise PermissionDeniedError(
+                    "Admin API authentication failed: unable to resolve request context."
+                )
+
+            if getattr(request.app.state, "api_key_manager", None) is None:
+                raise PermissionDeniedError(_DEV_MODE_ADMIN_API_MESSAGE)
+
+            if ctx.role not in allowed_roles:
+                raise PermissionDeniedError(
+                    f"Requires role: {', '.join(str(r) for r in allowed_roles)}"
+                )
+
+            return await func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+# Convenience decorators for common admin role requirements
+def require_auth_root(func):
+    """Decorator to require ROOT role for Admin API."""
+    return require_auth_role(Role.ROOT)(func)
+
+
+def require_auth_admin(func):
+    """Decorator to require ADMIN role for Admin API."""
+    return require_auth_role(Role.ADMIN)(func)
+
+
+def require_auth_user(func):
+    """Decorator to require USER role for Admin API."""
+    return require_auth_role(Role.USER)(func)
+
+
+def require_auth_root_or_admin(func):
+    """Decorator to require ROOT or ADMIN role for Admin API."""
+    return require_auth_role(Role.ROOT, Role.ADMIN)(func)
+
+
+def get_api_key_manager_or_raise(request: Request):
+    """Return the compatibility management facade exposed by the auth mode."""
+    manager = getattr(request.app.state, "api_key_manager", None)
+    if manager is None:
+        raise PermissionDeniedError(_DEV_MODE_ADMIN_API_MESSAGE)
+    return manager
+
+
+def should_expose_user_key(request: Request) -> bool:
+    """Trusted gateways own credentials; never expose server keys in that mode."""
+    from openviking.server.config import ServerConfig
+
+    config = getattr(request.app.state, "config", None)
+    if not isinstance(config, ServerConfig):
+        return True
+    return config.get_effective_auth_mode() != "trusted"
+
+
+def is_personal_api_key_auth(request: Request | None, ctx: RequestContext) -> bool:
+    """Self-service credentials require a personal key, not a delegated token."""
+    return (
+        request is not None
+        and _auth_mode(request) == "api_key"
+        and not ctx.from_oauth
+        and bool(ctx.api_key)
+    )

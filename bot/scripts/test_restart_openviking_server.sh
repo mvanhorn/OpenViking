@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # Restart OpenViking Server with Test Config (~/.openviking_test/ov.conf)
-# Usage: ./test_restart_openviking_server.sh [--port PORT] [--bot-url URL]
+# Usage: ./test_restart_openviking_server.sh [--port PORT] [--bot-port PORT]
 
 set -e
 
 # Default values
 PORT="1934"
-BOT_URL="http://localhost:18790"
+BOT_PORT="18890"
 TEST_CONFIG="$HOME/.openviking_test/ov.conf"
 TEST_DATA_DIR="$HOME/.openviking_test/data"
 
@@ -18,29 +18,22 @@ while [[ $# -gt 0 ]]; do
             PORT="$2"
             shift 2
             ;;
-        --bot-url)
-            BOT_URL="$2"
+        --bot-port)
+            BOT_PORT="$2"
             shift 2
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--port PORT] [--bot-url URL]"
+            echo "Usage: $0 [--port PORT] [--bot-port PORT]"
             exit 1
             ;;
     esac
 done
 
-# Parse Bot URL to extract port
-BOT_PORT=$(echo "$BOT_URL" | sed -n 's/.*:\([0-9]*\).*/\1/p')
-if [ -z "$BOT_PORT" ]; then
-    BOT_PORT="18790"
-fi
-
 echo "=========================================="
 echo "Restarting OpenViking Server (TEST MODE)"
 echo "=========================================="
 echo "OpenViking Server Port: $PORT"
-echo "Bot URL: $BOT_URL"
 echo "Bot Port: $BOT_PORT"
 echo "Config File: $TEST_CONFIG"
 echo "Data Dir: $TEST_DATA_DIR"
@@ -107,14 +100,14 @@ echo "  ✓ Using config: $TEST_CONFIG"
 echo ""
 echo "Step 5: Starting openviking-server with TEST config..."
 echo "  Config: $TEST_CONFIG"
-echo "  Command: OPENVIKING_CONFIG_FILE=$TEST_CONFIG openviking-server --with-bot --port $PORT --bot-url $BOT_URL"
+echo "  Command: OPENVIKING_CONFIG_FILE=$TEST_CONFIG openviking-server --with-bot --port $PORT --bot-port $BOT_PORT"
 echo ""
 
 # Set environment variable to use test config
 export OPENVIKING_CONFIG_FILE="$TEST_CONFIG"
 
 # Start server
-openviking-server --port "$PORT" 
+openviking-server --with-bot --port "$PORT" --bot-port "$BOT_PORT"
 
 SERVER_PID=$!
 echo "  Server PID: $SERVER_PID"
@@ -124,9 +117,10 @@ echo ""
 echo "Step 6: Waiting for server to be ready..."
 sleep 3
 
-# First check if server is responding at all
+# First check if bot proxy health reports healthy
 for i in {1..10}; do
-    if curl -s http://localhost:"$PORT"/api/v1/bot/health > /dev/null 2>&1; then
+    health_response=$(curl -fsS http://localhost:"$PORT"/bot/v1/health 2>/dev/null || true)
+    if echo "${health_response//[[:space:]]/}" | grep -q '"status":"healthy"'; then
         echo ""
         echo "=========================================="
         echo "✓ OpenViking Server started successfully! (TEST MODE)"
@@ -135,15 +129,12 @@ for i in {1..10}; do
         echo "Server URL: http://localhost:$PORT"
         echo "Config File: $TEST_CONFIG"
         echo "Data Dir: $TEST_DATA_DIR"
-        echo "Health Check: http://localhost:$PORT/api/v1/bot/health"
+        echo "Health Check: http://localhost:$PORT/bot/v1/health"
         echo ""
         exit 0
     fi
     # Check actual health response
-    health_response=$(curl -s http://localhost:"$PORT"/api/v1/bot/health 2>/dev/null)
-    if echo "$health_response" | grep -q "Vikingbot"; then
-        echo "  ✓ Vikingbot is healthy"
-    elif echo "$health_response" | grep -q "Bot service unavailable"; then
+    if echo "$health_response" | grep -q "Bot service unavailable"; then
         echo "  ⏳ Waiting for Vikingbot to start (attempt $i/10)..."
     fi
     sleep 2
@@ -160,7 +151,7 @@ echo "Data dir: $TEST_DATA_DIR"
 echo ""
 echo "Troubleshooting:"
 echo "  1. Check if port $PORT is in use: lsof -i :$PORT"
-echo "  2. Check Vikingbot is running on $BOT_URL"
+echo "  2. Check Vikingbot is running on port $BOT_PORT"
 echo "  3. Verify config file exists: $TEST_CONFIG"
 echo ""
 exit 1

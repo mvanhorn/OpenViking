@@ -8,12 +8,12 @@ Reference: bot/vikingbot/agent/tools/base.py design pattern
 
 import json
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
-from openviking.session.memory.utils import parse_memory_file_with_fields
-from openviking.session.memory.utils.content import truncate_content
-from openviking.storage.viking_fs import VikingFS
+from openviking.session.memory.utils import add_line_numbers, line_count, slice_content_lines
+from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.telemetry import tracer
+from openviking.utils.token_estimation import estimate_text_tokens
 from openviking_cli.exceptions import NotFoundError
 from openviking_cli.utils import get_logger
 
@@ -21,6 +21,40 @@ if TYPE_CHECKING:
     from openviking.server.identity import ToolContext
 
 logger = get_logger(__name__)
+
+_LLM_HIDDEN_MEMORY_FIELDS = {
+    "source_extraction_id",
+    "source_extraction_ids",
+    "last_update_trace_id",
+}
+
+
+def memory_maintenance_notice(
+    content: str, *, review_after_tokens: int | None = None
+) -> Optional[Dict[str, Any]]:
+    """Return maintenance metadata only when a memory exceeds the soft size threshold."""
+    if review_after_tokens is None:
+        from openviking_cli.utils.config import get_openviking_config
+
+        review_after_tokens = get_openviking_config().memory.maintenance_review_tokens
+    estimated_tokens = estimate_text_tokens(content)
+    if estimated_tokens <= review_after_tokens:
+        return None
+    guidance = (
+        f"This memory is estimated at {estimated_tokens:,} tokens, above the "
+        f"{review_after_tokens:,}-token readability target, so maintenance is required: do not "
+        "leave it as one broad oversized memory. Preserve every distinct valid fact exactly once. "
+        "For a topic-keyed collection such as preferences, split different behavioral choice "
+        "dimensions into focused same-type memories. For an identity-keyed collection such as "
+        "entities, never invent multiple identities for one object; split only if distinct "
+        "identities were mixed. Compact only duplicate wording, never concrete facts. Aim for the "
+        f"{review_after_tokens:,}-token target, but fact integrity takes priority. Delete or replace "
+        "the oversized source only after every fact has one clear destination."
+    )
+    return {
+        "maintenance_required": True,
+        "guidance": guidance,
+    }
 
 
 def optimize_search_result(result: Any, limit: int = 10) -> Any:
@@ -49,7 +83,7 @@ def optimize_tool_result(tool_name: str, result: Any) -> Any:
     # 对 read 工具返回的 dict，如果包含 content 字段，则截断 content
     if tool_name == "read" and isinstance(result, dict) and "content" in result:
         result = result.copy()
-        result["content"] = truncate_content(result["content"])
+        result["content"] = MemoryFileUtils.truncate_content(result["content"])
     return result
 
 
@@ -81,21 +115,6 @@ def add_tool_call_pair_to_messages(
     )
 
 
-def add_tool_call_items_to_messages(
-    messages: List[Dict[str, Any]],
-    tool_call_items: List[Tuple[Union[str, int], str, Dict[str, Any], Any]],
-) -> None:
-    """
-    Add multiple tool call pairs to the messages list.
-
-    Args:
-        messages: List to append messages to
-        tool_call_items: List of tuples (call_id, tool_name, params, result)
-    """
-    for call_id, tool_name, params, result in tool_call_items:
-        add_tool_call_pair_to_messages(messages, call_id, tool_name, params, result)
-
-
 class MemoryTool(ABC):
     """
     Abstract base class for memory tools.
@@ -125,7 +144,6 @@ class MemoryTool(ABC):
     @abstractmethod
     async def execute(
         self,
-        viking_fs: VikingFS,
         ctx: Optional["ToolContext"],
         **kwargs: Any,
     ) -> Any:
@@ -133,8 +151,7 @@ class MemoryTool(ABC):
         Execute the tool with given parameters.
 
         Args:
-            viking_fs: VikingFS instance
-            ctx: Tool context
+            ctx: Tool context (contains viking_fs)
             **kwargs: Tool-specific parameters
 
         Returns:
@@ -172,7 +189,22 @@ class MemoryReadTool(MemoryTool):
             "properties": {
                 "uri": {
                     "type": "string",
-                    "description": "Memory URI to read, e.g., 'viking://user/user123/memories/profile.md'",
+                    "description": (
+                        "Memory URI to read. e.g., current user: "
+                        "'viking://~/memories/profile.md'"
+                    ),
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Starting line number to read from (0-indexed)",
+                    "default": 0,
+                    "minimum": 0,
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Number of lines to read. -1 means read to end",
+                    "default": -1,
+                    "minimum": -1,
                 },
             },
             "required": ["uri"],
@@ -180,21 +212,49 @@ class MemoryReadTool(MemoryTool):
 
     async def execute(
         self,
-        viking_fs: VikingFS,
         ctx: Optional["ToolContext"],
         **kwargs: Any,
     ) -> Any:
         uri = kwargs.get("uri", "")
+        offset = kwargs.get("offset", 0)
+        limit = kwargs.get("limit", -1)
         try:
-            content = await viking_fs.read_file(
+            content = await ctx.viking_fs.read_file(
                 uri,
                 ctx=ctx.request_ctx,
             )
             # Parse MEMORY_FIELDS from comment and return dict directly
-            parsed = parse_memory_file_with_fields(content)
-            return parsed
+            mf = MemoryFileUtils.read(content, uri=uri)
+            ctx.read_file_contents[uri] = mf
+            # Remove links/backlinks from LLM-visible output (not needed for extraction)
+            llm_result = mf.to_metadata()
+            llm_result.pop("links", None)
+            llm_result.pop("backlinks", None)
+            for hidden_field in _LLM_HIDDEN_MEMORY_FIELDS:
+                llm_result.pop(hidden_field, None)
+            # Annotate with page_id for link extraction
+            if ctx and ctx.page_id_map:
+                page_id = ctx.page_id_map.get_page_id(uri)
+                if page_id is not None:
+                    llm_result["page_id"] = page_id
+            plain_content = mf.plain_content() or ""
+            maintenance_notice = memory_maintenance_notice(plain_content)
+            if maintenance_notice is not None:
+                llm_result["memory_maintenance_notice"] = maintenance_notice
+            visible_content = slice_content_lines(plain_content, offset=offset, limit=limit)
+            if visible_content:
+                llm_result["content"] = add_line_numbers(visible_content, start_line=offset + 1)
+            elif line_count(plain_content) == 0:
+                llm_result["content"] = (
+                    "<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>"
+                )
+            else:
+                llm_result["content"] = (
+                    "<system-reminder>Warning: the file exists but is shorter than the provided "
+                    f"offset ({offset + 1}). The file has {line_count(plain_content)} lines.</system-reminder>"
+                )
+            return llm_result
         except NotFoundError as e:
-            tracer.info(f"read not found: {uri}")
             return {"error": str(e)}
         except Exception as e:
             tracer.error(f"Failed to execute read: {e}")
@@ -232,7 +292,6 @@ class MemorySearchTool(MemoryTool):
 
     async def execute(
         self,
-        viking_fs: VikingFS,
         ctx: Optional["ToolContext"],
         **kwargs: Any,
     ) -> Any:
@@ -240,15 +299,16 @@ class MemorySearchTool(MemoryTool):
             query = kwargs.get("query", "")
             # Get target_uri from ctx.default_search_uris
             target_uri = ""
-            if ctx and hasattr(ctx, "default_search_uris") and ctx.default_search_uris:
+            if ctx.default_search_uris:
                 target_uri = ctx.default_search_uris
             limit = kwargs.get("limit", 10)
+            request_ctx = ctx.request_ctx if ctx else None
             # 多搜索 10 个，过滤抽象文件后再截断
-            search_result = await viking_fs.search(
+            search_result = await ctx.viking_fs.search(
                 query,
                 target_uri=target_uri,
                 limit=limit + 10,
-                ctx=ctx,
+                ctx=request_ctx,
             )
             return optimize_search_result(search_result.to_dict(), limit=limit)
         except Exception as e:
@@ -269,13 +329,19 @@ def _format_size(size_bytes: int) -> str:
 class MemoryLsTool(MemoryTool):
     """Tool to list directory contents."""
 
+    # Cap on recursive listing so a huge directory cannot flood the context.
+    _RECURSIVE_NODE_LIMIT = 500
+
     @property
     def name(self) -> str:
         return "ls"
 
     @property
     def description(self) -> str:
-        return "List directory content, includes abstract field when output='agent'"
+        return (
+            "List directory content. Pass recursive=true to include files in "
+            "subdirectories (returns 'relative/path size' per line)."
+        )
 
     @property
     def parameters(self) -> Dict[str, Any]:
@@ -284,7 +350,18 @@ class MemoryLsTool(MemoryTool):
             "properties": {
                 "uri": {
                     "type": "string",
-                    "description": "Directory URI to list, e.g., 'viking://user/user123/memories'",
+                    "description": (
+                        "Directory URI to list. e.g., current user: "
+                        "'viking://~/memories'"
+                    ),
+                },
+                "recursive": {
+                    "type": "boolean",
+                    "description": (
+                        "List files in all subdirectories with relative paths. "
+                        "Use this for memory directories organized into subfolders."
+                    ),
+                    "default": False,
                 },
             },
             "required": ["uri"],
@@ -292,13 +369,14 @@ class MemoryLsTool(MemoryTool):
 
     async def execute(
         self,
-        viking_fs: VikingFS,
         ctx: Optional["ToolContext"],
         **kwargs: Any,
     ) -> Any:
         try:
             uri = kwargs.get("uri", "")
-            entries = await viking_fs.ls(
+            if kwargs.get("recursive"):
+                return await self._execute_recursive(ctx, uri)
+            entries = await ctx.viking_fs.ls(
                 uri,
                 output="agent",
                 abs_limit=256,
@@ -306,23 +384,57 @@ class MemoryLsTool(MemoryTool):
                 node_limit=1000,
                 ctx=ctx.request_ctx,
             )
-            # Format: filename size (e.g., "file.md 1.2K")
+            # Format: filename size (e.g., "file.md 1.2K"). Directories are
+            # surfaced with a trailing slash so a subfoldered directory does not
+            # look empty; the model can ls into them or use recursive=true.
             result_lines = []
             for e in entries:
-                if not e.get("isDir", False):
-                    # Extract name from entry or fallback to uri
-                    name = e.get("name", "")
-                    if not name:
-                        uri = e.get("uri", "")
-                        name = uri.rsplit("/", 1)[-1] if "/" in uri else uri
-                    size = e.get("size", 0)
-                    result_lines.append(f"{name} {_format_size(size)}")
+                name = e.get("name", "")
+                if not name:
+                    entry_uri = e.get("uri", "")
+                    name = entry_uri.rsplit("/", 1)[-1] if "/" in entry_uri else entry_uri
+                if e.get("isDir", False):
+                    result_lines.append(f"{name}/")
+                else:
+                    result_lines.append(f"{name} {_format_size(e.get('size', 0))}")
             if not result_lines:
                 return "Directory is empty. You can write new files to create memory content."
             return "\n".join(result_lines)
         except Exception as e:
             tracer.info(f"Failed to execute ls: {e}")
             return {"error": str(e)}
+
+    async def _execute_recursive(self, ctx: Optional["ToolContext"], uri: str) -> Any:
+        base = uri.rstrip("/")
+        result = await ctx.viking_fs.glob(
+            "**/*",
+            uri=base,
+            node_limit=self._RECURSIVE_NODE_LIMIT + 1,
+            extra_fields=[],
+            ctx=ctx.request_ctx,
+        )
+        entries = result.get("matches", []) if isinstance(result, dict) else []
+        lines: list[str] = []
+        for e in entries:
+            if not isinstance(e, dict) or e.get("isDir", False):
+                continue
+            entry_uri = str(e.get("uri", ""))
+            name = entry_uri.rsplit("/", 1)[-1] if "/" in entry_uri else entry_uri
+            if name in {".overview.md", ".abstract.md"}:
+                continue
+            rel = entry_uri[len(base) + 1 :] if entry_uri.startswith(base + "/") else name
+            lines.append(f"{rel} {_format_size(e.get('size', 0))}")
+        if not lines:
+            return "Directory is empty. You can write new files to create memory content."
+        truncated = len(lines) > self._RECURSIVE_NODE_LIMIT
+        lines = lines[: self._RECURSIVE_NODE_LIMIT]
+        text = "\n".join(lines)
+        if truncated:
+            text += (
+                f"\n... (listing truncated at {self._RECURSIVE_NODE_LIMIT} files; "
+                "use ls on a subdirectory or search to narrow down)"
+            )
+        return text
 
 
 # Tool registry
@@ -337,20 +449,6 @@ def register_tool(tool: MemoryTool) -> None:
 def get_tool(name: str) -> Optional[MemoryTool]:
     """Get a memory tool by name."""
     return MEMORY_TOOLS_REGISTRY.get(name)
-
-
-def list_tools() -> Dict[str, MemoryTool]:
-    """List all registered memory tools."""
-    return MEMORY_TOOLS_REGISTRY.copy()
-
-
-# Tools exposed to LLM (not all registered tools are exposed)
-LLM_TOOLS = ["read"]
-
-
-def get_tool_schemas() -> List[Dict[str, Any]]:
-    """Get tools exposed to LLM in OpenAI function schema format."""
-    return [tool.to_schema() for tool in MEMORY_TOOLS_REGISTRY.values() if tool.name in LLM_TOOLS]
 
 
 # Register default tools

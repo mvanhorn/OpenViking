@@ -15,6 +15,19 @@ logger = get_logger(__name__)
 
 # Coalesce rapid re-enqueues for the same memory parent directory (github #769).
 _MEMORY_PARENT_SEMANTIC_DEDUPE_SEC = 45.0
+_SEMANTIC_COALESCE_LOCK = threading.Lock()
+_SEMANTIC_COALESCE_VERSION: dict[str, int] = {}
+
+
+def is_semantic_coalesce_stale(coalesce_key: str, coalesce_version: int) -> bool:
+    if not coalesce_key or coalesce_version <= 0:
+        return False
+    with _SEMANTIC_COALESCE_LOCK:
+        return coalesce_version < _SEMANTIC_COALESCE_VERSION.get(coalesce_key, 0)
+
+
+def is_semantic_msg_stale(msg: SemanticMsg) -> bool:
+    return is_semantic_coalesce_stale(msg.coalesce_key, msg.coalesce_version)
 
 
 class SemanticQueue(NamedQueue):
@@ -27,11 +40,11 @@ class SemanticQueue(NamedQueue):
 
     @staticmethod
     def _memory_parent_semantic_key(msg: SemanticMsg) -> str:
-        return f"{msg.account_id}|{msg.user_id}|{msg.agent_id}|{msg.uri}"
+        return f"{msg.account_id}|{msg.user_id}|{msg.peer_id}|{msg.uri}"
 
-    async def enqueue(self, msg: SemanticMsg) -> str:
+    async def enqueue(self, msg: SemanticMsg, *, deduplicate_memory: bool = True) -> str:
         """Serialize SemanticMsg object and store in queue."""
-        if msg.context_type == "memory":
+        if deduplicate_memory and msg.context_type == "memory" and not msg.coalesce_key:
             key = self._memory_parent_semantic_key(msg)
             now = time.monotonic()
             with self._memory_parent_semantic_lock:
@@ -50,6 +63,14 @@ class SemanticQueue(NamedQueue):
                     stale = [k for k, t in self._memory_parent_semantic_last.items() if t < cutoff]
                     for k in stale[:800]:
                         self._memory_parent_semantic_last.pop(k, None)
+
+        if msg.coalesce_key:
+            with _SEMANTIC_COALESCE_LOCK:
+                version = _SEMANTIC_COALESCE_VERSION.get(msg.coalesce_key, 0) + 1
+                _SEMANTIC_COALESCE_VERSION[msg.coalesce_key] = version
+                msg.coalesce_version = version
+
+        msg.queue_enqueued_at = time.time()
 
         return await super().enqueue(msg.to_dict())
 

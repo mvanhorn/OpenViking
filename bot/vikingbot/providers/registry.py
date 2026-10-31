@@ -1,10 +1,6 @@
 """
-Provider Registry — single source of truth for LLM provider metadata.
-
-Adding a new provider:
-  1. Add a ProviderSpec to PROVIDERS below.
-  2. Add a field to ProvidersConfig in config/schema.py.
-  Done. Env vars, prefixing, config matching, status display all derive from here.
+Bot provider metadata used for history formatting and configuration helpers.
+Model backend registration and request routing are owned by OpenViking VLM.
 
 Order matters — it controls match priority and fallback. Gateways first.
 Every entry writes out all fields so you can copy-paste as a template.
@@ -26,10 +22,10 @@ class ProviderSpec:
     """
 
     # identity
-    name: str  # config field name, e.g. "dashscope"
+    name: str  # provider identifier, e.g. "dashscope"
     keywords: tuple[str, ...]  # model-name keywords for matching (lowercase)
     env_key: str  # LiteLLM env var, e.g. "DASHSCOPE_API_KEY"
-    display_name: str = ""  # shown in `vikingbot status`
+    display_name: str = ""  # human-readable provider label
 
     # model prefixing
     litellm_prefix: str = ""  # "dashscope" → model becomes "dashscope/{model}"
@@ -50,6 +46,11 @@ class ProviderSpec:
 
     # per-model param overrides, e.g. (("kimi-k2.5", {"temperature": 1.0}),)
     model_overrides: tuple[tuple[str, dict[str, Any]], ...] = ()
+
+    # Provider-specific way to request reasoning/thinking, if supported by the protocol.
+    thinking_param: str = (
+        ""  # volcengine_thinking | dashscope_enable_thinking | openai_reasoning_effort
+    )
 
     @property
     def label(self) -> str:
@@ -133,6 +134,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="",
         strip_model_prefix=False,
         model_overrides=(),
+        thinking_param="openai_reasoning_effort",
     ),
     # DeepSeek: needs "deepseek/" prefix for LiteLLM routing.
     ProviderSpec(
@@ -167,6 +169,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="https://ark.cn-beijing.volces.com/api/v3",
         strip_model_prefix=False,
         model_overrides=(),
+        thinking_param="volcengine_thinking",
     ),
     # Gemini: needs "gemini/" prefix for LiteLLM.
     ProviderSpec(
@@ -220,6 +223,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="",
         strip_model_prefix=False,
         model_overrides=(),
+        thinking_param="dashscope_enable_thinking",
     ),
     # Moonshot: Kimi models, needs "moonshot/" prefix.
     # LiteLLM requires MOONSHOT_API_BASE env var to find the endpoint.
@@ -242,14 +246,15 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
     ),
     # MiniMax: needs "minimax/" prefix for LiteLLM routing.
     # Uses OpenAI-compatible API at api.minimax.io/v1.
-    # Recommended models: MiniMax-M2.7 (default), MiniMax-M2.7-highspeed (faster).
+    # Recommended models: MiniMax-M3 (default, flagship), MiniMax-M2.7 (alternative),
+    # MiniMax-M2.7-highspeed (faster).
     # Note: MiniMax does not support system messages; they are merged into the first user message.
     ProviderSpec(
         name="minimax",
         keywords=("minimax",),
         env_key="MINIMAX_API_KEY",
         display_name="MiniMax",
-        litellm_prefix="minimax",  # MiniMax-M2.7 → minimax/MiniMax-M2.7
+        litellm_prefix="minimax",  # MiniMax-M3 → minimax/MiniMax-M3
         skip_prefixes=("minimax/", "openrouter/"),
         env_extras=(),
         is_gateway=False,

@@ -46,12 +46,14 @@ class SingleTurnChannel(BaseChannel):
         markdown: bool = True,
         eval: bool = False,
         sender: str | None = None,
+        disabled_tools: list[str] | None = None,
     ):
         super().__init__(config, bus, workspace_path)
         self.message = message
         self.session_id = session_id
         self.markdown = markdown
         self.sender = sender
+        self.disabled_tools = disabled_tools or []
         self._response_received = asyncio.Event()
         self._last_response: str | None = None
         self._eval = eval
@@ -62,6 +64,13 @@ class SingleTurnChannel(BaseChannel):
 
         # Send the message
         sender_id = self.sender or "user"
+        metadata = {"disabled_tools": self.disabled_tools}
+        memory_peers = getattr(self.config, "memory_peer", None)
+        if memory_peers:
+            metadata["memory_peers"] = memory_peers
+        memory_users = getattr(self.config, "memory_user", None)
+        if memory_users:
+            metadata["memory_users"] = memory_users
         msg = InboundMessage(
             session_key=SessionKey(
                 type="cli",
@@ -70,6 +79,7 @@ class SingleTurnChannel(BaseChannel):
             ),
             sender_id=sender_id,
             content=self.message,
+            metadata=metadata,
         )
         await self.bus.publish_inbound(msg)
 

@@ -6,11 +6,16 @@ Session 负责管理对话消息、记录上下文使用、提取长期记忆。
 
 **生命周期**：创建 → 交互 → 提交
 
-通过 session_id 获取会话时，默认不会自动创建不存在的会话；如果需要自动创建，请显式使用 `client.get_session(..., auto_create=True)`。
+通过 session_id 获取会话时不会创建会话。请先创建会话，再通过
+`client.session(session_id=...)` 追加消息或提交会话。
 
 ```python
-session = client.session(session_id="chat_001")
-session.add_message("user", [TextPart("...")])
+from openviking_sdk import SyncHTTPClient
+
+client = SyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+session_info = client.create_session(session_id="chat_001")
+session = client.session(session_id=session_info["session_id"])
+session.add_message(role="user", content="...")
 session.commit()
 ```
 
@@ -18,41 +23,39 @@ session.commit()
 
 | 方法 | 说明 |
 |------|------|
-| `add_message(role, parts)` | 添加消息 |
-| `used(contexts, skill)` | 记录使用的上下文/技能 |
+| `add_message(role, content=None, parts=None, options=None, peer_id=None)` | 添加消息 |
 | `commit()` | 提交：归档（同步） + 摘要生成和记忆提取（异步后台） |
-| `get_task(task_id)` | 查询后台任务状态 |
+| `client.get_task(task_id)` | 查询后台任务状态 |
 
 ### add_message
 
 ```python
+from openviking_sdk import ContextPart, ImagePart, TextPart
+
 session.add_message(
-    "user",
-    [TextPart("How to configure embedding?")]
+    role="user",
+    content="How to configure embedding?",
 )
 
 session.add_message(
-    "assistant",
-    [
-        TextPart("Here's how..."),
-        ContextPart(uri="viking://user/memories/profile.md"),
+    role="assistant",
+    parts=[
+        TextPart(text="Here's how..."),
+        ContextPart(
+            uri="viking://~/memories/profile.md",
+            context_type="memory",
+            abstract="User profile",
+        ),
     ]
 )
-```
 
-### used
-
-```python
-# 记录使用的上下文
-session.used(contexts=["viking://user/memories/profile.md"])
-
-# 记录使用的技能
-session.used(skill={
-    "uri": "viking://agent/skills/code-search",
-    "input": "search config",
-    "output": "found 3 files",
-    "success": True
-})
+session.add_message(
+    role="user",
+    parts=[
+        TextPart(text="Remember this studio layout."),
+        ImagePart(url="https://example.com/studio.png", detail="auto"),
+    ]
+)
 ```
 
 ### commit
@@ -62,14 +65,15 @@ result = session.commit()
 # {
 #   "status": "accepted",
 #   "task_id": "uuid-xxx",
-#   "archive_uri": "viking://session/.../history/archive_001",
+#   "archive_uri": "viking://user/{user_id}/sessions/.../history/archive_001",
 #   "archived": True
 # }
 
-# 查询后台任务进度
-task = client.get_task(result["task_id"])
-# task["status"]: "pending" | "running" | "completed" | "failed"
-# sum(task["result"]["memories_extracted"].values()): 3
+# 产生归档时才有后台任务；无可归档消息时返回 skipped 和 task_id: null
+task_id = result.get("task_id")
+if task_id:
+    task = client.get_task(task_id=task_id)
+    print(task)  # 单次查询，不代表任务已完成
 ```
 
 ## 消息结构
@@ -90,6 +94,7 @@ class Message:
 | 类型 | 说明 |
 |------|------|
 | `TextPart` | 文本内容 |
+| `ImagePart` | 图片 URL 内容。记忆提取时，OpenViking 可以使用已配置的 VLM 将其描述为文本。 |
 | `ContextPart` | 上下文引用（URI + 摘要） |
 | `ToolPart` | 工具调用（输入 + 输出） |
 
@@ -99,16 +104,16 @@ class Message:
 
 commit() 分两阶段执行：
 
-**Phase 1（同步，立即完成）**：
-1. 递增 compression_index
-2. 写入消息到归档目录（`messages.jsonl`）
-3. 清空当前消息列表
-4. 返回 `task_id`
+**Phase 1（请求内完成归档准备）**：
+1. 在路径锁保护下分配归档编号，划分归档消息和保留消息
+2. 写入归档消息（`messages.jsonl`），将后续处理加入持久化队列
+3. 更新当前消息列表；默认归档全部消息，也可通过提交参数保留最近的消息或轮次
+4. 产生归档时返回 `task_id`，用于跟踪后台处理
 
 **Phase 2（异步后台）**：
 5. 生成结构化摘要（LLM）→ 写入 `.abstract.md` 和 `.overview.md`
 6. 提取长期记忆
-7. 更新 active_count
+7. 写入 `memory_diff.json`（记忆变更审计日志）到归档目录
 8. 写入 `.done` 完成标记
 
 ### 摘要格式
@@ -133,45 +138,91 @@ commit() 分两阶段执行：
 
 ## 记忆提取
 
-### 8 种分类
+### 记忆类型
 
-| 分类 | 归属 | 说明 | 可合并 |
-|------|------|------|--------|
-| **profile** | user | 用户身份/属性 | ✅ |
-| **preferences** | user | 用户偏好 | ✅ |
-| **entities** | user | 实体（人/项目） | ✅ |
-| **events** | user | 事件/决策 | ❌ |
-| **cases** | agent | 问题+解决方案 | ❌ |
-| **patterns** | agent | 可复用流程 | ✅ |
-| **tools** | agent | 工具使用经验与最佳实践 | ✅ |
-| **skills** | agent | 技能执行经验与工作流策略 | ✅ |
+提交会话后，OpenViking 会根据对话内容和当前记忆策略，提取对后续交互有价值的信息，并保存到当前用户的记忆空间。当对话涉及稳定的 Peer 时，相关记忆也可以保存到对应的 Peer 空间。
+
+OpenViking 内置 `profile`、`preferences`、`entities`、`events`、`identity`、`soul`、`cases`、`trajectories` 和 `experiences` 等记忆类型，也支持根据业务需要自定义。完整用途与路径见 [上下文类型](./02-context-types.md)。
+
+在 `memory_policy.memory_types` 中，`experiences` 会启用完整的 Agent Evolution 流程，并自动激活 `cases` 和 `trajectories`。如果没有 `experiences`，显式传入的 `cases` 和 `trajectories` 会被静默忽略，不会报错。
+
+Agent Evolution 还要求生效的 `agent_evolution.enabled` 开关已开启。选择 `experiences` 后，流程将任务组织为 case，将执行记录为 trajectory，再提炼可复用的 experiences。经验使用情况和执行结果分布通过 [Agent Evolution API](../api/19-agent-evolution.md) 查询。`openviking/session/train/` 中的离线训练框架属于内部实现，不是公开训练 API。
 
 ### 提取流程
 
-```
-消息 → LLM 提取 → 候选记忆
-         ↓
-向量预过滤 → 找相似记忆
-         ↓
-LLM 去重决策 → candidate(skip/create/none) + item(merge/delete)
-         ↓
-写入 AGFS → 向量化
+<MemoryExtractionDiagram />
+
+已有记忆会参与提取，更新可以合并或修改现有文件，也可能创建或删除文件。实际操作受记忆 schema、写入权限和输出校验约束，不能把每次提交理解成必然新增记忆。只有产生 case 时，后续训练才会生成 trajectory、experience 或已启用的 session skill。
+
+### 如何检查更新结果
+
+先等待 commit 对应任务完成，再查看 `memory_diff.json`。其中新增、修改、删除是实际文件变更；`skipped_operations` 表示提取提出了操作，但校验或策略使其跳过。无实际变化的更新不会计入 diff；正文未变但元数据发生变化时，仍可能记录为更新。
+
+## 记忆变更记录
+
+提交后的后台处理会在归档目录写入 `memory_diff.json`，记录本次提交的记忆变更，便于审计和回溯。收到 `task_id` 时文件可能尚未生成，先按[会话 API](../api/05-sessions.md)查询任务完成状态。
+
+```json
+{
+  "archive_uri": "viking://user/{user_id}/sessions/{session_id}/history/archive_001",
+  "extracted_at": "2026-04-21T10:00:00Z",
+  "operations": {
+    "adds": [
+      {
+        "uri": "viking://user/alice/memories/identity.md",
+        "memory_type": "identity",
+        "after": "新创建的文件内容"
+      }
+    ],
+    "updates": [
+      {
+        "uri": "viking://user/alice/memories/entities/project.md",
+        "memory_type": "entities",
+        "before": "修改前的文件内容",
+        "after": "修改后的文件内容"
+      }
+    ],
+    "deletes": [
+      {
+        "uri": "viking://user/alice/memories/entities/old.md",
+        "memory_type": "entities",
+        "deleted_content": "被删除的文件内容"
+      }
+    ]
+  },
+  "skipped_operations": [
+    {
+      "memory_type": "events",
+      "page_id": 101,
+      "reason_code": "invalid_ranges",
+      "reason": "无法解析出有效的事件范围"
+    }
+  ],
+  "summary": {
+    "total_adds": 1,
+    "total_updates": 1,
+    "total_deletes": 1,
+    "total_skipped": 1
+  }
+}
 ```
 
-### 去重决策
+| 字段 | 说明 |
+|------|------|
+| `archive_uri` | 本次提交的归档目录 URI |
+| `extracted_at` | 提取时间的 ISO 8601 格式 |
+| `operations.adds` | 新增的记忆（无 `before`） |
+| `operations.updates` | 修改的记忆（含 `before` 和 `after`） |
+| `operations.deletes` | 删除的记忆（含 `deleted_content`） |
+| `skipped_operations` | 策略性跳过的操作及稳定原因码；不代表文件变更 |
+| `summary` | 各操作类型的计数 |
 
-| 层级 | 决策 | 说明 |
-|------|------|------|
-| Candidate | `skip` | 候选记忆重复，直接跳过 |
-| Candidate | `create` | 创建候选记忆；必要时先删除冲突旧记忆 |
-| Candidate | `none` | 不创建候选记忆，只处理已有记忆 |
-| Existing item | `merge` | 将候选内容合并到指定已有记忆 |
-| Existing item | `delete` | 删除冲突的已有记忆 |
+如果没有实际变更或策略性跳过，也会写入空结构的 `memory_diff.json`（所有计数为零）。
 
 ## 存储结构
 
 ```
-viking://session/{session_id}/
+viking://user/{user_id}/sessions/{session_id}/
 ├── messages.jsonl            # 当前消息
 ├── .abstract.md              # 当前摘要
 ├── .overview.md              # 当前概览
@@ -180,23 +231,28 @@ viking://session/{session_id}/
 │   │   ├── messages.jsonl    # Phase 1 写入
 │   │   ├── .abstract.md      # Phase 2 写入（后台）
 │   │   ├── .overview.md      # Phase 2 写入（后台）
+│   │   ├── memory_diff.json  # Phase 2 写入（后台，记忆变更审计）
 │   │   └── .done             # Phase 2 完成标记
 │   └── archive_NNN/
 └── tools/
     └── {tool_id}/tool.json
 
-viking://user/memories/
-├── profile.md                # 追加式用户画像
+viking://~/memories/
+├── profile.md
+├── identity.md
+├── soul.md
 ├── preferences/
 ├── entities/
-└── events/
-
-viking://agent/memories/
+├── events/
 ├── cases/
-├── patterns/
-├── tools/
-└── skills/
+├── trajectories/
+└── experiences/
 ```
+
+`viking://~/sessions/{session_id}` 使用家目录别名，服务端会按认证身份将其展开为
+`viking://user/{user_id}/sessions/{session_id}`。无 uid 的写法
+`viking://user/sessions/{session_id}` 不再被接受，请求会报错并提示改用 `viking://~/...`。
+旧 URI `viking://session/{session_id}` 也不再接受。
 
 ## 相关文档
 

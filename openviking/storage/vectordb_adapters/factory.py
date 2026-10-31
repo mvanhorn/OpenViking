@@ -4,17 +4,22 @@
 
 from __future__ import annotations
 
+import importlib
+
 from .base import CollectionAdapter
 from .http_adapter import HttpCollectionAdapter
-from .local_adapter import LocalCollectionAdapter
+from .local_adapter import CuVSCollectionAdapter, LocalCollectionAdapter
+from .opengauss_adapter import OpenGaussCollectionAdapter
 from .vikingdb_private_adapter import VikingDBPrivateCollectionAdapter
 from .volcengine_adapter import VolcengineCollectionAdapter
 
 _ADAPTER_REGISTRY: dict[str, type[CollectionAdapter]] = {
     "local": LocalCollectionAdapter,
+    "cuvs": CuVSCollectionAdapter,
     "http": HttpCollectionAdapter,
     "volcengine": VolcengineCollectionAdapter,
     "vikingdb": VikingDBPrivateCollectionAdapter,
+    "opengauss": OpenGaussCollectionAdapter,
 }
 
 
@@ -26,8 +31,6 @@ def create_collection_adapter(config) -> CollectionAdapter:
     # If not in registry, try to load dynamically as a class path
     if adapter_cls is None and "." in backend:
         try:
-            import importlib
-
             module_name, class_name = backend.rsplit(".", 1)
             module = importlib.import_module(module_name)
             potential_cls = getattr(module, class_name)
@@ -39,7 +42,9 @@ def create_collection_adapter(config) -> CollectionAdapter:
 
     if adapter_cls is None:
         raise ValueError(
-            f"Vector backend {config.backend} is not supported. "
+            f"Vector backend {backend} is not supported. "
             f"Available backends: {sorted(_ADAPTER_REGISTRY)}"
         )
-    return adapter_cls.from_config(config)
+    adapter = adapter_cls.from_config(config)
+    adapter._dimension = config.dimension
+    return adapter

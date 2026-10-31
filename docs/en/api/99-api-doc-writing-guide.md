@@ -1,0 +1,286 @@
+# API documentation standard
+
+This document defines the unified structure and writing conventions for API module documentation in the `docs/en/api/` directory.
+
+## Keep documentation current
+
+- Update the English and Chinese pages in the same PR, including navigation and examples. Keep one canonical explanation and link to it from related pages.
+- Lead with the reader's task, prerequisites, a working example, and its expected result. Move implementation details below the usage instructions.
+- Verify defaults and supported options against the current implementation. Distinguish released behavior from work on `main` and future plans; link to the relevant release or PR when it matters.
+- Use valid JSON for copyable configuration. Label fragments or pseudocode explicitly; do not mix comments into a `json` block.
+- Link to official documentation for external tools and services. Describe only the setup needed here instead of duplicating their manuals.
+- Before submitting, run `npm run check:docs`, `npm run check:api`, and `npm run docs:build` from `docs/`. Automated checks cover structure and examples, not factual correctness or translation quality.
+
+## Editorial Standards
+
+- Start with what the API does, its prerequisites, and the result. Explain implementation details after the reader can decide what to do next.
+- Use concrete actions and objects. Avoid vague claims about intelligence, transformation, or seamless workflows, and preserve conditions when shortening prose.
+- Do not promise unmeasured quality, performance, costs, or security. Verify defaults, supported behavior, and failures against the implementation; label illustrative values.
+- Distinguish accepted from completed, optional from required, and implemented from planned. Keep the overview, parameter tables, examples, and troubleshooting consistent.
+- Write natural prose in each language while preserving the same facts and limits; avoid word-for-word translation.
+- Preserve useful section links. Check old anchors when changing headings and add compatibility anchors where needed.
+
+## Directory Structure
+
+API documentation is organized by module, with one file per module, using a two-digit numerical prefix.
+
+## Unified File Structure
+
+Each API module documentation should follow the structure below:
+
+````markdown
+# Module Name
+
+Brief introduction explaining the main features and purpose of this module.
+
+## Optional Concepts/Introduction Section
+
+(If needed, explain core concepts, workflows, etc., related to this module)
+
+## API Reference
+
+### API Method Name 1
+
+#### 1. Purpose and Prerequisites
+
+Explain what the operation does, when to use it, and the required permissions or existing resources.
+
+#### 2. Interface and Parameter Description
+
+**Parameters**
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| <param-name> | <type> | <yes/no> | <default> | <detailed description> |
+| ... | ... | ... | ... | ... |
+
+**Optional Supplementary Section**
+
+(If needed, explain special behaviors, considerations, usage scenarios, etc.)
+
+#### 3. Usage Examples
+
+**Python SDK**
+
+```text
+<SDK call example>
+```
+
+**TypeScript SDK**
+
+```typescript
+<SDK call example>
+```
+
+**Go SDK**
+
+```go
+<SDK call example>
+```
+
+**HTTP API**
+
+```
+<HTTP Method> <Path>
+```
+
+```bash
+<curl example>
+```
+
+**CLI**
+
+```bash
+<CLI command example>
+```
+
+**Response Example**
+
+```json
+<JSON response example>
+```
+
+
+#### 4. Response Contract (Required) and Error Handling (Optional)
+
+Every public operation must document its successful return value. JSON endpoints need at least one response-envelope example that matches the implementation. Non-JSON endpoints such as file downloads, SSE, and WebDAV must document the HTTP status, important response headers, body, or event format. A prose-only list of returned fields is not sufficient. Error and exception examples remain optional.
+
+#### 5. Implementation Details (Optional)
+
+Explain the processing steps and link to the implementation, router, or CLI handler when these help readers understand behavior or troubleshoot a failure.
+
+---
+
+### API Method Name 2
+
+(Repeat the above structure)
+
+---
+
+## Optional Additional Sections
+
+## Related Documentation
+
+- [Document Title](<relative-path>) - <brief description>
+````
+
+## Structure Details
+
+### Title and Introduction
+
+- The level 1 heading is the module name
+- The introduction uses a paragraph to explain the purpose and main features of the module
+
+### API Reference Section
+
+Use the following sections for each API. Add implementation details after the response contract when they help explain behavior. Existing pages still use the legacy `API Implementation Overview` section with code entries; follow this structure for new pages and when migrating a page.
+
+#### 1. Purpose and Prerequisites
+
+- Explain the operation and its intended use.
+- State required permissions, configuration, and existing resources.
+- Describe effects that matter before calling it, including replacement or deletion of existing data.
+
+#### 2. Interface and Parameter Description
+
+- Parameter table: includes parameter name, type, required status, default value, description
+- Supplementary notes (optional): special behaviors, considerations, usage scenarios, etc.
+
+#### 3. Usage Examples
+
+For operations that return background tasks, default examples should submit a task and query its status. Avoid explicitly setting `wait`, and do not use global `wait_processed()` as a substitute for task status. Keep supported parameters and their actual defaults in the full reference. When later operations depend on asynchronous output, show polling by `task_id` until `completed` and handle `failed` and `cancelled`; do not just remove waiting parameters and immediately read the result.
+
+When an operation presents all transports together, prefer this order:
+- Python SDK example
+- TypeScript SDK example
+- Go SDK example, when it adds endpoint-specific value and can stay concise
+- HTTP API (method + path + curl example)
+- CLI example
+- Response example
+
+Example tabs are generated from bold labels. Put each invocation label in its own
+paragraph and use one of these fixed base forms: `**Python SDK**`, `**TypeScript SDK**`,
+`**Go SDK**`, `**HTTP API**`, or `**CLI**`. When a transport qualifier is useful,
+put it inside the same bold label with ASCII parentheses, for example
+`**Python SDK (HTTP)**`. Do not put the qualifier after the bold label or use
+full-width parentheses. A label such as `**Python HTTP SDK**` does not match the tab matcher and renders as plain text. Show only surfaces that are actually
+implemented. If an SDK or CLI does not expose the capability, omit that tab and
+briefly identify the available alternative. Do not wrap a handwritten HTTP request
+and present it as a nonexistent SDK method.
+
+For an existing operation with a workflow-specific structure, keep the local
+structure stable and place TypeScript next to the other SDK examples.
+
+Keep API documentation organized around API modules and individual operations,
+not around client languages. SDK snippets should be short call examples inside
+the relevant operation's Usage Examples. Put language-specific quick references,
+walkthroughs, and combined workflows in that SDK's own documentation instead of
+adding language-owned sections to API module pages.
+
+## Example: Complete API Documentation
+
+````markdown
+### add_resource()
+
+#### 1. Purpose and Prerequisites
+
+Add resources to the knowledge base, supporting various sources such as local files, directories, URLs, etc.
+
+#### 2. Interface and Parameter Description
+
+**Parameters**
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| path | str | Yes | - | Local path, directory path, or URL |
+| to | str | No | None | Final resource URI; an existing target is replaced |
+| reason | str | No | "" | Reason for adding this resource |
+| wait | bool | No | False | Whether to wait for semantic processing completion |
+
+**Notes**
+
+- SDK/CLI can directly pass local paths; raw HTTP requires `temp_upload` first
+- An existing `to` target is replaced. For a directory, files absent from the new import may be removed; unchanged content is reused for semantic and vector processing. Use `parent` to add a new resource below an existing directory.
+
+#### 3. Usage Examples
+
+**HTTP API**
+
+```
+POST /api/v1/resources
+```
+
+```bash
+curl -X POST http://localhost:1933/api/v1/resources \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{
+    "path": "https://example.com/guide.md",
+    "reason": "User guide documentation"
+  }'
+```
+
+**Python SDK**
+
+```python
+from openviking_sdk import SyncHTTPClient
+
+client = SyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+
+result = client.add_resource(
+    path="./documents/guide.md",
+    options={"reason": "User guide documentation"},
+)
+print(f"Task ID: {result['task_id']}")
+
+print(client.get_task(result["task_id"]))
+```
+
+**CLI**
+
+```bash
+ov add-resource ./documents/guide.md --reason "User guide documentation"
+```
+
+#### 4. Response Contract
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "status": "success",
+    "root_uri": "viking://resources/guide",
+    "task_id": "uuid-xxx"
+  }
+}
+```
+
+#### 5. Implementation Details
+
+**Processing Workflow**:
+1. Identify resource type (local file/directory/URL)
+2. Call corresponding parser to parse content
+3. Build directory tree and write to AGFS
+4. Asynchronously generate L0/L1 semantic abstracts
+5. Build vector index
+
+**Code Entry**:
+- `sdk/python/openviking_sdk/client.py:AsyncHTTPClient.add_resource()` - Async SDK entry
+- `sdk/python/openviking_sdk/client.py:SyncHTTPClient.add_resource()` - Sync SDK entry
+- `openviking/service/resource_service.py:ResourceService.add_resource()` - Core implementation
+- `openviking/server/routers/resources.py:add_resource()` - HTTP router
+- `crates/ov_cli/src/handlers.rs:handle_add_resource()` - CLI handler
+
+---
+````
+
+## Documentation Maintenance Checklist
+
+When adding or modifying API documentation, please check:
+
+- [ ] Purpose, prerequisites, and effects are clear; any code entry paths are correct
+- [ ] Parameter table is complete and accurate
+- [ ] Example code is concise and runnable
+- [ ] Invocation examples use fixed bold labels and every SDK/CLI tab maps to a real implementation
+- [ ] HTTP method and path are correct
+- [ ] Every public operation has a successful response contract and its example matches actual output

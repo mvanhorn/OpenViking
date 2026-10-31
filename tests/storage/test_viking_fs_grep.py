@@ -1,0 +1,1368 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+
+import re
+import time
+from unittest.mock import AsyncMock
+
+import pytest
+
+import openviking.storage.viking_fs as viking_fs_module
+from openviking.server.identity import RequestContext, Role
+from openviking.storage.acl import AclEntry, AclLevel, AclMode, DirectAcl, EffectiveAcl
+from openviking.storage.expr import And, PathScope, RawDSL
+from openviking.storage.viking_fs import _DEFAULT_GREP_FILE_CONCURRENCY, VikingFS
+from openviking.storage.viking_fs import _grep as grep_module
+from openviking_cli.exceptions import InvalidArgumentError, PermissionDeniedError
+from openviking_cli.session.user_id import UserIdentifier
+from openviking_cli.utils.config.grep_config import GrepConfig
+
+
+class _DummyAgfs:
+    pass
+
+
+class _DummyVectorStore:
+    def __init__(self, results=None):
+        self.calls = []
+        self.results = results or []
+
+    async def search_by_keywords(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.results
+
+
+class _FailingVectorStore:
+    async def search_by_keywords(self, **kwargs):
+        raise RuntimeError("remote keyword search failed")
+
+
+class _FulltextMetaFailureStore:
+    def __init__(self):
+        self.calls = 0
+        self.backend = type(
+            "Backend",
+            (),
+            {
+                "_mode": "vikingdb",
+                "collection_name": "context",
+                "index_name": "default",
+            },
+        )()
+
+    async def get_account_backend(self, _account_id):
+        return self.backend
+
+    async def get_collection_meta(self, **_kwargs):
+        self.calls += 1
+        raise RuntimeError("metadata unavailable")
+
+
+class _SequencedFulltextMetaStore:
+    def __init__(self, metadata):
+        self.backend = type(
+            "Backend",
+            (),
+            {
+                "_mode": "vikingdb",
+                "collection_name": "context",
+                "index_name": "default",
+            },
+        )()
+        self.metadata = iter(metadata)
+        self.calls = 0
+
+    async def get_account_backend(self, _account_id):
+        return self.backend
+
+    async def get_collection_meta(self, **_kwargs):
+        self.calls += 1
+        return next(self.metadata)
+
+
+def _fulltext_meta(enabled):
+    return {
+        "Fields": [{"FieldName": "content", "FieldType": "text"}],
+        "FullText": [{"Field": "content"}] if enabled else [],
+    }
+
+
+@pytest.fixture
+def fs(monkeypatch):
+    viking_fs = VikingFS(agfs=_DummyAgfs())
+    monkeypatch.setattr(viking_fs, "stat", _fake_stat)
+    monkeypatch.setattr(
+        viking_fs,
+        "_uri_to_path",
+        lambda uri, ctx=None: uri.replace("viking://", "/"),
+    )
+    monkeypatch.setattr(
+        viking_fs,
+        "_path_to_uri",
+        lambda path, ctx=None: path.replace("/", "viking://", 1),
+    )
+    return viking_fs
+
+
+async def _fake_stat(uri, ctx=None, skip_count=False):
+    return {"name": uri.rsplit("/", 1)[-1], "isDir": True}
+
+
+@pytest.mark.asyncio
+async def test_collect_grep_files_skips_directory_vector_count(monkeypatch):
+    viking_fs = VikingFS(agfs=_DummyAgfs())
+    stat = AsyncMock(return_value={"isDir": True})
+    monkeypatch.setattr(viking_fs, "stat", stat)
+    monkeypatch.setattr(viking_fs, "ls", AsyncMock(return_value=[]))
+
+    assert await viking_fs._collect_grep_files(
+        "viking://resources",
+        excluded_prefix=None,
+        level_limit=1,
+    ) == []
+    stat.assert_awaited_once_with("viking://resources", ctx=None, skip_count=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry_count", [999, 1000, 1001, 10000])
+async def test_collect_grep_files_paginates_wide_directories(monkeypatch, entry_count):
+    viking_fs = VikingFS(agfs=_DummyAgfs())
+    entries = [
+        {"name": f"archive_{index:05d}.jsonl", "isDir": False} for index in range(entry_count)
+    ]
+    offsets = []
+
+    async def fake_ls(uri, node_limit, offset, ctx=None):
+        assert uri == "viking://user/test/sessions/session-1/history"
+        offsets.append(offset)
+        return entries[offset : offset + node_limit]
+
+    monkeypatch.setattr(viking_fs, "stat", AsyncMock(return_value={"isDir": True}))
+    monkeypatch.setattr(viking_fs, "ls", fake_ls)
+
+    files = await viking_fs._collect_grep_files(
+        "viking://user/test/sessions/session-1/history",
+        excluded_prefix=None,
+        level_limit=1,
+    )
+
+    assert len(files) == entry_count
+    assert files[-1].endswith(f"archive_{entry_count - 1:05d}.jsonl")
+    assert offsets == list(range(0, entry_count + 1, grep_module._GREP_LS_PAGE_SIZE))
+
+
+@pytest.mark.asyncio
+async def test_grep_fallback_finds_match_after_first_directory_page(monkeypatch):
+    viking_fs = VikingFS(agfs=_DummyAgfs())
+    entries = [
+        {"name": f"archive_{index:04d}.jsonl", "isDir": False} for index in range(1001)
+    ]
+
+    async def fake_ls(uri, node_limit, offset, ctx=None):
+        return entries[offset : offset + node_limit]
+
+    async def fake_read(uri, ctx=None):
+        return b"needle" if uri.endswith("archive_1000.jsonl") else b"haystack"
+
+    monkeypatch.setattr(viking_fs, "stat", AsyncMock(return_value={"isDir": True}))
+    monkeypatch.setattr(viking_fs, "ls", fake_ls)
+    monkeypatch.setattr(viking_fs, "read", fake_read)
+
+    result = await viking_fs._grep_encrypted(
+        "viking://user/test/sessions/session-1/history",
+        pattern="needle",
+        level_limit=1,
+    )
+
+    assert result["matches"] == [
+        {
+            "line": 1,
+            "uri": (
+                "viking://user/test/sessions/session-1/history/archive_1000.jsonl"
+            ),
+            "content": "needle",
+        }
+    ]
+    assert result["files_scanned"] == 1001
+
+
+@pytest.mark.asyncio
+async def test_collect_grep_files_preserves_dfs_order_across_pages(monkeypatch):
+    viking_fs = VikingFS(agfs=_DummyAgfs())
+    entries = {
+        "viking://resources": [
+            {"name": "a.md", "isDir": False},
+            {"name": "dir", "isDir": True},
+            {"name": "z.md", "isDir": False},
+        ],
+        "viking://resources/dir": [
+            {"name": "nested.md", "isDir": False},
+        ],
+    }
+
+    async def fake_ls(uri, node_limit, offset, ctx=None):
+        return entries.get(uri, [])[offset : offset + node_limit]
+
+    monkeypatch.setattr(grep_module, "_GREP_LS_PAGE_SIZE", 2)
+    monkeypatch.setattr(viking_fs, "stat", AsyncMock(return_value={"isDir": True}))
+    monkeypatch.setattr(viking_fs, "ls", fake_ls)
+
+    assert await viking_fs._collect_grep_files(
+        "viking://resources",
+        excluded_prefix=None,
+        level_limit=1,
+    ) == [
+        "viking://resources/a.md",
+        "viking://resources/dir/nested.md",
+        "viking://resources/z.md",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_collect_grep_files_skips_acl_denied_subtrees(monkeypatch):
+    viking_fs = VikingFS(agfs=_DummyAgfs())
+    listed = []
+
+    async def fake_ls(uri, node_limit, offset, ctx=None):
+        listed.append(uri)
+        if uri == "viking://resources":
+            return [
+                {"name": "public.md", "isDir": False},
+                {"name": "private", "isDir": True, "access": "denied"},
+                {"name": "revoked", "isDir": True},
+            ]
+        if uri == "viking://resources/revoked":
+            raise PermissionDeniedError("access revoked", resource=uri)
+        raise AssertionError(f"grep must not enter {uri}")
+
+    monkeypatch.setattr(viking_fs, "stat", AsyncMock(return_value={"isDir": True}))
+    monkeypatch.setattr(viking_fs, "ls", fake_ls)
+
+    assert await viking_fs._collect_grep_files(
+        "viking://resources",
+        excluded_prefix=None,
+        level_limit=1,
+    ) == ["viking://resources/public.md"]
+    assert listed == ["viking://resources", "viking://resources/revoked"]
+
+
+@pytest.mark.asyncio
+async def test_collect_grep_files_propagates_root_acl_denial(monkeypatch):
+    viking_fs = VikingFS(agfs=_DummyAgfs())
+    monkeypatch.setattr(viking_fs, "stat", AsyncMock(return_value={"isDir": True}))
+    monkeypatch.setattr(
+        viking_fs,
+        "ls",
+        AsyncMock(side_effect=PermissionDeniedError("access denied")),
+    )
+
+    with pytest.raises(PermissionDeniedError, match="access denied"):
+        await viking_fs._collect_grep_files(
+            "viking://resources",
+            excluded_prefix=None,
+            level_limit=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_collect_grep_files_propagates_later_page_failure(monkeypatch):
+    viking_fs = VikingFS(agfs=_DummyAgfs())
+
+    async def fake_ls(uri, node_limit, offset, ctx=None):
+        if offset:
+            raise RuntimeError("page 2 failed")
+        return [{"name": f"file_{index:04d}.md", "isDir": False} for index in range(node_limit)]
+
+    monkeypatch.setattr(viking_fs, "stat", AsyncMock(return_value={"isDir": True}))
+    monkeypatch.setattr(viking_fs, "ls", fake_ls)
+
+    with pytest.raises(RuntimeError, match="page 2 failed"):
+        await viking_fs._collect_grep_files(
+            "viking://resources",
+            excluded_prefix=None,
+            level_limit=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_collect_grep_files_propagates_later_page_acl_denial(monkeypatch):
+    viking_fs = VikingFS(agfs=_DummyAgfs())
+
+    async def fake_ls(uri, node_limit, offset, ctx=None):
+        if uri == "viking://resources":
+            return [{"name": "child", "isDir": True}]
+        if offset:
+            raise PermissionDeniedError("access revoked", resource=uri)
+        return [{"name": f"file_{index:04d}.md", "isDir": False} for index in range(node_limit)]
+
+    monkeypatch.setattr(viking_fs, "stat", AsyncMock(return_value={"isDir": True}))
+    monkeypatch.setattr(viking_fs, "ls", fake_ls)
+
+    with pytest.raises(PermissionDeniedError, match="access revoked"):
+        await viking_fs._collect_grep_files(
+            "viking://resources",
+            excluded_prefix=None,
+            level_limit=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_collect_grep_files_propagates_root_stat_failure(monkeypatch):
+    viking_fs = VikingFS(agfs=_DummyAgfs())
+    monkeypatch.setattr(
+        viking_fs,
+        "stat",
+        AsyncMock(side_effect=RuntimeError("root stat failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="root stat failed"):
+        await viking_fs._collect_grep_files(
+            "viking://resources",
+            excluded_prefix=None,
+            level_limit=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_opengauss_auto_grep_only_matches_bm25_candidates(monkeypatch):
+    store = _SequencedFulltextMetaStore([_fulltext_meta(True)])
+    store.backend._mode = "opengauss"
+    store._backend_type = "local"
+    store.search_by_keywords = AsyncMock(return_value=[{"uri": "viking://resources/a.md"}])
+    fs = VikingFS(
+        agfs=_DummyAgfs(),
+        vector_store=store,
+        grep_config=GrepConfig(switch_to_remote_threshold=0),
+    )
+    monkeypatch.setattr(fs, "stat", _fake_stat)
+    monkeypatch.setattr(fs, "read", AsyncMock(return_value=b"needle\nother"))
+    monkeypatch.setattr(
+        fs, "_grep_fs", AsyncMock(side_effect=AssertionError("successful recall must not scan FS"))
+    )
+    ctx = RequestContext(user=UserIdentifier("account", "user"), role=Role.USER)
+
+    result = await fs.grep("viking://resources", "needle", ctx=ctx, node_limit=2)
+    assert result == {
+        "matches": [{"uri": "viking://resources/a.md", "line": 1, "content": "needle"}],
+        "count": 1,
+        "match_count": 1,
+        "files_scanned": 1,
+    }
+
+    store.search_by_keywords.return_value = []
+    fs.read.reset_mock()
+    assert await fs.grep("viking://resources", "needle", ctx=ctx, node_limit=2) == {
+        "matches": [],
+        "count": 0,
+        "match_count": 0,
+        "files_scanned": 0,
+    }
+    fs.read.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fulltext_probe_keeps_grep_fallback_on_metadata_failure():
+    fs = VikingFS(agfs=_DummyAgfs())
+    ctx = RequestContext(user=UserIdentifier("account", "user"), role=Role.USER)
+    store = _FulltextMetaFailureStore()
+
+    assert await fs._collection_has_fulltext(store, ctx) is False
+    assert await fs._collection_has_fulltext(store, ctx) is False
+    assert store.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_fulltext_probe_propagates_metadata_failure_for_strict_callers():
+    fs = VikingFS(agfs=_DummyAgfs())
+    ctx = RequestContext(user=UserIdentifier("account", "user"), role=Role.USER)
+
+    with pytest.raises(RuntimeError, match="metadata unavailable"):
+        await fs._collection_has_fulltext(
+            _FulltextMetaFailureStore(),
+            ctx,
+            supported_modes=("vikingdb",),
+            raise_on_error=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_fulltext_probe_caches_supported_collection_without_expiry(monkeypatch):
+    fs = VikingFS(agfs=_DummyAgfs())
+    ctx = RequestContext(user=UserIdentifier("account", "user"), role=Role.USER)
+    store = _SequencedFulltextMetaStore([_fulltext_meta(True), _fulltext_meta(False)])
+    monkeypatch.setattr(grep_module.time, "monotonic", lambda: 10_000_000)
+
+    assert await fs._collection_has_fulltext(store, ctx) is True
+    assert await fs._collection_has_fulltext(store, ctx) is True
+    assert store.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_fulltext_probe_rechecks_unsupported_collection_after_one_minute(monkeypatch):
+    fs = VikingFS(agfs=_DummyAgfs())
+    ctx = RequestContext(user=UserIdentifier("account", "user"), role=Role.USER)
+    store = _SequencedFulltextMetaStore([_fulltext_meta(False), _fulltext_meta(True)])
+    now = 1000.0
+    monkeypatch.setattr(grep_module.time, "monotonic", lambda: now)
+
+    assert await fs._collection_has_fulltext(store, ctx) is False
+    now = 1059.0
+    assert await fs._collection_has_fulltext(store, ctx) is False
+    now = 1060.0
+    assert await fs._collection_has_fulltext(store, ctx) is True
+    assert store.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_fulltext_probe_does_not_cache_inconclusive_metadata():
+    fs = VikingFS(agfs=_DummyAgfs())
+    ctx = RequestContext(user=UserIdentifier("account", "user"), role=Role.USER)
+    store = _SequencedFulltextMetaStore([{}, _fulltext_meta(True)])
+
+    assert await fs._collection_has_fulltext(store, ctx) is False
+    assert await fs._collection_has_fulltext(store, ctx) is True
+    assert store.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_grep_without_config_uses_documented_remote_threshold(monkeypatch):
+    fs = VikingFS(agfs=_DummyAgfs())
+    vector_store = _DummyVectorStore()
+    vector_store._backend_type = "vikingdb"
+    monkeypatch.setattr(fs, "_get_vector_store", lambda: vector_store)
+
+    async def fake_collection_has_fulltext(vector_store, ctx):
+        return True
+
+    monkeypatch.setattr(fs, "_collection_has_fulltext", fake_collection_has_fulltext)
+
+    async def fake_count(uri, ctx):
+        return 5000
+
+    monkeypatch.setattr(fs, "_get_cached_count", fake_count)
+
+    assert await fs._resolve_grep_engine("auto", "viking://resources", None) == "fs"
+
+
+@pytest.mark.asyncio
+async def test_session_grep_forces_fs_engine_in_auto_mode(monkeypatch):
+    viking_fs = VikingFS(agfs=_DummyAgfs())
+    monkeypatch.setattr(viking_fs, "stat", AsyncMock(return_value={"isDir": True}))
+    resolve_engine = AsyncMock(return_value="vikingdb_then_fs")
+    grep_fs = AsyncMock(
+        return_value={"matches": [], "count": 0, "match_count": 0, "files_scanned": 0}
+    )
+    grep_vikingdb = AsyncMock()
+    monkeypatch.setattr(viking_fs, "_resolve_grep_engine", resolve_engine)
+    monkeypatch.setattr(viking_fs, "_grep_fs", grep_fs)
+    monkeypatch.setattr(viking_fs, "_grep_vikingdb_then_fs", grep_vikingdb)
+
+    await viking_fs.grep(
+        "viking://user/alice/sessions/session-1",
+        pattern="needle",
+    )
+
+    resolve_engine.assert_not_awaited()
+    grep_fs.assert_awaited_once()
+    grep_vikingdb.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_session_grep_uses_native_agfs(monkeypatch):
+    viking_fs = VikingFS(agfs=_DummyAgfs())
+    native_result = {"matches": [], "count": 0, "match_count": 0, "files_scanned": 4}
+    native_grep = AsyncMock(return_value=native_result)
+    fallback_grep = AsyncMock()
+    monkeypatch.setattr(viking_fs, "_grep_with_agfs", native_grep)
+    monkeypatch.setattr(viking_fs, "_grep_encrypted", fallback_grep)
+
+    result = await viking_fs._grep_fs(
+        uri="viking://user/alice/sessions/session-1",
+        pattern="needle",
+        exclude_uri="viking://user/alice/sessions/session-1/tools",
+        case_insensitive=True,
+        node_limit=7,
+        level_limit=3,
+        ctx=None,
+    )
+
+    assert result == native_result
+    native_grep.assert_awaited_once_with(
+        uri="viking://user/alice/sessions/session-1",
+        pattern="needle",
+        exclude_uri="viking://user/alice/sessions/session-1/tools",
+        case_insensitive=True,
+        node_limit=7,
+        level_limit=4,
+        ctx=None,
+        before_context=0,
+        after_context=0,
+    )
+    fallback_grep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("node_limit", "expected_remote_limit"),
+    [
+        (7, 35),
+        (None, 100000),
+        (50000, 100000),
+    ],
+)
+async def test_grep_vikingdb_auto_remote_limit_uses_five_times_node_limit(
+    monkeypatch, node_limit, expected_remote_limit
+):
+    fs = VikingFS(agfs=_DummyAgfs())
+    vector_store = _DummyVectorStore()
+    monkeypatch.setattr(fs, "_get_vector_store", lambda: vector_store)
+
+    result = await fs._grep_vikingdb_then_fs(
+        uri="viking://resources",
+        pattern="needle",
+        exclude_uri=None,
+        case_insensitive=False,
+        node_limit=node_limit,
+        level_limit=10,
+        ctx=None,
+    )
+
+    assert result == {"matches": [], "count": 0, "match_count": 0, "files_scanned": 0}
+    assert vector_store.calls[0]["limit"] == expected_remote_limit
+    assert vector_store.calls[0]["output_fields"] == ["uri"]
+
+
+@pytest.mark.asyncio
+async def test_grep_vikingdb_does_not_project_tags_without_filter_or_request(monkeypatch):
+    fs = VikingFS(agfs=_DummyAgfs())
+    vector_store = _DummyVectorStore(
+        results=[{"uri": "viking://resources/a.md", "search_tags": ["env=prod"]}]
+    )
+    monkeypatch.setattr(fs, "_get_vector_store", lambda: vector_store)
+
+    async def fake_grep_in_files(
+        file_uris,
+        pattern,
+        case_insensitive,
+        node_limit,
+        ctx,
+        before_context,
+        after_context,
+    ):
+        return {
+            "matches": [{"uri": "viking://resources/a.md", "line": 1, "content": "needle"}],
+            "count": 1,
+            "match_count": 1,
+            "files_scanned": 1,
+        }
+
+    monkeypatch.setattr(fs, "_grep_in_files", fake_grep_in_files)
+
+    result = await fs._grep_vikingdb_then_fs(
+        uri="viking://resources",
+        pattern="needle",
+        exclude_uri=None,
+        case_insensitive=False,
+        node_limit=1,
+        level_limit=3,
+        ctx=None,
+    )
+
+    assert vector_store.calls[0]["output_fields"] == ["uri"]
+    assert result["matches"] == [
+        {"uri": "viking://resources/a.md", "line": 1, "content": "needle"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_grep_vikingdb_remote_error_falls_back_to_fs(monkeypatch):
+    fs = VikingFS(agfs=_DummyAgfs())
+    monkeypatch.setattr(fs, "_get_vector_store", lambda: _FailingVectorStore())
+
+    calls = []
+
+    async def fake_grep_fs(**kwargs):
+        calls.append(kwargs)
+        return {
+            "matches": [{"uri": "viking://resources/a.md"}],
+            "count": 1,
+            "match_count": 1,
+            "files_scanned": 1,
+        }
+
+    monkeypatch.setattr(fs, "_grep_fs", fake_grep_fs)
+
+    result = await fs._grep_vikingdb_then_fs(
+        uri="viking://resources",
+        pattern="needle",
+        exclude_uri="viking://resources/archive",
+        case_insensitive=True,
+        node_limit=10,
+        level_limit=3,
+        ctx=None,
+    )
+
+    assert result["count"] == 1
+    assert calls == [
+        {
+            "uri": "viking://resources",
+            "pattern": "needle",
+            "exclude_uri": "viking://resources/archive",
+            "case_insensitive": True,
+            "node_limit": 10,
+            "level_limit": 3,
+            "ctx": None,
+            "before_context": 0,
+            "after_context": 0,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_opengauss_tagged_grep_fallback_enumerates_all_matching_pages(monkeypatch):
+    store = _SequencedFulltextMetaStore([_fulltext_meta(True)])
+    store.backend._mode = "opengauss"
+    store._backend_type = "local"
+    store.search_by_keywords = AsyncMock(side_effect=RuntimeError("remote keyword search failed"))
+    store.filter = AsyncMock(
+        side_effect=[
+            [
+                {"uri": f"viking://resources/other/{index}.md", "search_tags": ["env=prod"]}
+                for index in range(100000)
+            ],
+            [{"uri": "viking://resources/tagged.md", "search_tags": ["env=prod"]}],
+        ]
+    )
+    fs = VikingFS(
+        agfs=_DummyAgfs(),
+        vector_store=store,
+        grep_config=GrepConfig(switch_to_remote_threshold=0),
+    )
+    monkeypatch.setattr(fs, "stat", _fake_stat)
+
+    async def fake_grep_fs(**kwargs):
+        assert len(kwargs["allowed_uris"]) == 100001
+        assert "viking://resources/tagged.md" in kwargs["allowed_uris"]
+        return {
+            "matches": [{"uri": "viking://resources/tagged.md", "line": 1, "content": "needle"}],
+            "count": 1,
+            "match_count": 1,
+            "files_scanned": 1,
+        }
+
+    monkeypatch.setattr(fs, "_grep_fs", fake_grep_fs)
+    ctx = RequestContext(user=UserIdentifier("account", "user"), role=Role.USER)
+    result = await fs.grep(
+        "viking://resources",
+        "needle",
+        node_limit=1,
+        level_limit=3,
+        ctx=ctx,
+        tag_filter={"op": "must", "field": "search_tags", "conds": ["env=prod"]},
+    )
+
+    assert result["matches"] == [
+        {
+            "uri": "viking://resources/tagged.md",
+            "line": 1,
+            "content": "needle",
+            "tags": ["env=prod"],
+        }
+    ]
+    store.search_by_keywords.assert_awaited_once()
+    pages = [call.kwargs for call in store.filter.await_args_list]
+    assert [page["offset"] for page in pages] == [0, 100000]
+    assert all(page["order_by"] == "id" and page["order_desc"] is False for page in pages)
+    assert pages[0]["filter"] == And(
+        [
+            PathScope("uri", "viking://resources", depth=3),
+            RawDSL({"op": "must", "field": "search_tags", "conds": ["env=prod"]}),
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_grep_vikingdb_pushes_exclude_uri_to_filter(monkeypatch):
+    fs = VikingFS(agfs=_DummyAgfs())
+    vector_store = _DummyVectorStore()
+    monkeypatch.setattr(fs, "_get_vector_store", lambda: vector_store)
+
+    monkeypatch.setattr(fs, "_ensure_access", AsyncMock())
+
+    result = await fs._grep_vikingdb_then_fs(
+        uri="viking://resources",
+        pattern="needle",
+        exclude_uri="viking://resources/archive",
+        case_insensitive=False,
+        node_limit=10,
+        level_limit=3,
+        ctx=None,
+    )
+
+    assert result == {"matches": [], "count": 0, "match_count": 0, "files_scanned": 0}
+    filter_expr = vector_store.calls[0]["filter"]
+    assert isinstance(filter_expr, And)
+    assert filter_expr.conds[0] == PathScope("uri", "viking://resources", depth=3)
+    assert isinstance(filter_expr.conds[1], RawDSL)
+    assert filter_expr.conds[1].payload == {
+        "op": "must_not",
+        "field": "uri",
+        "conds": ["viking://resources/archive"],
+        "para": "-d=-1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_grep_vikingdb_keeps_local_exclude_uri_guard(monkeypatch):
+    fs = VikingFS(agfs=_DummyAgfs())
+    vector_store = _DummyVectorStore(
+        results=[
+            {"uri": "viking://resources/archive/a.md"},
+            {"uri": "viking://resources/keep.md"},
+        ]
+    )
+    monkeypatch.setattr(fs, "_get_vector_store", lambda: vector_store)
+
+    monkeypatch.setattr(fs, "_ensure_access", AsyncMock())
+
+    grep_in_files_calls = []
+
+    async def fake_grep_in_files(
+        file_uris,
+        pattern,
+        case_insensitive,
+        node_limit,
+        ctx,
+        before_context,
+        after_context,
+    ):
+        grep_in_files_calls.append(file_uris)
+        return {"matches": [], "count": 0, "match_count": 0, "files_scanned": len(file_uris)}
+
+    monkeypatch.setattr(fs, "_grep_in_files", fake_grep_in_files)
+
+    await fs._grep_vikingdb_then_fs(
+        uri="viking://resources",
+        pattern="needle",
+        exclude_uri="viking://resources/archive",
+        case_insensitive=False,
+        node_limit=10,
+        level_limit=3,
+        ctx=None,
+    )
+
+    assert grep_in_files_calls == [["viking://resources/keep.md"]]
+
+
+@pytest.mark.asyncio
+async def test_grep_vikingdb_pushes_tag_filter_into_bm25_request(monkeypatch):
+    fs = VikingFS(agfs=_DummyAgfs())
+    vector_store = _DummyVectorStore(
+        results=[
+            {"uri": "viking://resources/untagged.md"},
+            {"uri": "viking://resources/tagged.md", "search_tags": ["env=prod"]},
+        ]
+    )
+    monkeypatch.setattr(fs, "_get_vector_store", lambda: vector_store)
+
+    calls = []
+
+    async def fake_grep_in_files(
+        file_uris,
+        pattern,
+        case_insensitive,
+        node_limit,
+        ctx,
+        before_context,
+        after_context,
+    ):
+        calls.append(file_uris)
+        return {
+            "matches": [{"uri": "viking://resources/tagged.md", "line": 1, "content": "needle"}],
+            "count": 1,
+            "match_count": 1,
+            "files_scanned": len(file_uris),
+        }
+
+    monkeypatch.setattr(fs, "_grep_in_files", fake_grep_in_files)
+
+    result = await fs._grep_vikingdb_then_fs(
+        uri="viking://resources",
+        pattern="needle",
+        exclude_uri=None,
+        case_insensitive=False,
+        node_limit=1,
+        level_limit=3,
+        ctx=None,
+        tag_filter={"op": "must", "field": "search_tags", "conds": ["env=prod"]},
+    )
+
+    assert calls == [["viking://resources/untagged.md", "viking://resources/tagged.md"]]
+    assert vector_store.calls[0]["limit"] == 5
+    assert vector_store.calls[0]["filter"] == And(
+        [
+            PathScope("uri", "viking://resources", depth=3),
+            RawDSL({"op": "must", "field": "search_tags", "conds": ["env=prod"]}),
+        ]
+    )
+    assert result["matches"] == [
+        {
+            "uri": "viking://resources/tagged.md",
+            "line": 1,
+            "content": "needle",
+            "tags": ["env=prod"],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pattern", ["match", "["])
+async def test_grep_preserves_dfs_order_and_node_limit(monkeypatch, pattern):
+    fs = VikingFS(agfs=_DummyAgfs())
+
+    async def fake_stat(uri, ctx=None, skip_count=False):
+        return {"isDir": True}
+
+    async def fake_ls(uri, ctx=None, **kwargs):
+        entries = {
+            "viking://resources": [
+                {"name": "dir_a", "isDir": True},
+                {"name": "dir_b", "isDir": True},
+            ],
+            "viking://resources/dir_a": [
+                {"name": "a1.md", "isDir": False},
+                {"name": "a2.md", "isDir": False},
+            ],
+            "viking://resources/dir_b": [
+                {"name": "b1.md", "isDir": False},
+            ],
+        }
+        return entries.get(uri, [])
+
+    def fake_agfs_read(path, offset=0, size=-1):
+        contents = {
+            "/resources/dir_a/a1.md": "match a1 line1\nskip\nmatch a1 line3",
+            "/resources/dir_a/a2.md": "match a2 line1",
+            "/resources/dir_b/b1.md": "match b1 line1",
+        }
+        return contents[path].encode()
+
+    monkeypatch.setattr(fs, "stat", fake_stat)
+    monkeypatch.setattr(fs, "ls", fake_ls)
+    monkeypatch.setattr(
+        fs,
+        "_uri_to_path",
+        lambda uri, ctx=None: uri.replace("viking://", "/"),
+    )
+    monkeypatch.setattr(fs.agfs, "read", fake_agfs_read, raising=False)
+
+    if pattern == "[":
+        with pytest.raises(InvalidArgumentError, match="Invalid grep pattern"):
+            await fs.grep("viking://resources", pattern=pattern, node_limit=3)
+        return
+
+    result = await fs.grep("viking://resources", pattern=pattern, node_limit=3)
+
+    assert result["count"] == 3
+    assert result["files_scanned"] == 2
+    assert result["matches"] == [
+        {
+            "line": 1,
+            "uri": "viking://resources/dir_a/a1.md",
+            "content": "match a1 line1",
+        },
+        {
+            "line": 3,
+            "uri": "viking://resources/dir_a/a1.md",
+            "content": "match a1 line3",
+        },
+        {
+            "line": 1,
+            "uri": "viking://resources/dir_a/a2.md",
+            "content": "match a2 line1",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_grep_allowed_uris_filters_before_node_limit(monkeypatch):
+    fs = VikingFS(agfs=_DummyAgfs())
+
+    async def fake_stat(uri, ctx=None, skip_count=False):
+        return {"isDir": True}
+
+    async def fake_ls(uri, ctx=None, **kwargs):
+        return [
+            {"name": "untagged.md", "isDir": False},
+            {"name": "tagged.md", "isDir": False},
+        ]
+
+    def fake_agfs_read(path, offset=0, size=-1):
+        return b"match"
+
+    monkeypatch.setattr(fs, "stat", fake_stat)
+    monkeypatch.setattr(fs, "ls", fake_ls)
+    monkeypatch.setattr(
+        fs,
+        "_uri_to_path",
+        lambda uri, ctx=None: uri.replace("viking://", "/"),
+    )
+    monkeypatch.setattr(fs.agfs, "read", fake_agfs_read, raising=False)
+
+    result = await fs.grep(
+        "viking://resources",
+        pattern="match",
+        node_limit=1,
+        allowed_uris={"viking://resources/tagged.md"},
+    )
+
+    assert result["matches"] == [
+        {"line": 1, "uri": "viking://resources/tagged.md", "content": "match"}
+    ]
+    assert result["files_scanned"] == 1
+
+
+@pytest.mark.asyncio
+async def test_grep_applies_content_transform_before_matching(monkeypatch):
+    fs = VikingFS(agfs=_DummyAgfs())
+
+    async def fake_stat(uri, ctx=None, skip_count=False):
+        return {"isDir": True}
+
+    async def fake_ls(uri, ctx=None, **kwargs):
+        if uri == "viking://resources":
+            return [{"name": "memory.md", "isDir": False}]
+        return []
+
+    read_paths = []
+
+    def fake_agfs_read(path, offset=0, size=-1):
+        read_paths.append(path)
+        return b'before\nvisible\nafter\n<!-- MEMORY_FIELDS {"secret":"hidden"} -->'
+
+    monkeypatch.setattr(fs, "stat", fake_stat)
+    monkeypatch.setattr(fs, "ls", fake_ls)
+    monkeypatch.setattr(
+        fs,
+        "_uri_to_path",
+        lambda uri, ctx=None: uri.replace("viking://", "/"),
+    )
+    monkeypatch.setattr(fs.agfs, "read", fake_agfs_read, raising=False)
+
+    result = await fs.grep(
+        "viking://resources",
+        pattern="visible|secret",
+        content_transform=lambda content, _uri: content.split("<!--", 1)[0].rstrip(),
+        before_context=2,
+        after_context=2,
+    )
+
+    assert result["matches"] == [
+        {
+            "line": 2,
+            "uri": "viking://resources/memory.md",
+            "content": "visible",
+            "before_context": [{"line": 1, "content": "before"}],
+            "after_context": [{"line": 3, "content": "after"}],
+        }
+    ]
+    assert read_paths == ["/resources/memory.md"]
+
+
+@pytest.mark.asyncio
+async def test_grep_in_files_generates_context_from_single_read(monkeypatch):
+    fs = VikingFS(agfs=_DummyAgfs())
+    read = AsyncMock(return_value=b"first\nbefore\nmatch\nafter\nlast")
+    monkeypatch.setattr(fs, "read", read)
+
+    result = await fs._grep_in_files(
+        ["viking://resources/a.md"],
+        pattern="match",
+        case_insensitive=False,
+        node_limit=None,
+        ctx=None,
+        before_context=2,
+        after_context=1,
+    )
+
+    assert result["matches"] == [
+        {
+            "line": 3,
+            "uri": "viking://resources/a.md",
+            "content": "match",
+            "before_context": [
+                {"line": 1, "content": "first"},
+                {"line": 2, "content": "before"},
+            ],
+            "after_context": [{"line": 4, "content": "after"}],
+        }
+    ]
+    read.assert_awaited_once_with("viking://resources/a.md", ctx=None)
+
+
+@pytest.mark.asyncio
+async def test_grep_parallel_limits_context_construction_per_file(monkeypatch):
+    fs = VikingFS(agfs=_DummyAgfs())
+    lines = ["hit"] * 400
+    monkeypatch.setattr(fs, "read", AsyncMock(return_value="\n".join(lines)))
+
+    build_calls = 0
+    original_build_match = fs._build_grep_match
+
+    def count_build_calls(*args, **kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        return original_build_match(*args, **kwargs)
+
+    monkeypatch.setattr(fs, "_build_grep_match", count_build_calls)
+
+    matches, files_scanned = await fs._grep_files_parallel(
+        ["viking://resources/a.md"],
+        compiled_pattern=re.compile("hit"),
+        node_limit=1,
+        before_context=400,
+        after_context=400,
+    )
+
+    assert files_scanned == 1
+    assert len(matches) == 1
+    assert build_calls == 1
+    assert matches[0]["before_context"] == []
+    assert len(matches[0]["after_context"]) == 399
+
+
+@pytest.mark.asyncio
+async def test_grep_parallel_reads_respect_concurrency_limit(monkeypatch):
+    fs = VikingFS(agfs=_DummyAgfs())
+
+    async def fake_stat(uri, ctx=None, skip_count=False):
+        return {"isDir": True}
+
+    async def fake_ls(uri, ctx=None, **kwargs):
+        entries = {
+            "viking://resources": [{"name": f"file{i}.md", "isDir": False} for i in range(12)]
+        }
+        return entries.get(uri, [])
+
+    active_reads = 0
+    max_active_reads = 0
+
+    def fake_agfs_read(path, offset=0, size=-1):
+        nonlocal active_reads, max_active_reads
+        active_reads += 1
+        max_active_reads = max(max_active_reads, active_reads)
+        time.sleep(0.01)
+        active_reads -= 1
+        return f"match from {path}".encode()
+
+    monkeypatch.setattr(fs, "stat", fake_stat)
+    monkeypatch.setattr(fs, "ls", fake_ls)
+    monkeypatch.setattr(
+        fs,
+        "_uri_to_path",
+        lambda uri, ctx=None: uri.replace("viking://", "/"),
+    )
+    monkeypatch.setattr(fs.agfs, "read", fake_agfs_read, raising=False)
+
+    result = await fs.grep("viking://resources", pattern="match")
+
+    assert result["count"] == 12
+    assert result["files_scanned"] == 12
+    assert max_active_reads > 1
+    assert max_active_reads <= min(12, _DEFAULT_GREP_FILE_CONCURRENCY)
+
+
+@pytest.mark.asyncio
+async def test_grep_parallel_reads_work_with_blocking_agfs_read(monkeypatch):
+    fs = VikingFS(agfs=_DummyAgfs())
+
+    async def fake_stat(uri, ctx=None, skip_count=False):
+        return {"isDir": True}
+
+    async def fake_ls(uri, ctx=None, **kwargs):
+        if uri == "viking://resources":
+            return [{"name": f"file{i}.md", "isDir": False} for i in range(8)]
+        return []
+
+    def fake_agfs_read(path, offset=0, size=-1):
+        time.sleep(0.05)
+        return f"match from {path}".encode()
+
+    monkeypatch.setattr(fs, "stat", fake_stat)
+    monkeypatch.setattr(fs, "ls", fake_ls)
+    monkeypatch.setattr(
+        fs,
+        "_uri_to_path",
+        lambda uri, ctx=None: uri.replace("viking://", "/"),
+    )
+    monkeypatch.setattr(fs.agfs, "read", fake_agfs_read, raising=False)
+
+    started = time.perf_counter()
+    result = await fs.grep("viking://resources", pattern="match")
+    elapsed = time.perf_counter() - started
+
+    assert result["count"] == 8
+    assert result["files_scanned"] == 8
+    assert elapsed < 0.30
+
+
+@pytest.mark.asyncio
+async def test_grep_stops_scheduling_later_batches_after_node_limit(monkeypatch):
+    fs = VikingFS(agfs=_DummyAgfs())
+
+    async def fake_stat(uri, ctx=None, skip_count=False):
+        return {"isDir": True}
+
+    async def fake_ls(uri, ctx=None, **kwargs):
+        if uri == "viking://resources":
+            return [{"name": f"file{i}.md", "isDir": False} for i in range(6)]
+        return []
+
+    read_paths = []
+
+    def fake_agfs_read(path, offset=0, size=-1):
+        read_paths.append(path)
+        contents = {
+            "/resources/file0.md": "match file0 line1\nmatch file0 line2",
+            "/resources/file1.md": "match file1 line1",
+            "/resources/file2.md": "match file2 line1",
+            "/resources/file3.md": "match file3 line1",
+            "/resources/file4.md": "match file4 line1",
+            "/resources/file5.md": "match file5 line1",
+        }
+        return contents[path].encode()
+
+    monkeypatch.setattr(fs, "stat", fake_stat)
+    monkeypatch.setattr(fs, "ls", fake_ls)
+    monkeypatch.setattr(
+        fs,
+        "_uri_to_path",
+        lambda uri, ctx=None: uri.replace("viking://", "/"),
+    )
+    monkeypatch.setattr(fs.agfs, "read", fake_agfs_read, raising=False)
+    monkeypatch.setattr(viking_fs_module, "_DEFAULT_GREP_FILE_CONCURRENCY", 2)
+
+    result = await fs.grep("viking://resources", pattern="match", node_limit=2)
+
+    assert result["count"] == 2
+    assert result["files_scanned"] == 1
+    assert read_paths == ["/resources/file0.md", "/resources/file1.md"]
+
+
+@pytest.mark.asyncio
+async def test_grep_delegates_to_agfs_with_expected_filters(monkeypatch, fs):
+    calls = []
+
+    async def fake_grep(**kwargs):
+        calls.append(kwargs)
+        return {"matches": [], "files_scanned": 0}
+
+    monkeypatch.setattr(fs._async_agfs, "grep", fake_grep)
+
+    result = await fs.grep(
+        "viking://resources",
+        pattern="needle",
+        exclude_uri="viking://resources/archive",
+        case_insensitive=True,
+        node_limit=10,
+        level_limit=3,
+    )
+
+    assert result == {"matches": [], "count": 0, "match_count": 0, "files_scanned": 0}
+    assert calls == [
+        {
+            "path": "/resources",
+            "pattern": "needle",
+            "recursive": True,
+            "case_insensitive": True,
+            "stream": False,
+            "node_limit": 10,
+            "exclude_path": "/resources/archive",
+            "level_limit": 3,
+            "before_context": 0,
+            "after_context": 0,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_grep_with_context_uses_agfs_and_maps_context(monkeypatch, fs):
+    agfs_grep = AsyncMock(
+        return_value={
+            "matches": [
+                {
+                    "file": "a.md",
+                    "line": 2,
+                    "content": "needle",
+                    "before_context": [{"line": 1, "content": "before"}],
+                    "after_context": [{"line": 3, "content": "after"}],
+                }
+            ],
+            "files_scanned": 1,
+        }
+    )
+    fallback = AsyncMock()
+    monkeypatch.setattr(fs._async_agfs, "grep", agfs_grep)
+    monkeypatch.setattr(fs, "_grep_encrypted", fallback)
+
+    result = await fs.grep(
+        "viking://resources",
+        pattern="needle",
+        before_context=1,
+        after_context=2,
+    )
+
+    agfs_grep.assert_awaited_once_with(
+        path="/resources",
+        pattern="needle",
+        recursive=True,
+        case_insensitive=False,
+        stream=False,
+        node_limit=None,
+        exclude_path=None,
+        level_limit=10,
+        before_context=1,
+        after_context=2,
+    )
+    fallback.assert_not_awaited()
+    assert result["matches"] == [
+        {
+            "line": 2,
+            "uri": "viking://resources/a.md",
+            "content": "needle",
+            "before_context": [{"line": 1, "content": "before"}],
+            "after_context": [{"line": 3, "content": "after"}],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_grep_maps_agfs_matches_to_viking_uris(monkeypatch, fs):
+    async def fake_grep(**kwargs):
+        return {
+            "matches": [
+                {"file": "dir/a.md", "line": 2, "content": "first match"},
+                {"file": "/dir/b.md", "line_number": 5, "content": "second match"},
+            ],
+            "files_scanned": 7,
+        }
+
+    monkeypatch.setattr(fs._async_agfs, "grep", fake_grep)
+
+    result = await fs.grep("viking://resources", pattern="match")
+
+    assert result == {
+        "matches": [
+            {
+                "line": 2,
+                "uri": "viking://resources/dir/a.md",
+                "content": "first match",
+            },
+            {
+                "line": 5,
+                "uri": "viking://resources/dir/b.md",
+                "content": "second match",
+            },
+        ],
+        "count": 2,
+        "match_count": 2,
+        "files_scanned": 7,
+    }
+
+
+@pytest.mark.asyncio
+async def test_grep_applies_node_limit_to_backend_results(monkeypatch, fs):
+    async def fake_grep(**kwargs):
+        return {
+            "matches": [
+                {"file": "a.md", "line": 1, "content": "a"},
+                {"file": "b.md", "line": 1, "content": "b"},
+                {"file": "c.md", "line": 1, "content": "c"},
+            ]
+        }
+
+    monkeypatch.setattr(fs._async_agfs, "grep", fake_grep)
+
+    result = await fs.grep("viking://resources", pattern="match", node_limit=2)
+
+    assert result["count"] == 2
+    assert result["match_count"] == 2
+    assert result["files_scanned"] == 2
+    assert [match["uri"] for match in result["matches"]] == [
+        "viking://resources/a.md",
+        "viking://resources/b.md",
+    ]
+
+
+class _RestrictedAclManager:
+    """ACL manager stub: enabled, with per-URI effective ACLs from `resolve_many`."""
+
+    def __init__(self, effective_by_uri):
+        self.effective_by_uri = effective_by_uri
+
+    async def is_enabled(self, account_id):
+        return True
+
+    async def resolve_many(self, uris, ctx):
+        return {uri: self.effective_by_uri[uri] for uri in uris}
+
+
+def _acl_grep_fs(monkeypatch, effective_by_uri):
+    """VikingFS with a native-grep stub returning one restricted resource match."""
+    viking_fs = VikingFS(agfs=_DummyAgfs())
+
+    async def fake_grep(**kwargs):
+        return {
+            "matches": [
+                {"file": "secret.md", "line": 1, "content": "SECRET_MARKER_4977"},
+            ],
+            "count": 1,
+        }
+
+    monkeypatch.setattr(viking_fs._async_agfs, "grep", fake_grep)
+    viking_fs.acl_manager = _RestrictedAclManager(effective_by_uri)
+    return viking_fs
+
+
+def _restricted_acl() -> EffectiveAcl:
+    """RESTRICTED inheritance with no grants — denies every non-bypassing principal."""
+    return EffectiveAcl(AclMode.RESTRICTED, DirectAcl(), DirectAcl())
+
+
+@pytest.mark.asyncio
+async def test_grep_with_agfs_denies_acl_restricted_content_without_grant(monkeypatch):
+    """Native grep must not leak restricted-inheritance content to a user with no grant."""
+    viking_fs = _acl_grep_fs(
+        monkeypatch,
+        {"viking://resources/secret.md": _restricted_acl()},
+    )
+    ctx = RequestContext(user=UserIdentifier("acct1", "mallory"), role=Role.USER)
+
+    result = await viking_fs._grep_with_agfs(
+        "viking://resources", pattern="SECRET_MARKER_4977", ctx=ctx
+    )
+
+    assert result["matches"] == []
+    assert result["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_grep_with_agfs_allows_acl_granted_content(monkeypatch):
+    """Authorized principals keep receiving restricted-inheritance content through grep."""
+    granted = EffectiveAcl(
+        AclMode.RESTRICTED,
+        DirectAcl.from_entries([AclEntry("user:mallory", AclLevel.READ)]),
+        DirectAcl(),
+    )
+    viking_fs = _acl_grep_fs(
+        monkeypatch,
+        {"viking://resources/secret.md": granted},
+    )
+    ctx = RequestContext(user=UserIdentifier("acct1", "mallory"), role=Role.USER)
+
+    result = await viking_fs._grep_with_agfs(
+        "viking://resources", pattern="SECRET_MARKER_4977", ctx=ctx
+    )
+
+    assert [m["uri"] for m in result["matches"]] == ["viking://resources/secret.md"]
+    assert result["count"] == 1

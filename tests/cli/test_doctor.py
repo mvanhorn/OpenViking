@@ -1,22 +1,29 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Tests for ``ov doctor`` diagnostic checks."""
+"""Tests for ``openviking-server doctor`` diagnostic checks."""
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from openviking_cli.doctor import (
+    _probe_embedding_provider,
     check_agfs,
     check_config,
     check_disk,
     check_embedding,
     check_native_engine,
+    check_ollama,
     check_python,
+    check_vikingbot,
     check_vlm,
     run_doctor,
 )
@@ -26,6 +33,14 @@ class TestCheckConfig:
     def test_pass_with_valid_config(self, tmp_path: Path):
         config = tmp_path / "ov.conf"
         config.write_text(json.dumps({"embedding": {"dense": {}}}))
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            ok, detail, fix = check_config()
+        assert ok
+        assert str(config) in detail
+
+    def test_pass_with_utf8_bom_config(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text("\ufeff" + json.dumps({"embedding": {"dense": {}}}))
         with patch("openviking_cli.doctor._find_config", return_value=config):
             ok, detail, fix = check_config()
         assert ok
@@ -46,13 +61,13 @@ class TestCheckConfig:
         assert not ok
         assert "Invalid JSON" in detail
 
-    def test_fail_missing_embedding_section(self, tmp_path: Path):
+    def test_pass_without_embedding_section(self, tmp_path: Path):
         config = tmp_path / "ov.conf"
         config.write_text(json.dumps({"server": {}}))
         with patch("openviking_cli.doctor._find_config", return_value=config):
             ok, detail, fix = check_config()
-        assert not ok
-        assert "embedding" in detail
+        assert ok
+        assert str(config) in detail
 
 
 class TestCheckPython:
@@ -138,6 +153,93 @@ class TestCheckAgfs:
 
 
 class TestCheckEmbedding:
+    def test_fail_local_default_when_optional_dependency_missing(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(json.dumps({}))
+
+        real_import_module = importlib.import_module
+
+        def import_module_side_effect(name: str, *args, **kwargs):
+            if name == "llama_cpp":
+                raise ImportError("No module named 'llama_cpp'")
+            return real_import_module(name, *args, **kwargs)
+
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            with patch(
+                "openviking_cli.doctor.importlib.import_module",
+                side_effect=import_module_side_effect,
+            ):
+                ok, detail, fix = check_embedding()
+
+        assert not ok
+        assert "missing llama-cpp-python" in detail
+        assert "openviking[local-embed]" in fix
+
+    def test_pass_local_default_with_cached_model(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(json.dumps({}))
+        cached_model = (
+            Path.home() / ".cache" / "openviking" / "models" / "bge-small-zh-v1.5-f16.gguf"
+        )
+        real_import = __import__
+
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            with patch(
+                "openviking.models.embedder.local_embedders.get_local_model_cache_path",
+                return_value=cached_model,
+            ):
+                with patch.object(Path, "exists", autospec=True, return_value=True):
+                    with patch(
+                        "openviking_cli.doctor.importlib.import_module",
+                        side_effect=lambda name: (
+                            object() if name == "llama_cpp" else real_import(name)
+                        ),
+                    ):
+                        ok, detail, fix = check_embedding()
+
+        assert ok
+        assert "local/bge-small-zh-v1.5-f16" in detail
+        assert fix is None
+
+    def test_pass_local_default_reports_startup_download_when_cache_missing(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(json.dumps({}))
+        real_import = __import__
+
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            with patch.object(Path, "exists", autospec=True, return_value=False):
+                with patch(
+                    "openviking_cli.doctor.importlib.import_module",
+                    side_effect=lambda name: object() if name == "llama_cpp" else real_import(name),
+                ):
+                    ok, detail, fix = check_embedding()
+
+        assert ok
+        assert "startup initialization" in detail
+        assert fix is None
+
+    def test_fail_local_unknown_model(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps(
+                {
+                    "embedding": {
+                        "dense": {
+                            "provider": "local",
+                            "model": "unknown-local-model",
+                        }
+                    }
+                }
+            )
+        )
+
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            ok, detail, fix = check_embedding()
+
+        assert not ok
+        assert "unsupported local model" in detail
+        assert "Unknown local embedding model" in fix
+
     def test_pass_with_api_key(self, tmp_path: Path):
         config = tmp_path / "ov.conf"
         config.write_text(
@@ -154,9 +256,41 @@ class TestCheckEmbedding:
             )
         )
         with patch("openviking_cli.doctor._find_config", return_value=config):
-            ok, detail, fix = check_embedding()
+            with patch(
+                "openviking_cli.doctor._probe_embedding_provider",
+                return_value=(True, "openai/text-embedding-3-small probe ok", None),
+            ):
+                ok, detail, fix = check_embedding()
         assert ok
         assert "openai" in detail
+        assert fix is None
+
+    def test_pass_ollama_after_provider_probe(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps(
+                {
+                    "embedding": {
+                        "dense": {
+                            "provider": "ollama",
+                            "model": "bge-m3",
+                            "api_base": "http://localhost:11434/v1",
+                            "dimension": 1024,
+                        }
+                    }
+                }
+            )
+        )
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            with patch(
+                "openviking_cli.doctor._probe_embedding_provider",
+                return_value=(True, "ollama/bge-m3 probe ok (dimension=1024)", None),
+            ) as probe:
+                ok, detail, fix = check_embedding()
+        probe.assert_called_once()
+        assert ok
+        assert "ollama/bge-m3" in detail
+        assert fix is None
 
     def test_pass_with_api_key_from_environment_variable(self, tmp_path: Path):
         config = tmp_path / "ov.conf"
@@ -175,7 +309,11 @@ class TestCheckEmbedding:
         )
         with patch("openviking_cli.doctor._find_config", return_value=config):
             with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-env-123"}, clear=False):
-                ok, detail, fix = check_embedding()
+                with patch(
+                    "openviking_cli.doctor._probe_embedding_provider",
+                    return_value=(True, "openai/text-embedding-3-small probe ok", None),
+                ):
+                    ok, detail, fix = check_embedding()
         assert ok
         assert "openai" in detail
 
@@ -209,6 +347,149 @@ class TestCheckEmbedding:
         assert not ok
         assert "unreadable" in detail
 
+    def test_embedding_probe_fails_on_provider_error(self):
+        with patch(
+            "openviking_cli.utils.config.embedding_config.EmbeddingConfig.get_embedder",
+            return_value=object(),
+        ):
+            with patch(
+                "openviking.models.embedder.base.embed_compat",
+                side_effect=RuntimeError("model not found"),
+            ):
+                ok, detail, fix = _probe_embedding_provider(
+                    {"max_retries": 0},
+                    {
+                        "provider": "ollama",
+                        "model": "missing-model",
+                        "api_base": "http://localhost:11434/v1",
+                        "dimension": 1024,
+                    },
+                )
+
+        assert not ok
+        assert "probe failed" in detail
+        assert "model not found" in detail
+        assert "model name" in fix
+
+    def test_embedding_probe_fails_on_empty_dense_vector(self):
+        class FakeEmbedder:
+            pass
+
+        async def fake_embed_compat(*args, **kwargs):
+            return type("Result", (), {"dense_vector": []})()
+
+        with patch(
+            "openviking_cli.utils.config.embedding_config.EmbeddingConfig.get_embedder",
+            return_value=FakeEmbedder(),
+        ):
+            with patch(
+                "openviking.models.embedder.base.embed_compat",
+                side_effect=fake_embed_compat,
+            ):
+                ok, detail, fix = _probe_embedding_provider(
+                    {},
+                    {
+                        "provider": "openai",
+                        "model": "custom-embed",
+                        "api_base": "http://localhost:11434/v1",
+                        "dimension": 3,
+                    },
+                )
+
+        assert not ok
+        assert "no dense vector" in detail
+        assert "embedding.dense" in fix
+
+    def test_embedding_probe_fails_on_dimension_mismatch(self):
+        class FakeEmbedder:
+            def get_dimension(self):
+                return 2
+
+        async def fake_embed_compat(*args, **kwargs):
+            return type("Result", (), {"dense_vector": [0.1, 0.2]})()
+
+        with patch(
+            "openviking_cli.utils.config.embedding_config.EmbeddingConfig.get_embedder",
+            return_value=FakeEmbedder(),
+        ):
+            with patch(
+                "openviking.models.embedder.base.embed_compat",
+                side_effect=fake_embed_compat,
+            ):
+                ok, detail, fix = _probe_embedding_provider(
+                    {},
+                    {
+                        "provider": "openai",
+                        "model": "custom-embed",
+                        "api_base": "http://localhost:11434/v1",
+                        "dimension": 3,
+                    },
+                )
+
+        assert not ok
+        assert "dimension mismatch" in detail
+        assert "expected 3, got 2" in detail
+        assert "embedding.dense.dimension" in fix
+
+    def test_embedding_probe_uses_embedder_dimension_when_config_omits_dimension(self):
+        class FakeEmbedder:
+            def get_dimension(self):
+                return 2
+
+        async def fake_embed_compat(*args, **kwargs):
+            return type("Result", (), {"dense_vector": [0.1, 0.2]})()
+
+        with patch(
+            "openviking_cli.utils.config.embedding_config.EmbeddingConfig.get_embedder",
+            return_value=FakeEmbedder(),
+        ):
+            with patch(
+                "openviking.models.embedder.base.embed_compat",
+                side_effect=fake_embed_compat,
+            ):
+                ok, detail, fix = _probe_embedding_provider(
+                    {},
+                    {
+                        "provider": "openai",
+                        "model": "custom-embed",
+                        "api_base": "http://localhost:11434/v1",
+                    },
+                )
+
+        assert ok
+        assert "dimension=2" in detail
+        assert fix is None
+
+    def test_embedding_probe_fails_when_inferred_dimension_mismatches_probe(self):
+        class FakeEmbedder:
+            def get_dimension(self):
+                return 3
+
+        async def fake_embed_compat(*args, **kwargs):
+            return type("Result", (), {"dense_vector": [0.1, 0.2]})()
+
+        with patch(
+            "openviking_cli.utils.config.embedding_config.EmbeddingConfig.get_embedder",
+            return_value=FakeEmbedder(),
+        ):
+            with patch(
+                "openviking.models.embedder.base.embed_compat",
+                side_effect=fake_embed_compat,
+            ):
+                ok, detail, fix = _probe_embedding_provider(
+                    {},
+                    {
+                        "provider": "openai",
+                        "model": "custom-embed",
+                        "api_base": "http://localhost:11434/v1",
+                    },
+                )
+
+        assert not ok
+        assert "dimension mismatch" in detail
+        assert "expected 3, got 2" in detail
+        assert "embedding.dense.dimension" in fix
+
 
 class TestCheckVlm:
     def test_pass_with_config(self, tmp_path: Path):
@@ -221,6 +502,28 @@ class TestCheckVlm:
         with patch("openviking_cli.doctor._find_config", return_value=config):
             ok, detail, fix = check_vlm()
         assert ok
+
+    def test_pass_with_credentials_config(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps(
+                {
+                    "vlm": {
+                        "provider": "openai",
+                        "model": "gpt-4o-mini",
+                        "credentials": [
+                            {"api_key": "sk-primary"},
+                            {"api_key": "sk-backup"},
+                        ],
+                    }
+                }
+            )
+        )
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            ok, detail, fix = check_vlm()
+        assert ok
+        assert "openai/gpt-4o-mini" in detail
+        assert fix is None
 
     def test_fail_no_provider(self, tmp_path: Path):
         config = tmp_path / "ov.conf"
@@ -236,6 +539,492 @@ class TestCheckVlm:
             ok, detail, fix = check_vlm()
         assert not ok
         assert "unreadable" in detail
+
+    def test_pass_with_codex_oauth(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps({"vlm": {"provider": "openai-codex", "model": "gpt-5.3-codex"}})
+        )
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            with patch(
+                "openviking.models.vlm.backends.codex_auth.resolve_codex_runtime_credentials",
+                return_value={"source": "openviking"},
+            ):
+                ok, detail, fix = check_vlm()
+        assert ok
+        assert "oauth via openviking" in detail
+
+    def test_codex_oauth_path_still_validates_other_fields(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(json.dumps({"vlm": {"provider": "openai-codex"}}))
+
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            ok, detail, fix = check_vlm()
+
+        assert not ok
+        assert "requires 'model'" in detail
+        assert fix == "Fix vlm section in ov.conf"
+
+    def test_fail_with_codex_oauth_missing_auth(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps({"vlm": {"provider": "openai-codex", "model": "gpt-5.3-codex"}})
+        )
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            with patch(
+                "openviking.models.vlm.backends.codex_auth.resolve_codex_runtime_credentials",
+                side_effect=RuntimeError("missing auth"),
+            ):
+                with patch(
+                    "openviking.models.vlm.backends.codex_auth.get_codex_auth_status",
+                    return_value={
+                        "store_path": "/tmp/ov-codex.json",
+                        "bootstrap_path": "/tmp/codex/auth.json",
+                    },
+                ):
+                    ok, detail, fix = check_vlm()
+        assert not ok
+        assert "missing auth" in detail
+        assert "openviking-server init" in fix
+
+    def test_pass_with_default_provider_codex_oauth(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps(
+                {
+                    "vlm": {
+                        "model": "gpt-5.3-codex",
+                        "default_provider": "openai-codex",
+                        "providers": {"openai": {"api_key": "sk-test"}, "openai-codex": {}},
+                    }
+                }
+            )
+        )
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            with patch(
+                "openviking.models.vlm.backends.codex_auth.resolve_codex_runtime_credentials",
+                return_value={"source": "openviking"},
+            ):
+                ok, detail, fix = check_vlm()
+        assert ok
+        assert "openai-codex/gpt-5.3-codex" in detail
+        assert "oauth via openviking" in detail
+
+
+class TestCheckOllama:
+    def test_pass_when_config_is_missing(self):
+        with patch("openviking_cli.doctor._find_config", return_value=None):
+            ok, detail, fix = check_ollama()
+        assert ok
+        assert detail == "not configured"
+        assert fix is None
+
+    def test_pass_when_config_does_not_use_ollama(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps(
+                {
+                    "embedding": {
+                        "dense": {
+                            "provider": "openai",
+                            "model": "text-embedding-3-small",
+                        }
+                    },
+                    "vlm": {"provider": "openai", "model": "gpt-4o-mini"},
+                }
+            )
+        )
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            ok, detail, fix = check_ollama()
+        assert ok
+        assert detail == "not configured"
+        assert fix is None
+
+    def test_checks_embedding_ollama_api_base(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps(
+                {
+                    "embedding": {
+                        "dense": {
+                            "provider": "ollama",
+                            "model": "bge-m3",
+                            "api_base": "http://embedding-host:11435/v1",
+                        }
+                    }
+                }
+            )
+        )
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            with patch(
+                "openviking_cli.utils.ollama.check_ollama_running", return_value=True
+            ) as running:
+                ok, detail, fix = check_ollama()
+        running.assert_called_once_with("embedding-host", 11435)
+        assert ok
+        assert "embedding-host:11435" in detail
+        assert fix is None
+
+    def test_checks_vlm_ollama_api_base(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps(
+                {
+                    "vlm": {
+                        "provider": "litellm",
+                        "model": "ollama/llava",
+                        "api_base": "http://vlm-host:11436/v1",
+                    }
+                }
+            )
+        )
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            with patch(
+                "openviking_cli.utils.ollama.check_ollama_running", return_value=True
+            ) as running:
+                ok, detail, fix = check_ollama()
+        running.assert_called_once_with("vlm-host", 11436)
+        assert ok
+        assert "vlm-host:11436" in detail
+        assert fix is None
+
+    def test_checks_query_planner_ollama_api_base(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps(
+                {
+                    "embedding": {
+                        "dense": {"provider": "openai", "model": "text-embedding-3-small"}
+                    },
+                    "vlm": {"provider": "openai", "model": "gpt-4o-mini"},
+                    "query_planner": {
+                        "provider": "litellm",
+                        "model": "ollama/guoxuter/ov_intent_analysis_sft:v4_q8",
+                        "api_base": "http://planner-host:11437",
+                    },
+                }
+            )
+        )
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            with patch(
+                "openviking_cli.utils.ollama.check_ollama_running", return_value=True
+            ) as running:
+                ok, detail, fix = check_ollama()
+        running.assert_called_once_with("planner-host", 11437)
+        assert ok
+        assert "planner-host:11437" in detail
+        assert fix is None
+
+    def test_fails_when_query_planner_ollama_is_unreachable(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps(
+                {
+                    "query_planner": {
+                        "provider": "litellm",
+                        "model": "ollama/guoxuter/ov_intent_analysis_sft:v4_q8",
+                        "api_base": "http://localhost:11434",
+                    }
+                }
+            )
+        )
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            with patch("openviking_cli.utils.ollama.check_ollama_running", return_value=False):
+                ok, detail, fix = check_ollama()
+        assert not ok
+        assert "unreachable at localhost:11434" in detail
+        assert "ollama serve" in fix
+
+    def test_fails_when_configured_ollama_is_unreachable(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps(
+                {
+                    "embedding": {
+                        "dense": {
+                            "provider": "ollama",
+                            "model": "bge-m3",
+                            "api_base": "http://localhost:11434/v1",
+                        }
+                    }
+                }
+            )
+        )
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            with patch("openviking_cli.utils.ollama.check_ollama_running", return_value=False):
+                ok, detail, fix = check_ollama()
+        assert not ok
+        assert "unreachable at localhost:11434" in detail
+        assert "ollama serve" in fix
+
+
+class TestCheckVikingBot:
+    @pytest.fixture(autouse=True)
+    def _no_ovcli_config(self, monkeypatch):
+        monkeypatch.setattr("openviking_cli.doctor.load_ovcli_config", lambda: None)
+
+    def test_pass_with_user_api_key(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps(
+                {
+                    "server": {"root_api_key": "root-key"},
+                    "bot": {
+                        "ov_server": {
+                            "api_key": "user-key",
+                            "api_key_type": "user",
+                        }
+                    },
+                }
+            )
+        )
+
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            status, detail, fix = check_vikingbot()
+
+        assert status == "pass"
+        assert "api_key mode" in detail
+        assert fix is None
+
+    def test_pass_dev_mode_without_bot_ov_server(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(json.dumps({"bot": {}}))
+
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            status, detail, fix = check_vikingbot()
+
+        assert status == "pass"
+        assert "dev OpenViking auth" in detail
+        assert fix is None
+
+    def test_pass_dev_mode_with_ignored_bot_api_key(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(json.dumps({"bot": {"ov_server": {"api_key": "stale-key"}}}))
+
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            status, detail, fix = check_vikingbot()
+
+        assert status == "pass"
+        assert "dev OpenViking auth" in detail
+        assert fix is None
+
+    def test_warn_when_bot_ov_server_missing_in_api_key_mode(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(json.dumps({"server": {"root_api_key": "root-key"}, "bot": {}}))
+
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            status, detail, fix = check_vikingbot()
+
+        assert status == "warn"
+        assert "bot.ov_server not configured" in detail
+        assert "bot.ov_server.api_key" in fix
+
+    def test_warn_when_user_api_key_missing(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps(
+                {
+                    "server": {"root_api_key": "root-key"},
+                    "bot": {"ov_server": {"api_key_type": "user"}},
+                }
+            )
+        )
+
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            status, detail, fix = check_vikingbot()
+
+        assert status == "warn"
+        assert "api_key" in detail
+        assert "ovcli.conf" in detail
+        assert "User API key" in fix
+
+    def test_pass_with_ovcli_user_api_key_fallback(self, tmp_path: Path, monkeypatch):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps({"server": {"root_api_key": "root-key"}, "bot": {"ov_server": {}}})
+        )
+        monkeypatch.setattr(
+            "openviking_cli.doctor.load_ovcli_config",
+            lambda: SimpleNamespace(api_key="ovcli-user-key"),
+        )
+
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            status, detail, fix = check_vikingbot()
+
+        assert status == "pass"
+        assert "ovcli.conf api_key" in detail
+        assert "ovcli-user-key" not in detail
+        assert fix is None
+
+    def test_warn_with_legacy_root_api_key(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps(
+                {
+                    "server": {"root_api_key": "server-root-key"},
+                    "bot": {"ov_server": {"root_api_key": "root-key"}},
+                }
+            )
+        )
+
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            status, detail, fix = check_vikingbot()
+
+        assert status == "warn"
+        assert "root_api_key is deprecated and ignored" in detail
+        assert "bot.ov_server.api_key" in fix
+
+    def test_pass_with_root_api_key_type_for_explicit_server_url(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps(
+                {
+                    "bot": {
+                        "ov_server": {
+                            "server_url": "https://trusted.example",
+                            "api_key": "root-looking-key",
+                            "api_key_type": "root",
+                        }
+                    }
+                }
+            )
+        )
+
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            status, detail, fix = check_vikingbot()
+
+        assert status == "pass"
+        assert "trusted OpenViking auth" in detail
+        assert fix is None
+
+    def test_warn_when_external_root_key_omits_root_api_key_type(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps(
+                {
+                    "bot": {
+                        "ov_server": {
+                            "server_url": "https://trusted.example",
+                            "root_api_key": "root-key",
+                        }
+                    }
+                }
+            )
+        )
+
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            status, detail, fix = check_vikingbot()
+
+        assert status == "warn"
+        assert "root_api_key is deprecated and ignored" in detail
+        assert "api_key_type=root" not in detail
+        assert "User API key" in fix
+
+    def test_warn_when_root_api_key_type_inherits_api_key_server(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps(
+                {
+                    "server": {"root_api_key": "root-key"},
+                    "bot": {
+                        "ov_server": {
+                            "api_key_type": "root",
+                            "api_key": "root-key",
+                        }
+                    },
+                }
+            )
+        )
+
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            status, detail, fix = check_vikingbot()
+
+        assert status == "warn"
+        assert "api_key_type=root" in detail
+        assert "http://127.0.0.1:1933" in detail
+        assert "auth_mode=api_key" in detail
+        assert "To use http://127.0.0.1:1933" in fix
+        assert "bot.ov_server.api_key_type to 'user'" in fix
+        assert "User API key" in fix
+        assert "server.auth_mode='trusted'" in fix
+        assert "bot.ov_server.server_url" in fix
+        assert "api_key_type='root'" in fix
+
+    def test_pass_when_explicit_same_url_is_treated_as_external_server(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps(
+                {
+                    "server": {"host": "127.0.0.1", "port": 1933, "root_api_key": "root-key"},
+                    "bot": {
+                        "ov_server": {
+                            "server_url": "http://localhost:1933",
+                            "api_key_type": "root",
+                            "api_key": "root-key",
+                        }
+                    },
+                }
+            )
+        )
+
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            status, detail, fix = check_vikingbot()
+
+        assert status == "pass"
+        assert "trusted OpenViking auth" in detail
+        assert fix is None
+
+    def test_pass_with_trusted_root_api_key(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps(
+                {
+                    "server": {
+                        "auth_mode": "trusted",
+                        "root_api_key": "root-key",
+                    }
+                }
+            )
+        )
+
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            status, detail, fix = check_vikingbot()
+
+        assert status == "pass"
+        assert "trusted OpenViking auth" in detail
+        assert fix is None
+
+    def test_pass_current_trusted_prefers_server_root_key(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(
+            json.dumps(
+                {
+                    "server": {
+                        "auth_mode": "trusted",
+                        "root_api_key": "server-root-key",
+                    },
+                    "bot": {"ov_server": {"api_key": "stale-bot-key"}},
+                }
+            )
+        )
+
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            status, detail, fix = check_vikingbot()
+
+        assert status == "pass"
+        assert "trusted OpenViking auth" in detail
+        assert fix is None
+
+    def test_warn_with_trusted_missing_root_api_key(self, tmp_path: Path):
+        config = tmp_path / "ov.conf"
+        config.write_text(json.dumps({"server": {"auth_mode": "trusted"}}))
+
+        with patch("openviking_cli.doctor._find_config", return_value=config):
+            status, detail, fix = check_vikingbot()
+
+        assert status == "warn"
+        assert "server.auth_mode=trusted" in detail
+        assert "server.root_api_key" in fix
 
 
 class TestCheckDisk:
@@ -258,7 +1047,11 @@ class TestRunDoctor:
             )
         )
         with patch("openviking_cli.doctor._find_config", return_value=config):
-            code = run_doctor()
+            with patch(
+                "openviking_cli.doctor._probe_embedding_provider",
+                return_value=(True, "openai/m probe ok", None),
+            ):
+                code = run_doctor()
         captured = capsys.readouterr()
         assert "OpenViking Doctor" in captured.out
         # May not be 0 if native engine is missing, but the function should complete
@@ -270,6 +1063,18 @@ class TestRunDoctor:
         assert code == 1
         captured = capsys.readouterr()
         assert "FAIL" in captured.out
+
+    def test_returns_zero_on_warning_only(self, capsys):
+        with patch(
+            "openviking_cli.doctor._CHECKS",
+            [("Warning", lambda: ("warn", "needs attention", "fix it"))],
+        ):
+            code = run_doctor()
+
+        assert code == 0
+        captured = capsys.readouterr()
+        assert "WARN" in captured.out
+        assert "1 warning(s)" in captured.out
 
 
 def _import_fail(blocked_name: str):

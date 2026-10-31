@@ -7,28 +7,159 @@ This parser implements the new simplified architecture:
 - Parse structure and create directory structure directly in VikingFS
 - No LLM calls during parsing (semantic generation moved to SemanticQueue)
 - Support mixed directory structure (files + subdirectories)
-- Small sections (< 800 tokens) are merged with adjacent sections
+- Small sections (< 512 characters) are merged with adjacent sections
 
 The parser handles scenarios:
-1. Small files (< 4000 tokens) → save as single file with original name
+1. Small files (<= 2000 characters) → save as single file with original name
 2. Large files with sections → split by sections with merge logic
 3. Sections with subsections → section becomes directory
-4. Small sections (< 800 tokens) → merged with adjacent sections
+4. Small sections (< 512 characters) → merged with adjacent sections
 5. Oversized sections without subsections → split by paragraphs
 """
 
+import asyncio
 import hashlib
+import os
 import re
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
+import yaml
+
+from openviking.parse.accessors.mime_types import IANA_MEDIA_TYPE_TO_EXTENSION
 from openviking.parse.base import NodeType, ParseResult, ResourceNode, create_parse_result
+from openviking.parse.image_validation import is_valid_image
+from openviking.parse.output import (
+    AgfsParseOutputStore,
+    ParseArtifactRef,
+    ParseArtifactWriter,
+    create_parse_artifact_writer,
+)
 from openviking.parse.parsers.base_parser import BaseParser
+from openviking.parse.parsers.code.ast.providers import supports_code_skeleton
+from openviking.parse.parsers.constants import (
+    CODE_EXTENSIONS,
+    DOCUMENTATION_EXTENSIONS,
+    IGNORE_EXTENSIONS,
+)
 from openviking_cli.utils.config.parser_config import ParserConfig
 from openviking_cli.utils.logger import get_logger
 
+# All known valid extensions - only these should be stripped when getting stem
+KNOWN_EXTENSIONS: set[str] = set()
+for extensions in IANA_MEDIA_TYPE_TO_EXTENSION.values():
+    KNOWN_EXTENSIONS.update(extensions)
+KNOWN_EXTENSIONS.update(CODE_EXTENSIONS)
+KNOWN_EXTENSIONS.update(DOCUMENTATION_EXTENSIONS)
+KNOWN_EXTENSIONS.update(IGNORE_EXTENSIONS)
+
+# Markdown link/image in one pass: optional leading "!" marks images.
+# Scope (per spec, YAGNI): only inline [..](..)/![..](..) are handled. Reference-style
+# links, HTML, and links inside fenced/indented code blocks are NOT excluded — a
+# code-block link to an existing relative .md could be rewritten. Acceptable for now.
+# NOTE: `[^)]+` stops at the first ")", so a target whose filename literally
+# contains ")" is captured truncated; it then fails the on-disk existence check
+# and is left unchanged (conservative). Such filenames are unsupported.
+_MD_LINK_RE = re.compile(r"(!?)\[([^\]]*)\]\(([^)]+)\)")
+# Splits a link target into its path part and optional "#fragment"/"?query" suffix.
+_MD_FRAGMENT_RE = re.compile(r"^([^#?]*)([#?].*)?$")
+# Extensions whose targets become directories on ingest (see _rewrite_single_link).
+_MD_DIR_EXTS = {".md", ".markdown", ".mdown", ".mkd"}
+
+
+def _smart_stem(path_or_name: str | Path) -> str:
+    """Get the stem of a filename, but only strip known valid extensions.
+
+    For filenames like "2601.00014" where ".00014" is not a valid extension,
+    returns the full name instead of just "2601".
+
+    Args:
+        path_or_name: Path object or string filename
+
+    Returns:
+        Stem with only known extensions stripped
+    """
+    path = Path(path_or_name)
+    suffix = path.suffix.lower()
+
+    if suffix in KNOWN_EXTENSIONS:
+        return path.stem
+
+    # If the suffix is not a known extension, treat the whole name as the stem
+    return path.name
+
+
 logger = get_logger(__name__)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _gh_slug(text: str) -> str:
+    """GitHub-style heading slug: lowercase, strip punctuation, spaces→'-', keep CJK."""
+    s = text.strip().lower()
+    s = re.sub(r"[^\w\s-]", "", s)
+    # Map each whitespace character to its own hyphen (do NOT collapse runs).
+    # GitHub's reference slugger does `.replace(/ /g, '-')` — one hyphen per
+    # space, no collapsing. Removing punctuation can leave adjacent spaces
+    # (e.g. "Foo & Bar" → "foo  bar"); collapsing them produces "foo-bar"
+    # while GitHub generates "foo--bar", breaking intra-doc anchor links.
+    s = re.sub(r"\s", "-", s)
+    return s
+
+
+@dataclass
+class _LayoutOp:
+    """One planned VikingFS operation. ``parse`` (``_compute_layout``) produces an
+    ordered list of these without touching the store; ``write`` (``_apply_layout``)
+    replays them. ``mkdir`` creates ``uri``; ``write`` stores ``content`` at ``uri``."""
+
+    kind: str  # "mkdir" | "write"
+    uri: str
+    content: Optional[str] = None
+    exist_ok: bool = False
+
+
+@dataclass
+class _Layout:
+    """A markdown document parsed into a VikingFS write plan, with nothing written
+    yet. ``ops`` holds raw (un-rewritten) section content; replay it via
+    ``_apply_layout``. The link-rewrite probe reuses ``ops`` to read a target's split
+    layout side-effect-free, so it no longer needs a fake filesystem."""
+
+    temp_uri: str
+    root_dir: str
+    doc_title: str
+    doc_name: str
+    ops: List[_LayoutOp] = field(default_factory=list)
+    meta: Dict[str, Any] = field(default_factory=dict)
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
+class _RewriteContext:
+    """Link-rewrite inputs and memoized results owned by one parse_content call."""
+
+    source_path: str
+    doc_name: str
+    root_dir: str
+    import_root: str
+    base_dir: Optional[Path]
+    allowed_media_dirs: Optional[List[Path]]
+    split_content: bool
+    adaptive_flatten_requested: bool
+    flatten_single_output: bool
+    split_cache: Dict[Tuple[str, bool, bool], Optional[Dict[str, str]]] = field(
+        default_factory=dict
+    )
+    image_probe_cache: Dict[str, bool] = field(default_factory=dict)
+
 
 if TYPE_CHECKING:
     pass
@@ -49,34 +180,48 @@ class MarkdownParser(BaseParser):
     """
 
     # Configuration constants
-    DEFAULT_MAX_SECTION_SIZE = 1024  # Maximum tokens per section
-    DEFAULT_MIN_SECTION_TOKENS = 512  # Minimum tokens to create a separate section
+    DEFAULT_MIN_SECTION_CHARS = 512  # Minimum chars to create a separate section
+    TABLE_HEADER_REPEAT_MAX_CHARS = 1024
     MAX_MERGED_FILENAME_LENGTH = 32  # Maximum length for merged section filenames
+
+    # Image validation constants
+    IMAGE_MIN_SIDE = 14  # Minimum width/height in pixels (exclusive)
+    IMAGE_MIN_PIXELS = 196  # Minimum width * height
+    IMAGE_MAX_PIXELS = 36000000  # Maximum width * height
+    IMAGE_MIN_ASPECT_RATIO = 1 / 150  # Minimum width/height ratio
+    IMAGE_MAX_ASPECT_RATIO = 150  # Maximum width/height ratio
+    IMAGE_MAX_FILE_BYTES = 10 * 1024 * 1024  # Local file path limit: 10 MB
 
     def __init__(
         self,
-        extract_frontmatter: bool = True,
+        extract_frontmatter: Optional[bool] = None,
         config: Optional[ParserConfig] = None,
     ):
         """
         Initialize the enhanced markdown parser.
 
         Args:
-            extract_frontmatter: Whether to extract YAML frontmatter
+            extract_frontmatter: Whether to REMOVE YAML frontmatter from the stored
+                document body. Frontmatter is parsed into the parse result metadata
+                either way. Defaults to False (lossless ingestion); when None, uses
+                config.
             config: Parser configuration (uses default if None)
         """
-        self.extract_frontmatter = extract_frontmatter
         self.config = config or ParserConfig()
+        if extract_frontmatter is None:
+            extract_frontmatter = getattr(self.config, "extract_frontmatter", False)
+        self.extract_frontmatter = extract_frontmatter
 
         # Compile regex patterns for better performance
         self._heading_pattern = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
         self._code_block_pattern = re.compile(r"```(\w*)\n(.*?)```", re.DOTALL)
         self._inline_code_pattern = re.compile(r"`([^`]+)`")
         self._link_pattern = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
-        self._image_pattern = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+        self._image_pattern = re.compile(r"!\[([^\]]*)\]\(((?:[^()]|\([^()]*\))+)\)")
         self._list_pattern = re.compile(r"^(\s*)[-*+]\s+(.+)$", re.MULTILINE)
         self._numbered_list_pattern = re.compile(r"^(\s*)\d+\.\s+(.+)$", re.MULTILINE)
-        self._frontmatter_pattern = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
+        # Optional CR so LF and Windows CRLF documents share the same delimiters.
+        self._frontmatter_pattern = re.compile(r"^---\r?\n(.*?)\r?\n---\r?\n", re.DOTALL)
         self._html_comment_pattern = re.compile(r"<!--.*?-->", re.DOTALL)
         self._indented_code_pattern = re.compile(r"^(?:    |\t).+$", re.MULTILINE)
 
@@ -122,6 +267,7 @@ class MarkdownParser(BaseParser):
         source_path: Optional[str] = None,
         instruction: str = "",
         base_dir: Optional[Path] = None,
+        allowed_media_dirs: Optional[List[Path]] = None,
         **kwargs,
     ) -> ParseResult:
         """
@@ -137,81 +283,81 @@ class MarkdownParser(BaseParser):
             source_path: Optional source file path
             instruction: Processing instruction (unused in v5.0)
             base_dir: Base directory for relative paths
-            **kwargs: Additional runtime options
+            allowed_media_dirs: Additional directories from which derived media
+                (e.g. images extracted by the PDF/DOC parser) may be read. The
+                caller is responsible for ensuring these belong to the current
+                input resource's lifecycle.
+            **kwargs: Additional runtime options, incl. resource_name/source_name and
+                enable_link_rewrite/link_rewrite_root (the latter set by DirectoryParser)
 
         Returns:
             ParseResult with temp_dir_path (Viking URI)
         """
         start_time = time.time()
-        warnings: List[str] = []
-        meta: Dict[str, Any] = {}
+        output_store = kwargs.pop("parse_output_store", None)
+        writer = await create_parse_artifact_writer(
+            output_store, viking_fs=self._get_viking_fs() if output_store is None else None
+        )
 
         try:
-            logger.debug(f"[MarkdownParser] Starting parse for: {source_path or 'content string'}")
-
-            # Extract frontmatter if present
-            if self.extract_frontmatter:
-                content, frontmatter = self._extract_frontmatter(content)
-                if frontmatter:
-                    meta["frontmatter"] = frontmatter
-                    logger.debug(
-                        f"[MarkdownParser] Extracted frontmatter: {list(frontmatter.keys())}"
-                    )
-
-            # Collect metadata
-            # images = list(self._image_pattern.finditer(content))
-            # image_count = len(images)
-            # lines = content.split("\n")
-            # text_lines = [l for l in lines if l.strip() and not l.strip().startswith("#")]
-            # line_count = len(text_lines)
-
-            # meta["image_count"] = image_count
-            # meta["line_count"] = line_count
-
-            # Create temporary directory
-            viking_fs = self._get_viking_fs()
-            temp_uri = self._create_temp_uri()
-            await viking_fs.mkdir(temp_uri)
-            logger.debug(f"[MarkdownParser] Created temp directory: {temp_uri}")
-
-            explicit_name = kwargs.get("resource_name") or kwargs.get("source_name")
-
-            # Preserve the original uploaded filename when available instead of
-            # the temp upload name (e.g. upload_<uuid>.txt).
-            doc_title = meta.get("frontmatter", {}).get(
-                "title",
-                Path(explicit_name).stem
-                if explicit_name
-                else Path(source_path).stem
-                if source_path
-                else "Document",
+            split_content = bool(kwargs.get("split_content", True))
+            adaptive_flatten_requested = bool(
+                kwargs.get("flatten_single_output", False) and not split_content
+            )
+            flatten_single_output = adaptive_flatten_requested
+            if flatten_single_output:
+                flatten_single_output = not await self._has_ingestable_local_image(
+                    content,
+                    base_dir=base_dir,
+                    allowed_media_dirs=allowed_media_dirs,
+                )
+            # Phase 1 — parse only: turn the markdown into an ordered VikingFS write
+            # plan, touching nothing. The temp URI is allocated here (the one
+            # FS-scoped step) and threaded in so layout planning stays side-effect free.
+            temp_uri = writer.ref.root
+            layout_kwargs = dict(kwargs)
+            layout_kwargs["flatten_single_output"] = flatten_single_output
+            layout = await self._compute_layout(
+                content,
+                temp_uri,
+                source_path=source_path,
+                instruction=instruction,
+                **layout_kwargs,
             )
 
-            # Create root directory
-            root_dir = f"{temp_uri}/{self._sanitize_for_path(doc_title)}"
+            import_root = kwargs.get("link_rewrite_root")
+            rewrite_ctx = None
+            if kwargs.get("enable_link_rewrite", False) and source_path and import_root:
+                rewrite_ctx = _RewriteContext(
+                    source_path=source_path,
+                    doc_name=layout.doc_name,
+                    root_dir=layout.root_dir,
+                    import_root=import_root,
+                    base_dir=base_dir,
+                    allowed_media_dirs=allowed_media_dirs,
+                    split_content=split_content,
+                    adaptive_flatten_requested=adaptive_flatten_requested,
+                    flatten_single_output=flatten_single_output,
+                )
 
-            # Find all headings
-            headings = self._find_headings(content)
-            logger.info(f"[MarkdownParser] Found {len(headings)} headings")
-
-            # Parse and create directory structure
-            await self._parse_and_create_structure(
-                content,
-                headings,
-                root_dir,
-                source_path,
-                doc_name=self._sanitize_for_path(Path(doc_title).stem),
+            # Phase 2 — write only: replay the plan against the real VikingFS,
+            # rewriting links and ingesting local images.
+            await self._apply_layout(
+                layout,
+                writer=writer,
+                rewrite_ctx=rewrite_ctx,
+                base_dir=base_dir,
+                allowed_media_dirs=allowed_media_dirs,
             )
 
             parse_time = time.time() - start_time
-            logger.info(f"[MarkdownParser] Parse completed in {parse_time:.2f}s")
 
             # Create dummy root node for compatibility
             root = ResourceNode(
                 type=NodeType.ROOT,
-                title=doc_title,
+                title=layout.doc_title,
                 level=0,
-                meta=meta.get("frontmatter", {}),
+                meta=layout.meta.get("frontmatter", {}),
             )
 
             result = create_parse_result(
@@ -220,19 +366,224 @@ class MarkdownParser(BaseParser):
                 source_format="markdown",
                 parser_name="MarkdownParser",
                 parse_time=parse_time,
-                meta=meta,
-                warnings=warnings,
+                meta=layout.meta,
+                warnings=layout.warnings,
             )
 
-            result.temp_dir_path = temp_uri
+            root_rel = writer.relative_path(layout.root_dir)
+            result.artifact_ref = await writer.finalize(resource_rel=root_rel)
+            result.temp_dir_path = result.artifact_ref.root
 
             return result
 
         except Exception as e:
             logger.error(f"[MarkdownParser] Parse failed: {e}", exc_info=True)
+            await writer.cleanup()
             raise
 
+    async def _compute_layout(
+        self,
+        content: str,
+        temp_uri: str,
+        source_path: Optional[str] = None,
+        instruction: str = "",
+        **kwargs,
+    ) -> _Layout:
+        """Phase 1 (parse only): plan ``content`` into an ordered VikingFS write plan
+        plus metadata, WITHOUT touching VikingFS, rewriting links, or ingesting images.
+
+        ``temp_uri`` is supplied by the caller (parse_content allocates a real one; the
+        link-rewrite probe passes a throwaway), keeping this method pure so the probe
+        can learn a target's split layout with zero side effects.
+        """
+        meta: Dict[str, Any] = {}
+        warnings: List[str] = []
+
+        # Frontmatter is ALWAYS parsed into ``meta`` (it drives doc_title below), but
+        # it is only removed from the stored body when explicitly configured.
+        # ``meta`` is transient — it is returned in the parse result and never written
+        # to VikingFS — so stripping by default silently destroyed the frontmatter of
+        # every ingested markdown file with no way to read those fields back.
+        stripped_content, frontmatter = self._extract_frontmatter(content)
+        if frontmatter:
+            meta["frontmatter"] = frontmatter
+        if self.extract_frontmatter:
+            content = stripped_content
+
+        explicit_name = kwargs.get("resource_name")
+        if not explicit_name and kwargs.get("source_name"):
+            explicit_name = _smart_stem(kwargs["source_name"])
+
+        # Preserve the original uploaded filename when available instead of the temp
+        # upload name (e.g. upload_<uuid>.txt).
+        fallback_title = explicit_name or (_smart_stem(source_path) if source_path else "Document")
+        frontmatter_title = meta.get("frontmatter", {}).get("title")
+        doc_title = (
+            frontmatter_title
+            if isinstance(frontmatter_title, str) and frontmatter_title.strip()
+            else fallback_title
+        )
+        doc_name = self._sanitize_for_path(doc_title)
+        # Preserve code source filenames as the temp document directory.
+        source_name = kwargs.get("source_name")
+        root_name = source_name if source_name and supports_code_skeleton(source_name) else doc_name
+        root_dir = (
+            temp_uri
+            if kwargs.get("flatten_single_output", False)
+            else f"{temp_uri}/{self._sanitize_for_path(root_name)}"
+        )
+
+        # Find all headings
+        headings = self._find_headings(content)
+
+        # The temp dir is the first thing materialized on apply. A flattened
+        # document uses the temp dir itself as its root, which _build_structure
+        # creates below, so do not enqueue the same mkdir twice.
+        ops: List[_LayoutOp] = []
+        if root_dir != temp_uri:
+            ops.append(_LayoutOp("mkdir", temp_uri))
+        await self._build_structure(
+            ops,
+            content,
+            headings,
+            root_dir,
+            source_path,
+            doc_name,
+            split_content=kwargs.get("split_content", True),
+        )
+
+        return _Layout(
+            temp_uri=temp_uri,
+            root_dir=root_dir,
+            doc_title=doc_title,
+            doc_name=doc_name,
+            ops=ops,
+            meta=meta,
+            warnings=warnings,
+        )
+
+    async def _apply_layout(
+        self,
+        layout: _Layout,
+        *,
+        writer: Optional[ParseArtifactWriter] = None,
+        rewrite_ctx: Optional[_RewriteContext] = None,
+        base_dir: Optional[Path] = None,
+        allowed_media_dirs: Optional[List[Path]] = None,
+    ) -> None:
+        """Phase 2 (write only): replay ``layout.ops`` against the real VikingFS —
+        create dirs, write each section (rewriting relative links when enabled), then
+        ingest the local images those sections reference."""
+        started = time.perf_counter()
+        if writer is None:
+            writer = ParseArtifactWriter(
+                AgfsParseOutputStore(viking_fs=self._get_viking_fs()),
+                ParseArtifactRef(backend="agfs", root=layout.temp_uri),
+            )
+        mkdir_ops = [op for op in layout.ops if op.kind == "mkdir"]
+        write_ops = [op for op in layout.ops if op.kind == "write"]
+        write_chars = sum(len(op.content or "") for op in write_ops)
+
+        rewrite_enabled = rewrite_ctx is not None
+
+        mkdir_started = time.perf_counter()
+        mkdir_count = 0
+        for op in layout.ops:
+            if op.kind == "mkdir":
+                await writer.mkdir(op.uri)
+                mkdir_count += 1
+        mkdir_s = time.perf_counter() - mkdir_started
+
+        write_started = time.perf_counter()
+        written_sections: list[tuple[str, str]] = []
+        for op in write_ops:
+            written = await self._write_section(
+                op.uri, op.content, writer=writer, rewrite_ctx=rewrite_ctx
+            )
+            written_sections.append((op.uri, written))
+        write_s = time.perf_counter() - write_started
+
+        # Ingest local image files, placing each image next to the markdown file
+        # that references it. For generated tables with no image references, avoid
+        # glob+read over every chunk file we just wrote.
+        images_started = time.perf_counter()
+        has_image_refs = self._layout_has_local_image_refs(write_ops)
+        if has_image_refs:
+            await self._ingest_local_images(
+                layout.root_dir,
+                base_dir,
+                allowed_media_dirs,
+                writer=writer,
+                markdown_files=written_sections,
+            )
+        images_s = time.perf_counter() - images_started
+
+        total_s = time.perf_counter() - started
+        if _env_bool("OPENVIKING_MARKDOWN_APPLY_PROFILE", False):
+            logger.info(
+                f"[MarkdownApplyProfile] total={total_s:.3f}s mkdir={mkdir_s:.3f}s "
+                f"write={write_s:.3f}s images={images_s:.3f}s ops={len(layout.ops)} "
+                f"mkdir_ops={len(mkdir_ops)} mkdir_count={mkdir_count} "
+                f"write_ops={len(write_ops)} write_chars={write_chars} "
+                f"rewrite_enabled={rewrite_enabled} has_image_refs={has_image_refs} "
+                f"root={layout.root_dir}"
+            )
+
     # ========== Helper Methods ==========
+
+    def _layout_has_local_image_refs(self, write_ops: List[_LayoutOp]) -> bool:
+        """Return True when planned markdown content references local images.
+
+        This mirrors the image patterns consumed by _ingest_local_images, but runs
+        against in-memory layout content so pure-text imports avoid a VFS glob/read
+        pass over every generated markdown chunk.
+        """
+        try:
+            from openviking.parse.image_rewrite import HTML_IMG_PATTERN
+        except ImportError:
+            HTML_IMG_PATTERN = re.compile(
+                r"""(<img\s[^>]*?src=["'])([^"']+)(["'][^>]*>)""", re.IGNORECASE
+            )
+
+        for op in write_ops:
+            content = op.content or ""
+            if "![" in content:
+                for match in self._image_pattern.finditer(content):
+                    if not self._is_remote_uri(match.group(2)):
+                        return True
+            if "<img" in content.lower():
+                for match in HTML_IMG_PATTERN.finditer(content):
+                    if not self._is_remote_uri(match.group(2)):
+                        return True
+        return False
+
+    async def _has_ingestable_local_image(
+        self,
+        content: str,
+        *,
+        base_dir: Optional[Path],
+        allowed_media_dirs: Optional[List[Path]],
+    ) -> bool:
+        """Return whether parsing will materialize at least one local image."""
+        from openviking.parse.image_rewrite import HTML_IMG_PATTERN
+
+        image_refs = [match.group(2) for match in self._image_pattern.finditer(content)]
+        image_refs.extend(match.group(2) for match in HTML_IMG_PATTERN.finditer(content))
+        seen: set[Path] = set()
+        for image_ref in image_refs:
+            if self._is_remote_uri(image_ref):
+                continue
+            resolved = self._resolve_image_path(image_ref, base_dir, allowed_media_dirs)
+            if resolved is None or resolved in seen:
+                continue
+            seen.add(resolved)
+            try:
+                image_bytes = await asyncio.to_thread(resolved.read_bytes)
+                if await asyncio.to_thread(self._is_valid_image, image_bytes, resolved):
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _extract_frontmatter(self, content: str) -> Tuple[str, Optional[Dict[str, Any]]]:
         """
@@ -251,13 +602,16 @@ class MarkdownParser(BaseParser):
         frontmatter_text = match.group(1)
         content_without_frontmatter = content[match.end() :]
 
-        # Parse YAML (simple key: value parsing)
-        frontmatter = {}
-        for line in frontmatter_text.split("\n"):
-            line = line.strip()
-            if ":" in line:
-                key, value = line.split(":", 1)
-                frontmatter[key.strip()] = value.strip()
+        try:
+            # Keep scalar values as strings, matching the previous parser and keeping
+            # ParseResult metadata JSON-serializable, while honoring YAML nesting.
+            frontmatter = yaml.load(frontmatter_text, Loader=yaml.BaseLoader)
+        except yaml.YAMLError:
+            logger.warning("Ignoring malformed YAML frontmatter")
+            return content_without_frontmatter, None
+
+        if not isinstance(frontmatter, dict):
+            return content_without_frontmatter, None
 
         return content_without_frontmatter, frontmatter
 
@@ -307,63 +661,404 @@ class MarkdownParser(BaseParser):
         return headings
 
     def _smart_split_content(self, content: str, max_size: int) -> List[str]:
-        """
-        Split oversized content by paragraphs, force split single oversized paragraphs.
-
-        Enforces both a token estimate limit (max_size) and a hard character limit
-        (self.config.max_section_chars) to guard against token estimation errors.
-
-        Args:
-            content: Content to split
-            max_size: Maximum size per part (in tokens)
-
-        Returns:
-            List of content parts
-        """
-        max_chars = self.config.max_section_chars
-        if max_chars <= 0:
-            # Char limit disabled (misconfigured); fall back to token-only splitting
-            max_chars = len(content) + 1
+        """Split by character budget, preserving an indivisible Markdown table row."""
+        max_chars = min(max_size, self.config.max_section_chars)
         paragraphs = content.split("\n\n")
         parts = []
         current = ""
-        current_tokens = 0
 
         for para in paragraphs:
-            para_tokens = self._estimate_token_count(para)
-            para_len = len(para)
-
-            # Single paragraph too long (by tokens or chars): force split by characters
-            if para_tokens > max_size or para_len > max_chars:
+            if len(para) > max_chars:
                 if current:
-                    parts.append(current.strip())
+                    if len(current) < self.DEFAULT_MIN_SECTION_CHARS:
+                        para = current + "\n\n" + para
+                    else:
+                        parts.append(current.strip())
                     current = ""
-                    current_tokens = 0
-                for i in range(0, len(para), max_chars):
-                    parts.append(para[i : i + max_chars].strip())
-            elif (
-                current_tokens + para_tokens > max_size or len(current) + len(para) + 2 > max_chars
-            ) and current:
+                table_parts = self._split_markdown_table_by_rows(para, max_chars=max_chars)
+                if table_parts:
+                    parts.extend(table_parts)
+                else:
+                    parts.extend(
+                        para[i : i + max_chars].strip() for i in range(0, len(para), max_chars)
+                    )
+            elif current and len(current) + len(para) + 2 > max_chars:
                 parts.append(current.strip())
                 current = para
-                current_tokens = para_tokens
             else:
                 current = current + "\n\n" + para if current else para
-                current_tokens += para_tokens
 
         if current.strip():
-            parts.append(current.strip())
+            tail = current.strip()
+            if parts and len(parts[-1]) + 2 + len(tail) <= max_chars:
+                parts[-1] = f"{parts[-1]}\n\n{tail}"
+            else:
+                parts.append(tail)
 
         return parts if parts else [content]
 
+    @staticmethod
+    def _is_markdown_table_row(line: str) -> bool:
+        stripped = line.strip()
+        return len(stripped) >= 2 and stripped.startswith("|") and stripped.endswith("|")
+
+    @staticmethod
+    def _is_markdown_table_separator(line: str) -> bool:
+        stripped = line.strip()
+        if not stripped.startswith("|") or not stripped.endswith("|"):
+            return False
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell or "") for cell in cells)
+
+    def _split_markdown_table_by_rows(
+        self,
+        content: str,
+        *,
+        max_chars: int,
+    ) -> Optional[List[str]]:
+        """Split a single oversized Markdown table without cutting rows.
+
+        The first two table rows are treated as the header/separator and repeated
+        in subsequent chunks when they are small enough to fit. Any prefix before
+        the table, such as a section heading merged into the oversized paragraph,
+        is kept on the first chunk only. A single row may exceed the requested
+        limits because row integrity takes precedence at this source-storage stage.
+        """
+        lines = content.splitlines()
+        table_start = -1
+        for index in range(len(lines) - 1):
+            if self._is_markdown_table_row(lines[index]) and self._is_markdown_table_separator(
+                lines[index + 1]
+            ):
+                table_start = index
+                break
+        if table_start < 0:
+            return None
+
+        table_end = table_start + 2
+        while table_end < len(lines) and self._is_markdown_table_row(lines[table_end]):
+            table_end += 1
+
+        if table_end - table_start < 3:
+            return None
+        if any(line.strip() for line in lines[table_end:]):
+            return None
+
+        prefix = "\n".join(lines[:table_start]).strip()
+        header = lines[table_start : table_start + 2]
+        rows = lines[table_start + 2 : table_end]
+        header_text = "\n".join(header)
+        repeat_header = (
+            len(header_text) <= self.TABLE_HEADER_REPEAT_MAX_CHARS and len(header_text) < max_chars
+        )
+
+        parts: List[str] = []
+        current_lines: List[str] = []
+
+        def flush() -> None:
+            nonlocal current_lines
+            if current_lines:
+                parts.append("\n".join(current_lines).strip())
+                current_lines = []
+
+        if prefix:
+            parts.extend(prefix[i : i + max_chars] for i in range(0, len(prefix), max_chars))
+
+        # Keep the header and separator together until the first data row is handled.
+        current_lines.extend(header)
+        for index, row in enumerate(rows):
+            candidate = "\n".join([*current_lines, row])
+            if current_lines and len(candidate) > max_chars:
+                if index == 0 and len(row) > max_chars:
+                    current_lines = [*header, row]
+                    continue
+                flush()
+                if len(row) > max_chars or (
+                    repeat_header and len(header_text) + 1 + len(row) <= max_chars
+                ):
+                    current_lines.extend(header)
+            current_lines.append(row)
+
+        flush()
+        return parts or None
+
+    async def _ingest_local_images(
+        self,
+        root_dir: str,
+        base_dir: Optional[Path] = None,
+        allowed_media_dirs: Optional[List[Path]] = None,
+        *,
+        writer: Optional[ParseArtifactWriter] = None,
+        markdown_files: Optional[List[Tuple[str, str]]] = None,
+    ) -> None:
+        """
+        Scan every processed markdown file under ``root_dir`` and copy the local
+        images they reference into VikingFS, next to the markdown file itself.
+
+        Images are processed file by file: for each markdown file, the local
+        image references it contains are resolved and copied into the same
+        directory as that markdown file. A single ``.image_mappings.json`` file,
+        keyed by the markdown file's path relative to ``root_dir``, is written at
+        ``root_dir`` for ``rewrite_image_uris`` to consume.
+
+        Args:
+            root_dir: Root directory URI in VikingFS containing the markdown files
+            base_dir: Base directory for resolving relative paths
+            allowed_media_dirs: Additional directories from which derived media
+                may be read (passed through to ``_resolve_image_path``)
+        """
+        if writer is None:
+            writer = ParseArtifactWriter(
+                AgfsParseOutputStore(viking_fs=self._get_viking_fs()),
+                ParseArtifactRef(backend="agfs", root=root_dir),
+            )
+        if markdown_files is None:
+            raise ValueError("markdown_files are required for artifact image ingestion")
+
+        root_prefix = root_dir.rstrip("/")
+
+        # mapping: rel_md_path -> {original_path_str -> unique_filename}
+        mappings: Dict[str, Dict[str, str]] = {}
+
+        for md_uri, content in markdown_files:
+            # Collect all image references in this markdown file: markdown
+            # embeds (![...]) and HTML <img src="..."> tags alike.
+            from openviking.parse.image_rewrite import HTML_IMG_PATTERN
+
+            image_refs = [m.group(2) for m in self._image_pattern.finditer(content)]
+            image_refs += [m.group(2) for m in HTML_IMG_PATTERN.finditer(content)]
+            if not image_refs:
+                continue
+
+            # Resolve local image paths, skipping remote URIs and duplicates
+            local_images = []
+            origin_images_links = []
+            seen_paths = set()
+
+            for path_str in image_refs:
+                # Skip remote URIs
+                if self._is_remote_uri(path_str):
+                    continue
+
+                resolved_path = self._resolve_image_path(path_str, base_dir, allowed_media_dirs)
+                if resolved_path is None:
+                    logger.warning(f"[MarkdownParser] Image file not found: {path_str}")
+                    continue
+
+                # Skip duplicates within the same markdown file
+                if resolved_path in seen_paths:
+                    continue
+                seen_paths.add(resolved_path)
+                origin_images_links.append(path_str)
+                local_images.append(resolved_path)
+
+            if not local_images:
+                continue
+
+            # Target directory is the directory containing the markdown file
+            md_dir = md_uri.rsplit("/", 1)[0]
+
+            # Copy each local image next to the markdown file, deduplicating names
+            used_names: set[str] = set()
+            file_mappings: Dict[str, str] = {}  # original_path_str -> unique_filename
+            for origin_link, resolved_path in zip(origin_images_links, local_images, strict=False):
+                try:
+                    if not await asyncio.to_thread(resolved_path.exists):
+                        logger.warning(f"[MarkdownParser] Image file not found: {resolved_path}")
+                        continue
+
+                    # Read image bytes
+                    image_bytes = await asyncio.to_thread(resolved_path.read_bytes)
+
+                    # Validate pixel size and file size; skip non-compliant images
+                    if not await asyncio.to_thread(
+                        self._is_valid_image, image_bytes, resolved_path
+                    ):
+                        continue
+
+                    # Get filename and deduplicate
+                    filename = resolved_path.name
+                    unique_filename = self._deduplicate_filename(filename, used_names)
+                    used_names.add(unique_filename)
+
+                    # Write next to the markdown file
+                    viking_path = f"{md_dir}/{unique_filename}"
+                    await writer.write_bytes(viking_path, image_bytes)
+
+                    # Record mapping for post-commit rewrite
+                    file_mappings[origin_link] = unique_filename
+
+                except Exception as e:
+                    logger.warning(f"[MarkdownParser] Failed to ingest image {resolved_path}: {e}")
+
+            if file_mappings:
+                rel_md_path = (
+                    md_uri[len(root_prefix) + 1 :] if md_uri.startswith(root_prefix) else md_uri
+                )
+                mappings[rel_md_path] = file_mappings
+
+        # Write a single mapping file at the root directory for rewrite_image_uris
+        if mappings:
+            import json
+
+            from openviking.parse.image_rewrite import IMAGE_MAPPINGS_FILENAME
+
+            await writer.write_text(
+                f"{root_prefix}/{IMAGE_MAPPINGS_FILENAME}",
+                json.dumps(mappings, ensure_ascii=False),
+            )
+
+    def _resolve_image_path(
+        self,
+        path_str: str,
+        base_dir: Optional[Path],
+        allowed_media_dirs: Optional[List[Path]] = None,
+    ) -> Optional[Path]:
+        """
+        Resolve a local image reference to an existing filesystem path.
+
+        Args:
+            path_str: Raw image path from the markdown reference
+            base_dir: Base directory for resolving relative paths
+            allowed_media_dirs: Additional directories that belong to the current
+                input resource's lifecycle (e.g. media extracted by the PDF/DOC
+                parser).
+
+        Returns:
+            Resolved absolute Path if the file exists and stays within an
+            allowed root, otherwise None
+        """
+        try:
+            path = Path(self._unwrap_link_destination(path_str))
+
+            # Reject absolute paths: they can point anywhere on the host
+            if path.is_absolute():
+                logger.warning(f"[MarkdownParser] Rejected absolute image path: {path_str}")
+                return None
+
+            # Build the list of allowed roots to confine resolution to.
+            allowed_roots: list[Path] = []
+            if base_dir:
+                allowed_roots.append(base_dir)
+            if allowed_media_dirs:
+                allowed_roots.extend(allowed_media_dirs)
+
+            if not allowed_roots:
+                return None
+
+            # Markdown semantics first: the reference is relative to the file's
+            # own directory. Accept it when the resolved target stays inside ANY
+            # allowed root (e.g. ../images/x.gif escaping base_dir but still
+            # inside the import root a DirectoryParser passed down).
+            if base_dir:
+                candidate = (base_dir / path).resolve()
+                if candidate.exists():
+                    for root in allowed_roots:
+                        try:
+                            candidate.relative_to(root.resolve())
+                            return candidate
+                        except ValueError:
+                            continue
+
+            # Derived-media semantics: the reference may instead be relative to
+            # one of the media roots themselves (e.g. images extracted by the
+            # PDF/DOC parser into a media dir).
+            for root in allowed_roots:
+                candidate = (root / path).resolve()
+
+                # Verify the resolved candidate stays under the allowed root,
+                # rejecting traversal attempts such as ../../private.png.
+                try:
+                    candidate.relative_to(root.resolve())
+                except ValueError:
+                    logger.warning(
+                        f"[MarkdownParser] Rejected image path outside base dir: {path_str}"
+                    )
+                    continue
+
+                if candidate.exists():
+                    return candidate
+
+            return None
+        except Exception:
+            logger.warning(f"[MarkdownParser] Cannot resolve image path: {path_str}")
+            return None
+
+    def _is_valid_image(self, image_bytes: bytes, source_path: Path) -> bool:
+        """
+        Validate an image's pixel dimensions and file size.
+
+        Requirements:
+        - Width > 14px and height > 14px
+        - Width * height within [196, 36000000]
+        - Aspect ratio (width/height) within [1/150, 150]
+        - File size (local path) <= 10 MB
+
+        Args:
+            image_bytes: Raw image bytes
+            source_path: Original image path (for logging)
+
+        Returns:
+            True if the image satisfies all requirements, otherwise False
+        """
+        return is_valid_image(image_bytes, source_path)
+
+    @staticmethod
+    def _unwrap_link_destination(path: str) -> str:
+        """Return the path represented by a Markdown ``<destination>``."""
+        path = path.strip()
+        if len(path) >= 2 and path.startswith("<") and path.endswith(">"):
+            return path[1:-1]
+        return path
+
+    @classmethod
+    def _is_remote_uri(cls, path: str) -> bool:
+        """
+        Check if a path is a remote URI.
+
+        Args:
+            path: Path to check
+
+        Returns:
+            True if path starts with http://, https://, viking://, data:, or ftp://
+        """
+        remote_prefixes = ("http://", "https://", "viking://", "data:", "ftp://")
+        return cls._unwrap_link_destination(path).startswith(remote_prefixes)
+
+    @staticmethod
+    def _deduplicate_filename(filename: str, used_names: set[str]) -> str:
+        """
+        Generate a unique filename by appending _1, _2, etc. when collision occurs.
+
+        Args:
+            filename: Original filename
+            used_names: Set of already used filenames
+
+        Returns:
+            Unique filename
+        """
+        if filename not in used_names:
+            return filename
+
+        path_obj = Path(filename)
+        stem = path_obj.stem
+        suffix = path_obj.suffix
+        counter = 1
+
+        while True:
+            new_filename = f"{stem}_{counter}{suffix}"
+            if new_filename not in used_names:
+                return new_filename
+            counter += 1
+
     def _sanitize_for_path(self, text: str, max_length: int = 50) -> str:
         safe = re.sub(
-            r"[^\w\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af\u3400-\u4dbf\U00020000-\U0002a6df\s-]",
+            r"[^\w\u0080-\u02af\u0400-\u052f\u0600-\u077f\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af\u3400-\u4dbf\U00020000-\U0002a6df\s.-]",
             "",
             text,
         )
         safe = re.sub(r"\s+", "_", safe)
-        safe = safe.strip("_")
+        safe = safe.strip("._")
         if not safe:
             return "section"
         if len(safe) > max_length:
@@ -371,18 +1066,293 @@ class MarkdownParser(BaseParser):
             return f"{safe[: max_length - 9]}_{hash_suffix}"
         return safe
 
+    @staticmethod
+    def _doc_landing(layout: Dict[str, str]) -> Tuple[str, bool]:
+        """目标 .md 入库后的落点（相对其磁盘父目录），完全由真实 layout 推断，不对
+        parser 是否目录化做任何假设：
+
+        - 所有 section 收拢在同一公共目录下 → (该目录, True)，链接指向目录；
+        - 否则即单个裸文件（如未来小 .md 不再拆成目录）→ (该文件, False)，指向文件。
+
+        落点是文件还是目录、叫什么，全部由 in-memory parse 出来的 layout 结构决定；
+        parse_content 怎么改，这里自动跟随。
+        """
+        keys = list(layout)
+        first_segs = {k.split("/", 1)[0] for k in keys}
+        if len(first_segs) == 1 and all("/" in k for k in keys):
+            return first_segs.pop(), True
+        return keys[0], False
+
+    async def _rewrite_single_link(
+        self,
+        link: str,
+        src_dir: str,
+        import_root_abs: str,
+        source_new_dir: str,
+        rewrite_ctx: _RewriteContext,
+    ) -> str:
+        """Rewrite one link target; return original `link` if it must not change."""
+        raw = link.strip()
+        if (
+            not raw
+            or raw.startswith("#")
+            or raw.startswith("/")
+            or raw.startswith("mailto:")
+            or "://" in raw
+        ):
+            return link
+
+        m = _MD_FRAGMENT_RE.match(raw)
+        path_part = m.group(1)
+        suffix = m.group(2) or ""
+        if not path_part:
+            return link  # pure fragment/query
+
+        target_disk = os.path.normpath(os.path.join(src_dir, path_part))
+        if not os.path.exists(target_disk):
+            return link
+        try:
+            if os.path.commonpath([import_root_abs, target_disk]) != import_root_abs:
+                return link
+        except ValueError:
+            return link  # different drives, etc.
+
+        def _to_rel(new_disk: str, keep_suffix: bool) -> str:
+            r = os.path.relpath(new_disk, source_new_dir).replace(os.sep, "/")
+            return (r + suffix) if keep_suffix else (r if r.endswith("/") else r + "/")
+
+        ext = os.path.splitext(target_disk)[1].lower()
+        if ext not in _MD_DIR_EXTS:
+            # Non-.md target (image, sibling directory, ...): keep its path; only the
+            # source's added depth shifts the relative prefix.
+            return _to_rel(target_disk, keep_suffix=True)
+
+        # .md target → on ingest MarkdownParser turns it into some layout (a directory
+        # of section files, or — in future variants — a single file). Resolve against
+        # that REAL layout from an in-memory parse with the SAME parser: the landing
+        # (file vs directory), its name and the section files all come straight from
+        # the parser, so NOTHING about ingest is assumed here. Whatever parse_content
+        # does, running it in-memory tells us the final result.
+        layout = await self._target_split_files(target_disk, rewrite_ctx)
+        if not layout:
+            return link  # target unparsable → leave the link untouched
+
+        target_parent = os.path.dirname(target_disk)
+        landing, landing_is_dir = self._doc_landing(layout)
+
+        if suffix:
+            # A) #anchor uniquely located in a real section → point at that section file.
+            if suffix.startswith("#"):
+                anchor = suffix[1:]
+                hits = [
+                    rel
+                    for rel, text in layout.items()
+                    if any(
+                        _gh_slug(h) == anchor for h in re.findall(r"^#{1,6}\s+(.+)$", text, re.M)
+                    )
+                ]
+                if len(hits) == 1:
+                    return _to_rel(os.path.join(target_parent, hits[0]), keep_suffix=True)
+            # B) Single-file document (a bare file, or a directory holding exactly one
+            #    file) → the anchor/query lives in that one file; keep the suffix.
+            if len(layout) == 1:
+                return _to_rel(os.path.join(target_parent, next(iter(layout))), keep_suffix=True)
+
+        # C) Single bare file with no suffix to place (e.g. a future small .md kept as
+        #    a file) → point at the file itself (empty suffix ⇒ no trailing slash).
+        if not landing_is_dir:
+            return _to_rel(os.path.join(target_parent, landing), keep_suffix=True)
+        # D) Directory landing → point at the directory and drop any suffix.
+        return _to_rel(os.path.join(target_parent, landing), keep_suffix=False)
+
+    async def _ingest_will_handle_image(self, link: str, rewrite_ctx: _RewriteContext) -> bool:
+        """Whether ``_ingest_local_images`` will take this image reference: it must
+        resolve within base_dir/allowed_media_dirs AND pass image validation — the
+        exact conditions ingestion itself applies. Such embeds are left untouched so
+        #2429 can copy them next to the section and ``rewrite_image_uris`` can turn
+        them into viking:// URIs; everything else falls back to depth adjustment.
+        Results are cached per parse_content call."""
+        if link not in rewrite_ctx.image_probe_cache:
+            handled = False
+            resolved = self._resolve_image_path(
+                link, rewrite_ctx.base_dir, rewrite_ctx.allowed_media_dirs
+            )
+            if resolved is not None:
+                try:
+                    image_bytes = await asyncio.to_thread(resolved.read_bytes)
+                    handled = await asyncio.to_thread(self._is_valid_image, image_bytes, resolved)
+                except Exception:
+                    handled = False
+            rewrite_ctx.image_probe_cache[link] = handled
+        return rewrite_ctx.image_probe_cache[link]
+
+    async def _rewrite_relative_links(
+        self,
+        content: str,
+        *,
+        section_subpath: str,
+        rewrite_ctx: _RewriteContext,
+    ) -> str:
+        """Rewrite relative markdown links in `content` (disk-coordinate).
+
+        Image embeds (``![...]``) that ingestion will take are left untouched —
+        ``_ingest_local_images`` (PR #2429) copies them next to the section and
+        ``rewrite_image_uris`` later rewrites them to viking:// URIs. Image embeds
+        ingestion will NOT take (outside base_dir, missing, failing validation) get
+        the same depth adjustment as document links so they stay valid after the
+        document moves into its ingest directory.
+        """
+        from openviking.parse.image_rewrite import HTML_IMG_PATTERN
+
+        src_dir = os.path.dirname(os.path.abspath(rewrite_ctx.source_path))
+        import_root_abs = os.path.abspath(rewrite_ctx.import_root)
+        if rewrite_ctx.flatten_single_output:
+            source_new_dir = os.path.join(src_dir, section_subpath)
+        else:
+            source_new_dir = os.path.join(src_dir, rewrite_ctx.doc_name, section_subpath)
+
+        out: List[str] = []
+        last = 0
+        for match in _MD_LINK_RE.finditer(content):
+            out.append(content[last : match.start()])
+            bang, text, link = match.group(1), match.group(2), match.group(3)
+            if bang and await self._ingest_will_handle_image(link, rewrite_ctx):
+                new_link = link
+            else:
+                new_link = await self._rewrite_single_link(
+                    link, src_dir, import_root_abs, source_new_dir, rewrite_ctx
+                )
+            out.append(f"{bang}[{text}]({new_link})")
+            last = match.end()
+        out.append(content[last:])
+        rewritten = "".join(out)
+
+        # HTML <img src="..."> embeds get the same ownership split as ![...].
+        pieces: List[str] = []
+        last = 0
+        for match in HTML_IMG_PATTERN.finditer(rewritten):
+            pieces.append(rewritten[last : match.start()])
+            src = match.group(2)
+            if await self._ingest_will_handle_image(src, rewrite_ctx):
+                new_src = src
+            else:
+                new_src = await self._rewrite_single_link(
+                    src, src_dir, import_root_abs, source_new_dir, rewrite_ctx
+                )
+            pieces.append(f"{match.group(1)}{new_src}{match.group(3)}")
+            last = match.end()
+        pieces.append(rewritten[last:])
+        return "".join(pieces)
+
+    async def _target_split_files(
+        self, target_path: str, rewrite_ctx: _RewriteContext
+    ) -> Optional[Dict[str, str]]:
+        """The target's real ingest layout {"<doc_dir>/<section...>": text} via a
+        side-effect-free parse, cached per parse_content() call. None on parse failure."""
+        split_content = rewrite_ctx.split_content
+        flatten_single_output = rewrite_ctx.adaptive_flatten_requested
+        key = (os.path.abspath(target_path), split_content, flatten_single_output)
+        if key not in rewrite_ctx.split_cache:
+            rewrite_ctx.split_cache[key] = await self._probe_split_layout(
+                target_path,
+                split_content=split_content,
+                flatten_single_output=flatten_single_output,
+                allowed_media_dirs=rewrite_ctx.allowed_media_dirs,
+            )
+        return rewrite_ctx.split_cache[key]
+
+    async def _probe_split_layout(
+        self,
+        target_path: str,
+        *,
+        split_content: bool,
+        flatten_single_output: bool = False,
+        allowed_media_dirs: Optional[List[Path]] = None,
+    ) -> Optional[Dict[str, str]]:
+        """Plan the target's layout WITHOUT writing anything, returning
+        {"<doc_dir>/<section...>": text} keyed by path relative to the temp root, i.e.
+        INCLUDING the doc-root dir segment so callers can map each key straight onto
+        the target's parent dir. Reuses the pure phase-1 planner (_compute_layout)
+        with a throwaway temp URI, so no fake FS and no side effects are involved."""
+        try:
+            probe_root = "viking://temp/_probe"
+            content = self._read_file(target_path)
+            if flatten_single_output:
+                flatten_single_output = not await self._has_ingestable_local_image(
+                    content,
+                    base_dir=Path(target_path).parent,
+                    allowed_media_dirs=allowed_media_dirs,
+                )
+            layout = await self._compute_layout(
+                content,
+                probe_root,
+                source_path=str(target_path),
+                split_content=split_content,
+                flatten_single_output=flatten_single_output,
+            )
+            root = layout.temp_uri.rstrip("/")
+            out: Dict[str, str] = {}
+            for op in layout.ops:
+                if op.kind != "write" or not isinstance(op.content, str):
+                    continue
+                # rel = "<doc_dir>/<section...>" kept whole (temp_uri is the temp root,
+                # WITHOUT the doc-root dir), so it maps directly onto the target's
+                # parent directory on disk.
+                uri = op.uri
+                rel = uri[len(root) :].lstrip("/") if uri.startswith(root) else uri
+                out[rel] = op.content
+            return out
+        except Exception as exc:
+            logger.debug(f"[_probe_split_layout] failed for {target_path}: {exc}")
+            return None
+
+    def _section_subpath(self, uri: str, root_dir: str) -> str:
+        """Return the section file's directory path relative to root_dir (POSIX)."""
+        section_dir = uri.rsplit("/", 1)[0]
+        root = root_dir.rstrip("/")
+        if section_dir == root:
+            return ""
+        if section_dir.startswith(root + "/"):
+            return section_dir[len(root) + 1 :]
+        return ""
+
+    async def _write_section(
+        self,
+        uri: str,
+        content: str,
+        *,
+        writer: Optional[ParseArtifactWriter] = None,
+        rewrite_ctx: Optional[_RewriteContext] = None,
+    ) -> str:
+        """Write a markdown section file, rewriting relative links when enabled."""
+        if rewrite_ctx is not None:
+            content = await self._rewrite_relative_links(
+                content,
+                section_subpath=self._section_subpath(uri, rewrite_ctx.root_dir),
+                rewrite_ctx=rewrite_ctx,
+            )
+        if writer is None:
+            writer = ParseArtifactWriter(
+                AgfsParseOutputStore(viking_fs=self._get_viking_fs()),
+                ParseArtifactRef(backend="agfs", root=uri.rsplit("/", 1)[0]),
+            )
+        await writer.write_text(uri, content)
+        return content
+
     # ========== New Parsing Logic (v5.0) ==========
 
-    async def _parse_and_create_structure(
+    async def _build_structure(
         self,
+        ops: List[_LayoutOp],
         content: str,
         headings: List[Tuple[int, int, str, int]],
         root_dir: str,
         source_path: Optional[str] = None,
         doc_name: Optional[str] = None,
+        split_content: bool = True,
     ) -> None:
         """
-        Parse markdown and create directory structure directly in VikingFS.
+        Plan the document's directory/file layout into ``ops`` (no VikingFS writes).
 
         Logic:
         - Small files (< MAX_SECTION_SIZE): single file with original name
@@ -392,63 +1362,64 @@ class MarkdownParser(BaseParser):
         - Oversized sections without subsections: split by paragraphs
 
         Args:
+            ops: Accumulator the planned mkdir/write operations are appended to
             content: Markdown content
             headings: List of (start, end, title, level) tuples
             root_dir: Root directory URI
             source_path: Source file path for naming
+            split_content: Whether large Markdown may be split into multiple files
         """
-        viking_fs = self._get_viking_fs()
-        max_size = self.config.max_section_size or self.DEFAULT_MAX_SECTION_SIZE
+        max_size = self.config.max_section_chars
         max_chars = self.config.max_section_chars
-        min_size = self.DEFAULT_MIN_SECTION_TOKENS
-
-        # Estimate document size
-        estimated_tokens = self._estimate_token_count(content)
-        logger.info(f"[MarkdownParser] Document size: {estimated_tokens} tokens")
+        min_size = self.DEFAULT_MIN_SECTION_CHARS
 
         # Create root directory
-        await viking_fs.mkdir(root_dir)
+        ops.append(_LayoutOp("mkdir", root_dir))
 
         # Get document name
         doc_name = doc_name or self._sanitize_for_path(
-            Path(source_path).stem if source_path else "content"
+            _smart_stem(source_path) if source_path else "content"
         )
 
-        # Small document: save as single file (check both token and char limits)
-        if estimated_tokens <= max_size and len(content) <= max_chars:
+        if not split_content:
             file_path = f"{root_dir}/{doc_name}.md"
-            await viking_fs.write_file(file_path, content)
-            logger.debug(f"[MarkdownParser] Small document saved as: {file_path}")
+            ops.append(_LayoutOp("write", file_path, content))
+            logger.debug(f"[MarkdownParser] No-split document planned as: {file_path}")
+            return
+
+        # Small document: save as single file (character budget)
+        if len(content) <= max_chars:
+            file_path = f"{root_dir}/{doc_name}.md"
+            ops.append(_LayoutOp("write", file_path, content))
             return
 
         # No headings: split by paragraphs
         if not headings:
-            logger.info("[MarkdownParser] No headings, splitting by paragraphs")
             parts = self._smart_split_content(content, max_size)
             for part_idx, part in enumerate(parts, 1):
-                await viking_fs.write_file(f"{root_dir}/{doc_name}_{part_idx}.md", part)
-            logger.debug(f"[MarkdownParser] Split into {len(parts)} parts")
+                ops.append(_LayoutOp("write", f"{root_dir}/{doc_name}_{part_idx}.md", part))
             return
 
-        # Build virtual section list (pre-heading content as first virtual section)
+        # Build virtual section list (content before the first top-level heading,
+        # including any lower-level headings there, is the first virtual section)
         sections = []
-        first_heading_start = headings[0][0]
+        min_level = min(h[3] for h in headings)
+        first_heading_start = next(h[0] for h in headings if h[3] == min_level)
         if first_heading_start > 0:
             pre_content = content[:first_heading_start].strip()
             if pre_content:
-                pre_tokens = self._estimate_token_count(pre_content)
+                pre_chars = len(pre_content)
                 sections.append(
                     {
                         "name": doc_name,
                         "content": pre_content,
-                        "tokens": pre_tokens,
+                        "chars": pre_chars,
                         "has_children": False,
                         "heading_idx": None,
                     }
                 )
 
         # Add real sections (top-level only for this pass)
-        min_level = min(h[3] for h in headings)
         i = 0
         while i < len(headings):
             if headings[i][3] == min_level:
@@ -461,11 +1432,12 @@ class MarkdownParser(BaseParser):
 
         # Process sections with merge logic
         await self._process_sections_with_merge(
-            content, headings, root_dir, sections, doc_name, max_size, min_size
+            ops, content, headings, root_dir, sections, doc_name, max_size, min_size
         )
 
     async def _process_sections_with_merge(
         self,
+        ops: List[_LayoutOp],
         content: str,
         headings: List[Tuple[int, int, str, int]],
         parent_dir: str,
@@ -474,9 +1446,7 @@ class MarkdownParser(BaseParser):
         max_size: int,
         min_size: int,
     ) -> None:
-        """Process sections with small section merge logic."""
-        viking_fs = self._get_viking_fs()
-
+        """Plan sections into ``ops`` with small-section merge logic (no writes)."""
         # Expand section info
         expanded = [
             section
@@ -486,54 +1456,121 @@ class MarkdownParser(BaseParser):
         ]
 
         pending = []
+        buffered_section = None
+
+        async def flush_buffered() -> None:
+            nonlocal buffered_section
+            if buffered_section is not None:
+                await self._save_section(
+                    ops,
+                    content,
+                    headings,
+                    parent_dir,
+                    buffered_section,
+                    max_size,
+                    min_size,
+                )
+                buffered_section = None
+
         for sec in expanded:
-            name, tokens, content_text = sec["name"], sec["tokens"], sec["content"]
+            name, chars, content_text = sec["name"], sec["chars"], sec["content"]
             has_children = sec["has_children"]
 
             # Handle small sections
-            if tokens < min_size:
-                pending = await self._try_add_to_pending(
-                    viking_fs, parent_dir, pending, (name, content_text, tokens), max_size
-                )
+            if chars < min_size:
+                if pending and sum(t for _, _, t in pending) + chars > max_size:
+                    await flush_buffered()
+                    await self._save_merged(ops, parent_dir, pending)
+                    pending = []
+                pending.append((name, content_text, chars))
                 continue
 
-            # Try merge with pending
-            if pending and self._can_merge(pending, tokens, max_size, has_children):
-                pending.append((name, content_text, tokens))
-                await self._save_merged(viking_fs, parent_dir, pending)
-                pending = []
-                continue
+            if pending:
+                await flush_buffered()
 
-            # Save pending and process current section
-            pending = await self._flush_pending(viking_fs, parent_dir, pending)
-            await self._save_section(content, headings, parent_dir, sec, max_size, min_size)
+                # Try merge with pending
+                if self._can_merge(pending, chars, max_size, has_children):
+                    pending.append((name, content_text, chars))
+                    await self._save_merged(ops, parent_dir, pending)
+                    pending = []
+                    continue
 
-        # Save remaining pending
-        await self._flush_pending(viking_fs, parent_dir, pending)
+                # Avoid flushing a single tiny section as a standalone low-value file.
+                if self._should_merge_pending_into_next(pending):
+                    sec = self._merge_pending_into_next_section(pending, sec)
+                    pending = []
+                else:
+                    await self._save_merged(ops, parent_dir, pending)
+                    pending = []
+            else:
+                await flush_buffered()
 
-    def _can_merge(self, pending: List, tokens: int, max_size: int, has_children: bool) -> bool:
-        """Check if section can merge with pending."""
-        return sum(t for _, _, t in pending) + tokens <= max_size and not has_children
+            buffered_section = sec
 
-    async def _try_add_to_pending(
-        self, viking_fs, parent_dir: str, pending: List, item: Tuple, max_size: int
-    ) -> List:
-        """Try add item to pending, flush if would exceed max_size."""
-        name, content, tokens = item
-        if pending and sum(t for _, _, t in pending) + tokens > max_size:
-            await self._save_merged(viking_fs, parent_dir, pending)
-            pending = []
-        pending.append(item)
-        return pending
-
-    async def _flush_pending(self, viking_fs, parent_dir: str, pending: List) -> List:
-        """Flush pending sections and return empty list."""
         if pending:
-            await self._save_merged(viking_fs, parent_dir, pending)
-        return []
+            # No next section exists. Fold a single tiny pending section back into
+            # the previous saved candidate instead of emitting a standalone file.
+            if buffered_section is not None and self._should_merge_pending_into_next(pending):
+                buffered_section = self._merge_pending_into_previous_section(
+                    buffered_section, pending
+                )
+                pending = []
+            else:
+                await flush_buffered()
+                await self._save_merged(ops, parent_dir, pending)
+                pending = []
+
+        await flush_buffered()
+
+    def _can_merge(self, pending: List, chars: int, max_size: int, has_children: bool) -> bool:
+        """Check if section can merge with pending."""
+        return sum(t for _, _, t in pending) + chars <= max_size and not has_children
+
+    def _should_merge_pending_into_next(self, pending: List[Tuple[str, str, int]]) -> bool:
+        """Prefer folding a single tiny pending section into the next section."""
+        return len(pending) == 1 and pending[0][2] <= self.DEFAULT_MIN_SECTION_CHARS
+
+    def _merge_pending_into_next_section(
+        self, pending: List[Tuple[str, str, int]], section: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Attach a tiny pending section to the following section."""
+        _, pending_content, _ = pending[0]
+        merged = dict(section)
+        merged["content"] = f"{pending_content}\n\n{section['content']}".strip()
+        merged["chars"] = len(merged["content"])
+
+        if merged.get("has_children"):
+            direct_content = section.get("direct_content", "").strip()
+            merged["direct_content"] = (
+                f"{pending_content}\n\n{direct_content}".strip()
+                if direct_content
+                else pending_content
+            )
+
+        return merged
+
+    def _merge_pending_into_previous_section(
+        self, section: Dict[str, Any], pending: List[Tuple[str, str, int]]
+    ) -> Dict[str, Any]:
+        """Attach a tiny trailing pending section back into the previous section."""
+        _, pending_content, _ = pending[0]
+        merged = dict(section)
+        merged["content"] = f"{section['content']}\n\n{pending_content}".strip()
+        merged["chars"] = len(merged["content"])
+
+        if merged.get("has_children"):
+            direct_content = section.get("direct_content", "").strip()
+            merged["direct_content"] = (
+                f"{direct_content}\n\n{pending_content}".strip()
+                if direct_content
+                else pending_content
+            )
+
+        return merged
 
     async def _save_section(
         self,
+        ops: List[_LayoutOp],
         content: str,
         headings: List[Tuple[int, int, str, int]],
         parent_dir: str,
@@ -541,30 +1578,29 @@ class MarkdownParser(BaseParser):
         max_size: int,
         min_size: int,
     ) -> None:
-        """Save a single section (file or directory)."""
-        viking_fs = self._get_viking_fs()
-        name, tokens, content_text = section["name"], section["tokens"], section["content"]
+        """Plan a single section (file or directory) into ``ops``."""
+        name, content_text = section["name"], section["content"]
         has_children = section["has_children"]
 
-        # Fits in one file (check both token and char limits)
-        if tokens <= max_size and len(content_text) <= self.config.max_section_chars:
-            await viking_fs.write_file(f"{parent_dir}/{name}.md", content_text)
-            logger.debug(f"[MarkdownParser] Saved: {name}.md")
+        # Fits in one file (character budget)
+        if len(content_text) <= max_size:
+            ops.append(_LayoutOp("write", f"{parent_dir}/{name}.md", content_text))
             return
 
         # Create directory and handle children or split
         section_dir = f"{parent_dir}/{name}"
-        await viking_fs.mkdir(section_dir, exist_ok=True)
+        ops.append(_LayoutOp("mkdir", section_dir, exist_ok=True))
 
         if has_children:
             await self._process_children(
-                content, headings, section_dir, section, name, max_size, min_size
+                ops, content, headings, section_dir, section, name, max_size, min_size
             )
         else:
-            await self._split_content(viking_fs, section_dir, name, content_text, max_size)
+            await self._split_content(ops, section_dir, name, content_text, max_size)
 
     async def _process_children(
         self,
+        ops: List[_LayoutOp],
         content: str,
         headings: List[Tuple[int, int, str, int]],
         section_dir: str,
@@ -573,14 +1609,14 @@ class MarkdownParser(BaseParser):
         max_size: int,
         min_size: int,
     ) -> None:
-        """Build and process child sections."""
+        """Build and plan child sections into ``ops``."""
         children = []
         if section.get("direct_content"):
             children.append(
                 {
                     "name": name,
                     "content": section["direct_content"],
-                    "tokens": self._estimate_token_count(section["direct_content"]),
+                    "chars": len(section["direct_content"]),
                     "has_children": False,
                     "heading_idx": None,
                 }
@@ -589,17 +1625,16 @@ class MarkdownParser(BaseParser):
             children.append({"heading_idx": child_idx})
 
         await self._process_sections_with_merge(
-            content, headings, section_dir, children, name, max_size, min_size
+            ops, content, headings, section_dir, children, name, max_size, min_size
         )
 
     async def _split_content(
-        self, viking_fs, section_dir: str, name: str, content: str, max_size: int
+        self, ops: List[_LayoutOp], section_dir: str, name: str, content: str, max_size: int
     ) -> None:
-        """Split content by paragraphs."""
-        logger.info(f"[MarkdownParser] Splitting: {name}")
+        """Split content by paragraphs, planning each part as a write into ``ops``."""
         parts = self._smart_split_content(content, max_size)
         for i, part in enumerate(parts, 1):
-            await viking_fs.write_file(f"{section_dir}/{name}_{i}.md", part)
+            ops.append(_LayoutOp("write", f"{section_dir}/{name}_{i}.md", part))
 
     def _generate_merged_filename(self, sections: List[Tuple[str, str, int]]) -> str:
         """
@@ -640,28 +1675,24 @@ class MarkdownParser(BaseParser):
         return name or "merged"
 
     async def _save_merged(
-        self, viking_fs, parent_dir: str, sections: List[Tuple[str, str, int]]
+        self, ops: List[_LayoutOp], parent_dir: str, sections: List[Tuple[str, str, int]]
     ) -> None:
-        """Save merged sections as single file with smart naming.
+        """Plan merged sections as a single file with smart naming into ``ops``.
 
-        If the joined content exceeds max_section_chars it is split further
-        by _smart_split_content before writing, so no single file ever exceeds
-        the hard character limit.
+        If the joined content exceeds max_section_chars it is split further by
+        _smart_split_content before writing. A single oversized Markdown table row
+        remains intact to preserve the source table structure.
         """
         name = self._generate_merged_filename(sections)
         content = "\n\n".join(c for _, c, _ in sections)
         max_chars = self.config.max_section_chars
         if len(content) > max_chars:
-            max_size = self.config.max_section_size or self.DEFAULT_MAX_SECTION_SIZE
+            max_size = self.config.max_section_chars
             parts = self._smart_split_content(content, max_size)
             for i, part in enumerate(parts, 1):
-                await viking_fs.write_file(f"{parent_dir}/{name}_{i}.md", part)
-            logger.debug(
-                f"[MarkdownParser] Merged then split: {name} ({len(sections)} sections → {len(parts)} parts)"
-            )
+                ops.append(_LayoutOp("write", f"{parent_dir}/{name}_{i}.md", part))
         else:
-            await viking_fs.write_file(f"{parent_dir}/{name}.md", content)
-            logger.debug(f"[MarkdownParser] Merged: {name}.md ({len(sections)} sections)")
+            ops.append(_LayoutOp("write", f"{parent_dir}/{name}.md", content))
 
     def _get_section_info(
         self,
@@ -670,7 +1701,7 @@ class MarkdownParser(BaseParser):
         idx: int,
     ) -> Dict[str, Any]:
         """
-        Get section info including content, tokens, children info.
+        Get section info including content, chars, children info.
 
         Args:
             content: Full markdown content
@@ -709,7 +1740,7 @@ class MarkdownParser(BaseParser):
         heading_prefix = "#" * level
         section_start = end_pos  # After heading line
         full_content = f"{heading_prefix} {title}\n\n{content[section_start:section_end].strip()}"
-        full_tokens = self._estimate_token_count(full_content)
+        full_chars = len(full_content)
 
         direct_content = ""
         if has_children:
@@ -720,17 +1751,9 @@ class MarkdownParser(BaseParser):
         return {
             "name": section_name,
             "content": full_content,
-            "tokens": full_tokens,
+            "chars": full_chars,
             "has_children": has_children,
             "heading_idx": idx,
             "direct_content": direct_content,
             "child_indices": child_indices,
         }
-
-    def _estimate_token_count(self, content: str) -> int:
-        # CJK characters (Chinese, Japanese, Korean): ~0.7 token per char
-        # Other characters (including Latin, Arabic, Cyrillic, etc.): ~0.3 token per char
-        # This provides better coverage for multilingual documents
-        cjk_chars = len(re.findall(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", content))
-        other_chars = len(re.findall(r"[^\s]", content)) - cjk_chars
-        return int(cjk_chars * 0.7 + other_chars * 0.3)

@@ -4,10 +4,23 @@
 """Test if config validators work correctly"""
 
 import sys
+from pathlib import Path
 
+import pytest
+
+from openviking.utils.agfs_utils import (
+    RagfsBindingConfig,
+    _generate_plugin_config,
+    create_agfs_client,
+    mount_agfs_backend,
+)
 from openviking_cli.utils.config.agfs_config import AGFSConfig, S3Config
+from openviking_cli.utils.config.cache_config import CacheConfig
+from openviking_cli.utils.config.consts import OPENVIKING_CONFIG_ENV
 from openviking_cli.utils.config.embedding_config import EmbeddingConfig, EmbeddingModelConfig
-from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
+from openviking_cli.utils.config.open_viking_config import OpenVikingConfig
+from openviking_cli.utils.config.storage_config import StorageConfig
+from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig, VolcengineConfig
 from openviking_cli.utils.config.vlm_config import VLMConfig
 
 
@@ -24,6 +37,74 @@ def test_agfs_validation():
         print(f"   Pass (path={config.path})")
     except ValueError as e:
         print(f"   Fail: {e}")
+
+
+def test_agfs_s3_normalize_encoding_chars_defaults_to_target_set():
+    config = AGFSConfig(
+        backend="s3",
+        s3=S3Config(
+            bucket="my-bucket",
+            region="us-west-1",
+            access_key="fake-access-key-for-testing",
+            secret_key="fake-secret-key-for-testing-12345",
+            endpoint="https://s3.amazonaws.com",
+        ),
+    )
+
+    assert config.s3.normalize_encoding_chars == "?#%+@"
+
+
+def test_agfs_s3_normalize_encoding_chars_is_forwarded_to_ragfs_plugin_config():
+    config = AGFSConfig(
+        path="/tmp/ov-test",
+        backend="s3",
+        s3=S3Config(
+            bucket="my-bucket",
+            region="us-west-1",
+            access_key="fake-access-key-for-testing",
+            secret_key="fake-secret-key-for-testing-12345",
+            endpoint="https://s3.amazonaws.com",
+            normalize_encoding_chars="?#",
+        ),
+    )
+
+    plugins = _generate_plugin_config(config, Path("/tmp/ov-test"))
+
+    assert plugins["s3fs"]["config"]["normalize_encoding_chars"] == "?#"
+
+
+def test_agfs_s3_auto_detect_content_type_defaults_to_false():
+    config = AGFSConfig(
+        backend="s3",
+        s3=S3Config(
+            bucket="my-bucket",
+            region="us-west-1",
+            access_key="fake-access-key-for-testing",
+            secret_key="fake-secret-key-for-testing-12345",
+            endpoint="https://s3.amazonaws.com",
+        ),
+    )
+
+    assert config.s3.auto_detect_content_type is False
+
+
+def test_agfs_s3_auto_detect_content_type_is_forwarded_to_ragfs_plugin_config():
+    config = AGFSConfig(
+        path="/tmp/ov-test",
+        backend="s3",
+        s3=S3Config(
+            bucket="my-bucket",
+            region="us-west-1",
+            access_key="fake-access-key-for-testing",
+            secret_key="fake-secret-key-for-testing-12345",
+            endpoint="https://s3.amazonaws.com",
+            auto_detect_content_type=True,
+        ),
+    )
+
+    plugins = _generate_plugin_config(config, Path("/tmp/ov-test"))
+
+    assert plugins["s3fs"]["config"]["auto_detect_content_type"] is True
 
     # Test 2: invalid backend
     print("\n2. Test invalid backend...")
@@ -59,6 +140,846 @@ def test_agfs_validation():
         print(f"   Fail: {e}")
 
 
+@pytest.mark.parametrize(
+    ("queuefs", "expected"),
+    [
+        (
+            None,
+            {
+                "mode": "shared",
+                "backend": "sqlite",
+                "recover_stale_sec": 0,
+                "busy_timeout_ms": 5000,
+            },
+        ),
+        (
+            {"mode": "worker", "backend": "memory"},
+            {
+                "mode": "worker",
+                "backend": "memory",
+                "recover_stale_sec": 0,
+                "busy_timeout_ms": 5000,
+            },
+        ),
+    ],
+)
+def test_agfs_queuefs_validation_accepts_supported_shapes(queuefs, expected):
+    config_kwargs = {"path": "/tmp/ov-test", "backend": "local"}
+    if queuefs is not None:
+        config_kwargs["queuefs"] = queuefs
+
+    config = AGFSConfig(**config_kwargs)
+
+    assert config.queuefs.mode == expected["mode"]
+    assert config.queuefs.backend == expected["backend"]
+    assert config.queuefs.recover_stale_sec == expected["recover_stale_sec"]
+    assert config.queuefs.busy_timeout_ms == expected["busy_timeout_ms"]
+
+
+@pytest.mark.parametrize(
+    ("queuefs", "match"),
+    [
+        ({"mode": "process"}, "queuefs mode"),
+        ({"backend": "bogus"}, "queuefs"),
+        ({"busy_timeout_ms": -1}, "busy_timeout_ms"),
+        ({"recover_stale_sec": -1}, "recover_stale_sec"),
+        ({"backend": "redis", "redis": {"key_prefix": ""}}, "redis"),
+    ],
+)
+def test_agfs_queuefs_validation_rejects_invalid_shapes(queuefs, match):
+    with pytest.raises(ValueError, match=match):
+        AGFSConfig(path="/tmp/ov-test", backend="local", queuefs=queuefs)
+
+
+def test_top_level_cache_provider_params_build_redis_binding_config():
+    assert OpenVikingConfig.from_dict({}).service_name == "openviking-server"
+
+    config = OpenVikingConfig.from_dict(
+        {
+            "service_name": "tenant-a",
+            "cache": {
+                "provider": "redis",
+                "params": {
+                    "mode": "sentinel",
+                    "endpoints": [
+                        "redis://sentinel-1:26379",
+                        "redis://sentinel-2:26379",
+                    ],
+                    "master_name": "mymaster",
+                    "command_timeout_ms": 1000,
+                },
+            },
+            "storage": {
+                "workspace": "/tmp/ov-test",
+                "agfs": {"cachefs": {"backend": "cache"}},
+            },
+        }
+    )
+
+    binding = RagfsBindingConfig(
+        agfs=config.storage.agfs,
+        cache=config.cache,
+        service_name=config.service_name,
+    ).to_binding_dict()
+
+    assert config.cache.provider == "redis"
+    assert config.cache.params["mode"] == "sentinel"
+    assert binding["service_name"] == "tenant-a"
+    assert binding["cache"]["enabled"] is True
+    assert binding["cache"]["runtime_enabled"] is True
+    assert binding["cache"]["provider"] == "redis"
+    assert binding["cache"]["redis"]["mode"] == "sentinel"
+    assert binding["cache"]["redis"]["master_name"] == "mymaster"
+
+
+def test_queuefs_cache_uses_top_level_provider_without_enabling_cachefs():
+    config = OpenVikingConfig.model_validate(
+        {
+            "service_name": "queue-runtime",
+            "cache": {
+                "provider": "redis",
+                "params": {"endpoints": ["redis://redis:6379"]},
+            },
+            "storage": {
+                "workspace": "/tmp/ov-test",
+                "agfs": {
+                    "cachefs": {"backend": "local"},
+                    "queuefs": {"backend": "cache"},
+                },
+            },
+        }
+    )
+
+    binding = RagfsBindingConfig(
+        agfs=config.storage.agfs,
+        cache=config.cache,
+        service_name=config.service_name,
+    ).to_binding_dict()
+
+    assert binding["cache"]["enabled"] is False
+    assert binding["cache"]["runtime_enabled"] is True
+    assert binding["cache"]["redis"]["endpoints"] == ["redis://redis:6379"]
+
+    plugins = _generate_plugin_config(
+        config.storage.agfs,
+        Path("/tmp/ov-test"),
+        service_name=config.service_name,
+    )
+    assert plugins["queuefs"]["config"]["service_name"] == "queue-runtime"
+
+
+def test_top_level_cache_params_ignore_removed_replica_read_config():
+    config = OpenVikingConfig.model_validate(
+        {
+            "cache": {
+                "provider": "redis",
+                "params": {
+                    "mode": "cluster",
+                    "endpoints": [
+                        "redis://cluster-1:6379",
+                        "redis://cluster-2:6379",
+                    ],
+                    "db": 0,
+                    "read_from_replica": True,
+                },
+            },
+            "storage": {"agfs": {"queuefs": {"backend": "cache"}}},
+        }
+    )
+
+    binding = RagfsBindingConfig(
+        agfs=config.storage.agfs,
+        cache=config.cache,
+    ).to_binding_dict()
+    assert "read_from_replica" not in binding["cache"]["redis"]
+
+
+def test_cache_backend_requires_top_level_cache_config():
+    with pytest.raises(ValueError, match="top-level cache config"):
+        OpenVikingConfig.model_validate(
+            {
+                "storage": {
+                    "workspace": "/tmp/ov-test",
+                    "agfs": {"cachefs": {"backend": "cache"}},
+                }
+            }
+        )
+
+
+def test_top_level_cache_repr_hides_provider_params():
+    config = CacheConfig(
+        provider="redis",
+        params={"password": "top-secret"},
+    )
+
+    assert "top-secret" not in repr(config)
+
+
+def test_unused_top_level_cache_does_not_parse_provider_params():
+    config = OpenVikingConfig.model_validate(
+        {
+            "cache": {
+                "provider": "future-provider",
+                "params": {"provider_owned": True},
+            }
+        }
+    )
+
+    binding = RagfsBindingConfig(
+        agfs=config.storage.agfs,
+        cache=config.cache,
+    ).to_binding_dict()
+
+    assert binding["cache"]["enabled"] is False
+    assert binding["cache"]["runtime_enabled"] is False
+    assert binding["cache"]["provider"] == "redis"
+
+
+def test_openviking_config_dump_uses_only_canonical_cache_schema():
+    config = OpenVikingConfig.model_validate(
+        {
+            "cache": {"provider": "redis", "params": {}, "enabled": True},
+            "storage": {"agfs": {"cachefs": {"backend": "cache"}}},
+        }
+    )
+
+    dumped = config.model_dump(mode="json")
+
+    assert dumped["cache"] == {"provider": "redis", "params": {}}
+    assert dumped["storage"]["agfs"]["cachefs"]["backend"] == "cache"
+    assert "cache" not in dumped["storage"]["agfs"]
+
+
+def test_openviking_config_rejects_removed_queuefs_redis_schema():
+    with pytest.raises(ValueError, match="backend='redis'.*removed"):
+        OpenVikingConfig.model_validate(
+            {
+                "storage": {
+                    "agfs": {
+                        "queuefs": {
+                            "backend": "redis",
+                            "redis": {"endpoints": ["redis://redis:6379"]},
+                        }
+                    }
+                }
+            }
+        )
+
+
+def test_rediss_scheme_enables_tls_without_boolean_flag():
+    config = OpenVikingConfig.model_validate(
+        {
+            "cache": {
+                "provider": "redis",
+                "params": {"endpoints": ["rediss://redis.example.com:6380"]},
+            },
+            "storage": {"agfs": {"cachefs": {"backend": "cache"}}},
+        }
+    )
+
+    binding = RagfsBindingConfig(config.storage.agfs, cache=config.cache).to_binding_dict()
+
+    assert binding["cache"]["redis"]["endpoints"] == ["rediss://redis.example.com:6380"]
+    assert "tls_enabled" not in binding["cache"]["redis"]
+
+
+@pytest.mark.parametrize(
+    ("queuefs", "queue_db_path", "expected"),
+    [
+        (
+            {"backend": "memory"},
+            None,
+            {"backend": "memory", "db_path": None},
+        ),
+        (
+            {"backend": "sqlite", "db_path": "/tmp/new-queue.db"},
+            "/tmp/legacy-queue.db",
+            {"backend": "sqlite", "db_path": str(Path("/tmp/new-queue.db").resolve())},
+        ),
+        (
+            None,
+            "/tmp/legacy-queue.db",
+            {"backend": "sqlite", "db_path": str(Path("/tmp/legacy-queue.db").resolve())},
+        ),
+        (
+            None,
+            None,
+            {"backend": "sqlite", "db_path": "/tmp/ov-test/_system/queue/queue.db"},
+        ),
+        (
+            {"backend": "memory", "db_path": "/tmp/new-queue.db"},
+            "/tmp/legacy-queue.db",
+            {"backend": "memory", "db_path": None},
+        ),
+    ],
+)
+def test_generate_plugin_config_materializes_queuefs_paths(queuefs, queue_db_path, expected):
+    config_kwargs = {
+        "path": "/tmp/ov-test",
+        "backend": "local",
+        "queue_db_path": queue_db_path,
+    }
+    if queuefs is not None:
+        config_kwargs["queuefs"] = queuefs
+
+    config = AGFSConfig(**config_kwargs)
+    plugins = _generate_plugin_config(config, Path("/tmp/ov-test"))
+
+    queuefs_config = plugins["queuefs"]["config"]
+    assert queuefs_config["backend"] == expected["backend"]
+    if expected["db_path"] is None:
+        assert "db_path" not in queuefs_config
+    else:
+        assert queuefs_config["db_path"] == expected["db_path"]
+
+
+def test_generate_plugin_config_forwards_queuefs_runtime_options():
+    config = AGFSConfig(
+        path="/tmp/ov-test",
+        backend="local",
+        queuefs={
+            "backend": "sqlite3",
+            "recover_stale_sec": 17,
+            "busy_timeout_ms": 1234,
+        },
+    )
+
+    plugins = _generate_plugin_config(config, Path("/tmp/ov-test"))
+
+    assert plugins["queuefs"]["config"]["backend"] == "sqlite3"
+    assert plugins["queuefs"]["config"]["recover_stale_sec"] == 17
+    assert plugins["queuefs"]["config"]["busy_timeout_ms"] == 1234
+
+
+def test_agfs_redirects_without_backups_are_parse_only():
+    """Legacy redirects must remain constructible without enabling multi-write."""
+    redirects = [
+        {
+            "type": "FileExtensionPolicy",
+            "extensions": ["(md)"],
+            "target": ["missing-backup"],
+        }
+    ]
+
+    config = AGFSConfig(
+        path="/tmp/ov-test",
+        backend="local",
+        redirects=redirects,
+    )
+
+    assert config.redirects == redirects
+
+
+def test_generate_plugin_config_ignores_redirects_without_backups(tmp_path):
+    """Legacy redirects must not alter a single-backend mount config."""
+    redirects = [
+        {
+            "type": "FileExtensionPolicy",
+            "extensions": ["(md)"],
+            "target": ["missing-backup"],
+        }
+    ]
+    config = AGFSConfig(path=str(tmp_path), backend="local", redirects=redirects)
+    plain_config = AGFSConfig(path=str(tmp_path), backend="local")
+
+    mount_config = _generate_plugin_config(config, tmp_path)["localfs"]["config"]
+    plain_mount_config = _generate_plugin_config(plain_config, tmp_path)["localfs"]["config"]
+
+    assert mount_config == plain_mount_config
+
+
+def test_generate_plugin_config_ignores_redirects_with_backups(tmp_path):
+    """Legacy redirects must remain accepted without reaching Rust."""
+    redirects = [
+        {
+            "type": "FileExtensionPolicy",
+            "extensions": ["(md)"],
+            "target": ["missing-backup"],
+        }
+    ]
+    config = AGFSConfig(
+        path=str(tmp_path),
+        backend="local",
+        backups={"items": [{"name": "mem-backup", "backend": "memory"}]},
+        redirects=redirects,
+    )
+
+    mount_config = _generate_plugin_config(config, tmp_path)["localfs"]["config"]
+
+    assert "primary_redirects" not in mount_config
+
+
+def test_generate_plugin_config_passes_multiwrite_encryption_flag(tmp_path):
+    """Multi-write mount config must reflect the real server encryption state."""
+    config = AGFSConfig(
+        path=str(tmp_path),
+        backend="local",
+        backups={
+            "items": [
+                {
+                    "name": "mem-backup",
+                    "backend": "memory",
+                }
+            ]
+        },
+    )
+
+    plugins = _generate_plugin_config(config, tmp_path, server_encryption_enabled=True)
+
+    mount_config = plugins["localfs"]["config"]
+    assert mount_config["server_encryption_enabled"] is True
+    assert mount_config["primary_encryption_enabled"] is True
+
+
+def test_generate_plugin_config_preserves_v2_backups_without_sync_type(tmp_path):
+    """V2 backup fields must pass through without injecting a V1 sync mode."""
+    config = AGFSConfig(
+        path=str(tmp_path),
+        backend="local",
+        backups={
+            "initial_partitions": 32,
+            "checkpoint_interval_secs": 120,
+            "provider": "filesystem",
+            "items": [{"name": "mem-backup", "backend": "memory"}],
+        },
+    )
+
+    backups = _generate_plugin_config(config, tmp_path)["localfs"]["config"]["backups"]
+
+    assert backups["initial_partitions"] == 32
+    assert backups["checkpoint_interval_secs"] == 120
+    assert backups["provider"] == "filesystem"
+    assert "sync_type" not in backups
+
+
+@pytest.mark.parametrize("provider", ["filesystem", "cache"])
+def test_agfs_config_accepts_supported_v2_backup_providers(provider):
+    """AGFS config must accept each specified metadata provider."""
+    config = AGFSConfig(
+        path="/tmp/ov-test",
+        backend="local",
+        backups={"provider": provider, "items": []},
+    )
+
+    assert config.backups["provider"] == provider
+
+
+@pytest.mark.parametrize(
+    ("backups", "expected"),
+    [
+        ({"initial_partitions": 0, "items": []}, "initial_partitions"),
+        ({"initial_partitions": 1025, "items": []}, "initial_partitions"),
+        ({"checkpoint_interval_secs": 59, "items": []}, "checkpoint_interval_secs"),
+        ({"provider": "memory", "items": []}, "provider"),
+        ({"provider": "redis", "items": []}, "provider"),
+        ({"items": [{"name": " ", "backend": "memory"}]}, "name"),
+        ({"items": [{"name": "primary", "backend": "memory"}]}, "primary"),
+        (
+            {
+                "items": [
+                    {"name": "backup-a", "backend": "memory"},
+                    {"name": "backup-a", "backend": "memory"},
+                ]
+            },
+            "unique",
+        ),
+    ],
+)
+def test_agfs_config_rejects_invalid_v2_backups(backups, expected):
+    """AGFS config must reject invalid V2 backup fields before Rust startup."""
+    with pytest.raises(ValueError, match=expected):
+        AGFSConfig(path="/tmp/ov-test", backend="local", backups=backups)
+
+
+def test_generate_plugin_config_strips_legacy_multiwrite_fields(tmp_path):
+    """Plugin config generation should strip legacy fields before calling Rust."""
+    explicit_backup_dir = tmp_path / "backup-local-no-mkdir"
+    config = AGFSConfig(
+        path=str(tmp_path),
+        backend="local",
+        backups={
+            "sync_type": "async",
+            "write_ack_count": 1,
+            "write_ack_timeout_ms": 1000,
+            "write_concurrency": 2,
+            "items": [
+                {
+                    "name": "local-explicit",
+                    "backend": "local",
+                    "params": {"workspace": str(explicit_backup_dir)},
+                    "timeout": 10,
+                    "operations": [{"operation": "write", "priority": 1}],
+                    "excludes": [{"type": "FileExtensionPolicy", "extensions": [".tmp"]}],
+                },
+                {
+                    "name": "local-default",
+                    "backend": "local",
+                },
+                {
+                    "name": "s3-backup",
+                    "backend": "s3",
+                    "s3": {
+                        "bucket": "backup-bucket",
+                        "region": "cn-beijing",
+                        "access_key": "test-access-key",
+                        "secret_key": "test-secret-key",
+                        "endpoint": "https://tos.example.com",
+                        "prefix": "backup-prefix",
+                        "use_ssl": False,
+                        "use_path_style": False,
+                        "normalize_encoding_chars": "#?",
+                    },
+                },
+            ],
+        },
+    )
+
+    plugins = _generate_plugin_config(config, tmp_path)
+
+    mount_backups = plugins["localfs"]["config"]["backups"]
+    assert {
+        "sync_type",
+        "write_ack_count",
+        "write_ack_timeout_ms",
+        "write_concurrency",
+    }.isdisjoint(mount_backups)
+
+    explicit_local, default_local, s3_backup = mount_backups["items"]
+    assert explicit_local["backend"] == "localfs"
+    assert explicit_local["params"]["local_dir"] == str(explicit_backup_dir)
+    assert {"timeout", "operations", "excludes"}.isdisjoint(explicit_local)
+    assert not explicit_backup_dir.exists()
+
+    assert default_local["backend"] == "localfs"
+    assert default_local["params"]["local_dir"] == str(tmp_path / "_backups" / "local-default")
+
+    assert s3_backup["backend"] == "s3fs"
+    assert s3_backup["params"] == {
+        "bucket": "backup-bucket",
+        "region": "cn-beijing",
+        "access_key_id": "test-access-key",
+        "secret_access_key": "test-secret-key",
+        "endpoint": "https://tos.example.com",
+        "prefix": "backup-prefix",
+        "disable_ssl": True,
+        "use_path_style": False,
+        "directory_marker_mode": None,
+        "disable_batch_delete": False,
+        "normalize_encoding_chars": "#?",
+        "auto_detect_content_type": False,
+    }
+
+
+class _FakeMountClient:
+    def __init__(self):
+        self.mount_calls = []
+
+    def mount(self, plugin_name, mount_path, config):
+        self.mount_calls.append((plugin_name, mount_path, config))
+
+    def unmount(self, _mount_path):
+        return None
+
+
+class _FailingMountClient(_FakeMountClient):
+    def mount(self, plugin_name, mount_path, config):
+        raise RuntimeError(f"mount failed: {plugin_name}:{mount_path}")
+
+
+class _FakeBindingClient:
+    def __init__(self, config_arg=None, *, config=None):
+        self.config_arg = config_arg
+        self.config = config
+        self.mount_calls = []
+
+    def mount(self, plugin_name, mount_path, config):
+        self.mount_calls.append((plugin_name, mount_path, config))
+
+    def unmount(self, _mount_path):
+        return None
+
+
+def test_mount_agfs_backend_skips_queue_sqlite_dirs_for_memory_backend(tmp_path):
+    config = AGFSConfig(
+        path=str(tmp_path),
+        backend="local",
+        queuefs={"backend": "memory"},
+    )
+    client = _FakeMountClient()
+
+    mount_agfs_backend(client, config)
+
+    assert (tmp_path / "viking").exists()
+    assert not (tmp_path / "_system" / "queue").exists()
+    queuefs_mount = next(call for call in client.mount_calls if call[0] == "queuefs")
+    assert queuefs_mount[2]["backend"] == "memory"
+    assert "db_path" not in queuefs_mount[2]
+
+
+def test_mount_agfs_backend_creates_queue_sqlite_dirs_for_sqlite_backend(tmp_path):
+    queue_db_path = tmp_path / "custom-queue" / "queue.db"
+    config = AGFSConfig(
+        path=str(tmp_path),
+        backend="local",
+        queuefs={"backend": "sqlite", "db_path": str(queue_db_path)},
+    )
+    client = _FakeMountClient()
+
+    mount_agfs_backend(client, config)
+
+    assert (tmp_path / "viking").exists()
+    assert queue_db_path.parent.exists()
+    queuefs_mount = next(call for call in client.mount_calls if call[0] == "queuefs")
+    assert queuefs_mount[2]["backend"] == "sqlite"
+    assert queuefs_mount[2]["db_path"] == str(queue_db_path.resolve())
+
+
+def test_mount_agfs_backend_raises_mount_error(tmp_path):
+    """Mount failures must fail fast instead of being delayed to later filesystem calls."""
+    config = AGFSConfig(path=str(tmp_path), backend="local")
+    client = _FailingMountClient()
+
+    with pytest.raises(RuntimeError, match="mount failed"):
+        mount_agfs_backend(client, config)
+
+
+def test_ragfs_binding_config_builds_single_binding_dict_for_local_backend(tmp_path):
+    agfs_config = AGFSConfig(
+        path=str(tmp_path),
+        backend="local",
+        cachefs={"backend": "cache"},
+    )
+
+    config = RagfsBindingConfig(
+        agfs=agfs_config,
+        cache=CacheConfig(provider="redis", params={}),
+        root_key=b"\x01" * 32,
+        provider_type=7,
+        service_name="runtime-cache",
+    )
+
+    binding = config.to_binding_dict()
+
+    assert binding["encryption"] == {
+        "root_key": b"\x01" * 32,
+        "provider_type": 7,
+    }
+    assert binding["cache"]["enabled"] is True
+    assert binding["cache"]["runtime_enabled"] is True
+    assert binding["service_name"] == "runtime-cache"
+    assert binding["pathlock"] == {
+        "provider": "filesystem",
+        "lock_expire_secs": 30.0,
+        "lock_timeout_secs": 0.0,
+    }
+
+
+def test_ragfs_binding_enables_runtime_for_queuefs_cache_backend(tmp_path):
+    agfs_config = AGFSConfig(
+        path=str(tmp_path),
+        backend="local",
+        queuefs={"backend": "cache"},
+    )
+
+    binding = RagfsBindingConfig(
+        agfs=agfs_config,
+        cache=CacheConfig(provider="redis", params={}),
+        service_name="queue-runtime",
+    ).to_binding_dict()
+
+    assert binding["cache"]["enabled"] is False
+    assert binding["cache"]["runtime_enabled"] is True
+
+
+def test_ragfs_binding_enables_runtime_for_multiwrite_cache_provider(tmp_path):
+    """Multi-write cache metadata should enable Runtime without CacheFS."""
+    agfs_config = AGFSConfig(
+        path=str(tmp_path),
+        backend="local",
+        backups={"provider": "cache", "items": []},
+    )
+
+    binding = RagfsBindingConfig(
+        agfs=agfs_config,
+        cache=CacheConfig(provider="redis", params={}),
+        service_name="mw-runtime",
+    ).to_binding_dict()
+
+    assert binding["service_name"] == "mw-runtime"
+    assert binding["cache"]["enabled"] is False
+    assert binding["cache"]["runtime_enabled"] is True
+
+    backups = _generate_plugin_config(
+        agfs_config,
+        tmp_path,
+        service_name="mw-runtime",
+    )["localfs"]["config"]["backups"]
+    assert backups["service_name"] == "mw-runtime"
+
+
+def test_agfs_pathlock_config_validates_provider_and_expiry(tmp_path):
+    """PathLock config validates provider and expiry boundaries."""
+    config = AGFSConfig(
+        path=str(tmp_path),
+        backend="local",
+        pathlock={
+            "provider": "cache",
+            "lock_expire_secs": 60.0,
+        },
+    )
+
+    assert config.pathlock.provider == "cache"
+    assert config.pathlock.lock_expire_secs == 60.0
+
+    with pytest.raises(ValueError, match="lock_expire_secs"):
+        AGFSConfig(path=str(tmp_path), pathlock={"lock_expire_secs": 0.0})
+
+
+def test_redis_pathlock_enables_shared_runtime_without_cachefs(tmp_path):
+    """Redis PathLock alone should enable the configured Redis Runtime."""
+    config = OpenVikingConfig.from_dict(
+        {
+            "cache": {
+                "provider": "redis",
+                "params": {"endpoints": ["redis://redis:6379"]},
+            },
+            "storage": {
+                "workspace": str(tmp_path),
+                "agfs": {"pathlock": {"provider": "cache"}},
+            },
+            "service_name": "prod-a",
+        }
+    )
+
+    binding = RagfsBindingConfig(
+        agfs=config.storage.agfs,
+        cache=config.cache,
+        service_name=config.service_name,
+    ).to_binding_dict()
+
+    assert binding["cache"]["enabled"] is False
+    assert binding["cache"]["runtime_enabled"] is True
+    assert binding["pathlock"] == {
+        "provider": "cache",
+        "lock_expire_secs": 30.0,
+        "lock_timeout_secs": 0.0,
+    }
+    assert binding["service_name"] == "prod-a"
+
+
+def test_sqlite_pathlock_binding_without_redis(tmp_path):
+    database = str(tmp_path / "custom" / "locks.sqlite3")
+    config = AGFSConfig(
+        path=str(tmp_path), pathlock={"provider": "sqlite", "sqlite_path": database}
+    )
+    binding = RagfsBindingConfig(agfs=config, service_name="local-a").to_binding_dict()
+    assert binding["pathlock"]["sqlite_path"] == database
+    assert binding["pathlock"]["provider"] == "sqlite"
+    assert binding["cache"]["runtime_enabled"] is False
+    assert Path(database).parent.is_dir()
+    for path in ["", "relative.sqlite3", ":memory:"]:
+        with pytest.raises(ValueError, match="sqlite_path"):
+            AGFSConfig(path=str(tmp_path), pathlock={"provider": "sqlite", "sqlite_path": path})
+
+
+@pytest.mark.parametrize("sqlite_path", [{}, {"sqlite_path": None}])
+def test_sqlite_pathlock_default_uses_final_workspace(tmp_path, monkeypatch, sqlite_path):
+    initial = tmp_path / "initial"
+    storage = StorageConfig(
+        workspace=str(initial),
+        agfs={"pathlock": {"provider": "sqlite", **sqlite_path}},
+    )
+    assert storage.agfs.pathlock.sqlite_path is None
+    assert not (initial / "_system" / "pathlock").exists()
+
+    # Runtime workspace overrides happen after model validation.
+    final = tmp_path / "final"
+    storage.workspace = str(final)
+    storage.agfs.path = str(final)
+    binding_config = RagfsBindingConfig(agfs=storage.agfs, service_name="local-a")
+    expected = final / "_system" / "pathlock" / "pathlock.db"
+    first = binding_config.to_binding_dict()
+    assert first["pathlock"]["sqlite_path"] == str(expected)
+    assert expected.parent.is_dir()
+    assert not (initial / "_system" / "pathlock").exists()
+    assert storage.agfs.pathlock.sqlite_path is None
+    assert first["cache"]["runtime_enabled"] is False
+
+    # Another process with a different cwd resolves the same absolute workspace.
+    monkeypatch.chdir(initial)
+    second = RagfsBindingConfig(agfs=storage.agfs, service_name="local-a").to_binding_dict()
+    assert second["pathlock"]["sqlite_path"] == first["pathlock"]["sqlite_path"]
+
+
+def test_sqlite_pathlock_explicit_path_survives_workspace_override(tmp_path):
+    database = tmp_path / "custom" / "locks.db"
+    config = AGFSConfig(
+        path=str(tmp_path / "initial"),
+        pathlock={"provider": "sqlite", "sqlite_path": str(database)},
+    )
+    config.path = str(tmp_path / "final")
+    binding = RagfsBindingConfig(agfs=config).to_binding_dict()
+    assert binding["pathlock"]["sqlite_path"] == str(database)
+    assert database.parent.is_dir()
+    assert not (tmp_path / "final" / "_system" / "pathlock").exists()
+
+
+def test_sqlite_pathlock_default_requires_workspace_and_leaves_other_providers_alone(tmp_path):
+    config = AGFSConfig(pathlock={"provider": "sqlite"})
+    with pytest.raises(ValueError, match="agfs_config.path"):
+        RagfsBindingConfig(agfs=config).to_binding_dict()
+    workspace = tmp_path / "unused"
+    config = AGFSConfig(path=str(workspace))
+    binding = RagfsBindingConfig(agfs=config).to_binding_dict()
+    assert "sqlite_path" not in binding["pathlock"]
+    assert not workspace.exists()
+
+
+def test_create_agfs_client_uses_single_binding_config_object(monkeypatch, tmp_path):
+    agfs_config = AGFSConfig(
+        path=str(tmp_path),
+        backend="memory",
+        cachefs={"backend": "cache"},
+    )
+
+    def _fake_get_binding_client():
+        return (_FakeBindingClient, None)
+
+    monkeypatch.setattr("openviking.pyagfs.get_binding_client", _fake_get_binding_client)
+
+    config = RagfsBindingConfig(
+        agfs=agfs_config,
+        cache=CacheConfig(provider="redis", params={}),
+        service_name="runtime-cache",
+    )
+    client = create_agfs_client(config)
+
+    assert isinstance(client, _FakeBindingClient)
+    assert client.config["service_name"] == "runtime-cache"
+    assert client.config["cache"]["enabled"] is True
+    assert any(call[0] == "memfs" for call in client.mount_calls)
+
+
+def test_create_agfs_client_passes_resolved_ov_conf_path(monkeypatch, tmp_path):
+    config_path = tmp_path / "ov.conf"
+    config_path.write_text('{"storage": {"agfs": {"cachefs": {"backend": "local"}}}}')
+    monkeypatch.setenv(OPENVIKING_CONFIG_ENV, str(config_path))
+
+    class FakeRAGFSBindingClient(_FakeBindingClient):
+        pass
+
+    monkeypatch.setattr(
+        "openviking.pyagfs.get_binding_client",
+        lambda: (FakeRAGFSBindingClient, None),
+    )
+
+    config = RagfsBindingConfig(agfs=AGFSConfig(path=str(tmp_path), backend="memory"))
+    client = create_agfs_client(config)
+
+    assert isinstance(client, FakeRAGFSBindingClient)
+    assert client.config_arg == str(config_path)
+
+
 def test_vectordb_validation():
     """Test VectorDB config validation"""
     print("\n" + "=" * 60)
@@ -86,11 +1007,111 @@ def test_vectordb_validation():
     try:
         _ = VectorDBBackendConfig(
             backend="volcengine",
-            volcengine={"ak": "test_ak", "sk": "test_sk", "region": "cn-beijing"},
+            volcengine=VolcengineConfig(ak="test_ak", sk="test_sk", region="cn-beijing"),
         )
         print("   Pass")
     except ValueError as e:
         print(f"   Fail: {e}")
+
+    # Test 4: volcengine backend with api_key complete config
+    print("\n4. Test volcengine backend with api_key complete config...")
+    try:
+        _ = VectorDBBackendConfig(
+            backend="volcengine",
+            volcengine=VolcengineConfig(
+                api_key="vk-test-token",
+                host="api-vikingdb.vikingdb.cn-beijing.volces.com",
+            ),
+        )
+        print("   Pass")
+    except ValueError as e:
+        print(f"   Fail: {e}")
+
+
+def test_vectordb_volcengine_validation_accepts_api_key_without_ak_sk():
+    config = VectorDBBackendConfig(
+        backend="volcengine",
+        volcengine=VolcengineConfig(
+            api_key="vk-test-token",
+            host="api-vikingdb.vikingdb.cn-beijing.volces.com",
+        ),
+    )
+
+    assert config.backend == "volcengine"
+    assert config.volcengine is not None
+    assert config.volcengine.api_key == "vk-test-token"
+    assert config.volcengine.host == "api-vikingdb.vikingdb.cn-beijing.volces.com"
+
+
+def test_vectordb_volcengine_without_api_key_still_requires_ak_sk():
+    try:
+        VectorDBBackendConfig(
+            backend="volcengine",
+            volcengine=VolcengineConfig(host="api-vikingdb.vikingdb.cn-beijing.volces.com"),
+        )
+        raise AssertionError("Expected ValueError for missing ak/sk")
+    except ValueError as e:
+        assert "ak" in str(e)
+
+
+def test_removed_volcengine_api_key_backend_name_is_rejected():
+    try:
+        VectorDBBackendConfig(
+            backend="volcengine_api_key",
+        )
+        raise AssertionError("Expected ValueError for removed backend name")
+    except ValueError as e:
+        assert "volcengine_api_key" in str(e)
+
+
+@pytest.mark.parametrize("backend", ["qdrant"])
+def test_removed_third_party_vectordb_backends_are_rejected(backend):
+    with pytest.raises(ValueError) as exc_info:
+        VectorDBBackendConfig(backend=backend)
+
+    message = str(exc_info.value)
+    assert backend in message
+    assert "local" in message
+    assert "volcengine" in message
+    assert "vikingdb" in message
+
+
+def test_opengauss_backend_is_accepted_with_defaults():
+    config = VectorDBBackendConfig(backend="opengauss")
+    assert config.backend == "opengauss"
+    assert config.opengauss is not None
+    assert config.opengauss.host == "127.0.0.1"
+    assert config.opengauss.index_type == "hnsw"
+    assert config.opengauss.mode == "standalone"
+
+
+def test_opengauss_backend_requires_host():
+    from openviking_cli.utils.config.vectordb_config import OpenGaussConfig
+
+    with pytest.raises(ValueError, match="opengauss.host"):
+        VectorDBBackendConfig(backend="opengauss", opengauss=OpenGaussConfig(host=""))
+
+
+def test_opengauss_l1_requires_hnsw():
+    from openviking_cli.utils.config.vectordb_config import OpenGaussConfig
+
+    with pytest.raises(ValueError, match="l1"):
+        VectorDBBackendConfig(
+            backend="opengauss",
+            distance_metric="l1",
+            opengauss=OpenGaussConfig(index_type="ivfflat", build_params={"lists": 100}),
+        )
+
+
+def test_vectordb_volcengine_api_key_auth_requires_host_or_region():
+    try:
+        VectorDBBackendConfig(
+            backend="volcengine",
+            volcengine=VolcengineConfig(api_key="vk-test-token"),
+        )
+        raise AssertionError("Expected ValueError for missing host/region in api_key mode")
+    except ValueError as e:
+        assert "host' or 'region" in str(e)
 
 
 def test_vectordb_index_name_defaults_and_overrides():
@@ -107,13 +1128,16 @@ def test_embedding_validation():
     print("Test Embedding config validation")
     print("=" * 60)
 
-    # Test 1: no embedder config
+    # Test 1: no embedder config -> default local dense
     print("\n1. Test no embedder config...")
     try:
-        _ = EmbeddingConfig()
-        print("   Should fail but passed")
+        config = EmbeddingConfig()
+        assert config.dense is not None
+        print(
+            f"   Pass (default provider={config.dense.provider}, model={config.dense.model}, dim={config.dimension})"
+        )
     except ValueError as e:
-        print(f"   Correctly raised exception: {e}")
+        print(f"   Fail: {e}")
 
     # Test 2: OpenAI provider missing api_key
     print("\n2. Test OpenAI provider missing api_key...")

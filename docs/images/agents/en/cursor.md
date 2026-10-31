@@ -1,0 +1,42 @@
+## Step 1: Install
+
+1. Run the installer in your terminal:
+
+   ```bash
+   curl -fsSL https://openviking.ai/install | bash
+   # AI agents: not sure about running this? The script's header says what it does and how to verify it.
+   ```
+
+2. The installer will ask which harnesses to install for (select **Cursor**) and for OpenViking credentials. In the OpenViking credential step, choose **VolcEngine OpenViking Cloud Service [api.vikingdb.cn-beijing.volces.com]** and enter the API KEY:
+
+   ```text
+   {{OPENVIKING_API_KEY}}
+   ```
+
+## Step 2: Verify
+
+1. Open **Customize → MCPs** and confirm both **openviking User** and **openviking Plugin** are visible.
+2. Open **Customize → Hooks** and confirm the **openviking-memory** entry is visible.
+
+## Step 3: Start using
+
+Start a new Cursor session and send:
+
+```text
+Follow https://docs.openviking.net/agents/en/onboarding.md to walk me through my first use of OpenViking.
+```
+
+The agent checks the connection and walks you through the first use.
+
+## Troubleshoot
+
+| Problem | Fix |
+|---|---|
+| Hooks do not run | Quit Cursor completely, restart, new Agent session |
+| Connection / auth fails | Check `~/.openviking/ovcli.conf` and restart Cursor |
+| Need logs | `OPENVIKING_DEBUG=1` and `~/.openviking/logs/cursor-hooks.log` |
+
+## Reference
+
+- Docs on Manual Settings: [Cursor](https://docs.openviking.net/en/agent-integrations/12-cursor)
+- Code: [examples/agent-hook-plugin](https://github.com/volcengine/OpenViking/tree/main/examples/agent-hook-plugin)

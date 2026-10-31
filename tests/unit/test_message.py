@@ -6,7 +6,9 @@
 import json
 from datetime import datetime, timezone
 
-from openviking.message import ContextPart, Message, TextPart, ToolPart
+import pytest
+
+from openviking.message import ContextPart, ImagePart, Message, TextPart, ToolPart
 from openviking.message.part import part_from_dict
 
 
@@ -108,6 +110,29 @@ class TestContextPart:
         assert part.context_type == "resource"
 
 
+class TestImagePart:
+    """Test ImagePart dataclass."""
+
+    def test_default_values(self):
+        """Test default values."""
+        part = ImagePart()
+
+        assert part.url == ""
+        assert part.detail is None
+        assert part.type == "image_url"
+
+    def test_custom_values(self):
+        """Test custom values."""
+        part = ImagePart(
+            url="https://example.com/image.png",
+            detail="auto",
+        )
+
+        assert part.url == "https://example.com/image.png"
+        assert part.detail == "auto"
+        assert part.type == "image_url"
+
+
 class TestToolPart:
     """Test ToolPart dataclass."""
 
@@ -125,6 +150,9 @@ class TestToolPart:
         assert part.duration_ms is None
         assert part.prompt_tokens is None
         assert part.completion_tokens is None
+        assert part.tool_output_ref == ""
+        assert part.tool_output_truncated is False
+        assert part.tool_output_mime_type == "text/plain"
         assert part.type == "tool"
 
     def test_custom_values(self):
@@ -132,26 +160,40 @@ class TestToolPart:
         part = ToolPart(
             tool_id="call-123",
             tool_name="search",
-            tool_uri="viking://session/test/tools/call-123",
-            skill_uri="viking://agent/test/skills/search",
+            tool_uri="viking://user/default/sessions/test/tools/call-123",
+            skill_uri="viking://user/test/skills/search",
             tool_input={"query": "test"},
             tool_output="Result",
             tool_status="completed",
             duration_ms=150.5,
             prompt_tokens=100,
             completion_tokens=50,
+            tool_output_ref="viking://user/default/sessions/s1/tool-results/tr_call",
+            tool_output_truncated=True,
+            tool_output_original_chars=1000,
+            tool_output_preview_chars=100,
+            tool_output_sha256="abc123",
+            tool_output_group_id="msg-1",
+            tool_output_externalized_reason="single_threshold",
         )
 
         assert part.tool_id == "call-123"
         assert part.tool_name == "search"
-        assert part.tool_uri == "viking://session/test/tools/call-123"
-        assert part.skill_uri == "viking://agent/test/skills/search"
+        assert part.tool_uri == "viking://user/default/sessions/test/tools/call-123"
+        assert part.skill_uri == "viking://user/test/skills/search"
         assert part.tool_input == {"query": "test"}
         assert part.tool_output == "Result"
         assert part.tool_status == "completed"
         assert part.duration_ms == 150.5
         assert part.prompt_tokens == 100
         assert part.completion_tokens == 50
+        assert part.tool_output_ref == "viking://user/default/sessions/s1/tool-results/tr_call"
+        assert part.tool_output_truncated is True
+        assert part.tool_output_original_chars == 1000
+        assert part.tool_output_preview_chars == 100
+        assert part.tool_output_sha256 == "abc123"
+        assert part.tool_output_group_id == "msg-1"
+        assert part.tool_output_externalized_reason == "single_threshold"
 
     def test_tool_statuses(self):
         """Test various tool statuses."""
@@ -214,14 +256,19 @@ class TestPartFromDict:
             "type": "tool",
             "tool_id": "call-123",
             "tool_name": "search",
-            "tool_uri": "viking://session/test/tools/call-123",
-            "skill_uri": "viking://agent/test/skills/search",
+            "tool_uri": "viking://user/default/sessions/test/tools/call-123",
+            "skill_uri": "viking://user/test/skills/search",
             "tool_input": {"query": "test"},
             "tool_output": "Result",
             "tool_status": "completed",
             "duration_ms": 150.0,
             "prompt_tokens": 100,
             "completion_tokens": 50,
+            "tool_output_ref": "viking://user/default/sessions/s1/tool-results/tr_call",
+            "tool_output_truncated": True,
+            "tool_output_original_chars": 1000,
+            "tool_output_preview_chars": 100,
+            "tool_output_sha256": "abc123",
         }
 
         part = part_from_dict(data)
@@ -230,6 +277,42 @@ class TestPartFromDict:
         assert part.tool_id == "call-123"
         assert part.tool_name == "search"
         assert part.tool_status == "completed"
+        assert part.tool_output_ref == "viking://user/default/sessions/s1/tool-results/tr_call"
+        assert part.tool_output_truncated is True
+        assert part.tool_output_original_chars == 1000
+        assert part.tool_output_preview_chars == 100
+        assert part.tool_output_sha256 == "abc123"
+
+    def test_image_part_from_openai_style_dict(self):
+        """Test creating ImagePart from OpenAI-style image_url dict."""
+        data = {
+            "type": "image_url",
+            "image_url": {"url": "https://example.com/image.png", "detail": "high"},
+        }
+
+        part = part_from_dict(data)
+
+        assert isinstance(part, ImagePart)
+        assert part.url == "https://example.com/image.png"
+        assert part.detail == "high"
+
+    def test_image_part_rejects_flat_dict(self):
+        """OpenAI-style image_url payloads require the nested image_url shape."""
+        data = {"type": "image_url", "url": "https://example.com/image.png"}
+
+        with pytest.raises(ValueError, match="image_url part requires a non-empty URL"):
+            part_from_dict(data)
+
+    def test_image_part_rejects_missing_url(self):
+        """Test image_url parts require a non-empty URL."""
+        data = {"type": "image_url", "image_url": {}}
+
+        try:
+            part_from_dict(data)
+        except ValueError as exc:
+            assert "image_url part requires a non-empty URL" in str(exc)
+        else:
+            raise AssertionError("Expected ValueError for missing image URL")
 
     def test_unknown_type_defaults_to_text(self):
         """Test unknown type defaults to TextPart."""
@@ -240,6 +323,20 @@ class TestPartFromDict:
         assert isinstance(part, TextPart)
         # The entire dict is converted to string
         assert "unknown" in part.text
+
+    def test_unknown_type_with_text_preserves_text(self):
+        """Unknown part types with text degrade to TextPart text."""
+        data = {
+            "type": "control",
+            "control_type": "batch_training_case_spec",
+            "payload": {"protocol": "v1"},
+            "text": "control text",
+        }
+
+        part = part_from_dict(data)
+
+        assert isinstance(part, TextPart)
+        assert part.text == "control text"
 
     def test_missing_type_defaults_to_text(self):
         """Test missing type defaults to TextPart."""
@@ -412,7 +509,8 @@ class TestMessageToDict:
         assert d["parts"][0]["type"] == "text"
         assert d["parts"][1]["type"] == "context"
 
-    def test_to_dict_with_tool_part(self):
+    @pytest.mark.parametrize("tool_input", [None, {}, {"query": "OpenViking"}])
+    def test_to_dict_with_tool_part(self, tool_input):
         """Test to_dict with ToolPart."""
         msg = Message(
             id="msg-1",
@@ -422,10 +520,16 @@ class TestMessageToDict:
                     tool_id="call-1",
                     tool_name="search",
                     tool_uri="viking://tools/1",
+                    tool_input=tool_input,
                     tool_status="completed",
                     duration_ms=100,
                     prompt_tokens=50,
                     completion_tokens=25,
+                    tool_output_ref="viking://user/default/sessions/s1/tool-results/tr_call",
+                    tool_output_truncated=True,
+                    tool_output_original_chars=1000,
+                    tool_output_preview_chars=100,
+                    tool_output_externalized_reason="single_threshold",
                 )
             ],
         )
@@ -435,6 +539,38 @@ class TestMessageToDict:
         assert d["parts"][0]["type"] == "tool"
         assert d["parts"][0]["tool_id"] == "call-1"
         assert d["parts"][0]["duration_ms"] == 100
+        assert d["parts"][0]["tool_output_ref"] == "viking://user/default/sessions/s1/tool-results/tr_call"
+        assert d["parts"][0]["tool_output_truncated"] is True
+        assert d["parts"][0]["tool_output_original_chars"] == 1000
+        assert d["parts"][0]["tool_output_preview_chars"] == 100
+        assert d["parts"][0]["tool_output_externalized_reason"] == "single_threshold"
+        assert ("tool_input" in d["parts"][0]) == (tool_input is not None)
+        assert Message.from_dict(d).parts[0].tool_input == tool_input
+        assert Message.from_dict(json.loads(msg.to_jsonl())).to_dict()["parts"] == d["parts"]
+
+    def test_to_dict_with_image_part(self):
+        """Test to_dict with ImagePart."""
+        msg = Message(
+            id="msg-1",
+            role="user",
+            parts=[
+                TextPart(text="Look at this"),
+                ImagePart(
+                    url="https://example.com/image.png",
+                    detail="auto",
+                ),
+            ],
+        )
+
+        d = msg.to_dict()
+
+        assert d["parts"][1] == {
+            "type": "image_url",
+            "image_url": {
+                "url": "https://example.com/image.png",
+                "detail": "auto",
+            },
+        }
 
     def test_to_dict_timestamp_format(self):
         """Test timestamp format in to_dict."""
@@ -471,6 +607,43 @@ class TestMessageFromDict:
         assert isinstance(msg.parts[0], TextPart)
         assert msg.parts[0].text == "Hello"
 
+    def test_from_dict_unknown_type_with_text_preserves_text(self):
+        """Unknown serialized part types with text degrade to TextPart."""
+        d = {
+            "id": "msg-control",
+            "role": "system",
+            "parts": [
+                {
+                    "type": "control",
+                    "control_type": "batch_training_case_spec",
+                    "payload": {"protocol": "v1"},
+                    "text": "# OpenViking Batch Training CaseSpec v1",
+                }
+            ],
+            "created_at": "2026-03-26T10:30:00Z",
+        }
+
+        msg = Message.from_dict(d)
+
+        assert len(msg.parts) == 1
+        assert isinstance(msg.parts[0], TextPart)
+        assert msg.parts[0].text == "# OpenViking Batch Training CaseSpec v1"
+
+    def test_from_dict_missing_part_type_defaults_to_text(self):
+        """Serialized dict parts without type should default to TextPart."""
+        d = {
+            "id": "msg-missing-type",
+            "role": "user",
+            "parts": [{"text": "hello"}],
+            "created_at": "2026-03-26T10:30:00Z",
+        }
+
+        msg = Message.from_dict(d)
+
+        assert len(msg.parts) == 1
+        assert isinstance(msg.parts[0], TextPart)
+        assert msg.parts[0].text == "hello"
+
     def test_from_dict_with_context_part(self):
         """Test from_dict with ContextPart."""
         d = {
@@ -504,6 +677,11 @@ class TestMessageFromDict:
                     "tool_name": "search",
                     "tool_uri": "viking://tools/1",
                     "tool_status": "completed",
+                    "tool_output_ref": "viking://user/default/sessions/s1/tool-results/tr_call",
+                    "tool_output_truncated": True,
+                    "tool_output_original_chars": 1000,
+                    "tool_output_preview_chars": 100,
+                    "tool_output_externalized_reason": "single_threshold",
                 }
             ],
             "created_at": "2026-03-26T10:30:00Z",
@@ -513,6 +691,54 @@ class TestMessageFromDict:
 
         assert isinstance(msg.parts[0], ToolPart)
         assert msg.parts[0].tool_id == "call-1"
+        assert msg.parts[0].tool_output_ref == "viking://user/default/sessions/s1/tool-results/tr_call"
+        assert msg.parts[0].tool_output_truncated is True
+        assert msg.parts[0].tool_output_original_chars == 1000
+        assert msg.parts[0].tool_output_preview_chars == 100
+        assert msg.parts[0].tool_output_externalized_reason == "single_threshold"
+
+    def test_from_dict_with_image_part(self):
+        """Test from_dict with ImagePart."""
+        d = {
+            "id": "msg-1",
+            "role": "user",
+            "parts": [
+                {"type": "text", "text": "Look at this"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://example.com/image.png",
+                        "detail": "auto",
+                    },
+                },
+            ],
+            "created_at": "2026-03-26T10:30:00Z",
+        }
+
+        msg = Message.from_dict(d)
+
+        assert isinstance(msg.parts[0], TextPart)
+        assert isinstance(msg.parts[1], ImagePart)
+        assert msg.parts[1].url == "https://example.com/image.png"
+        assert msg.parts[1].detail == "auto"
+
+    def test_from_dict_supports_legacy_content_only_messages(self):
+        """Legacy messages with only content should load as a TextPart."""
+        d = {
+            "id": "msg-legacy",
+            "role": "user",
+            "content": "Hello from legacy storage",
+        }
+
+        msg = Message.from_dict(d)
+
+        assert msg.id == "msg-legacy"
+        assert msg.role == "user"
+        assert len(msg.parts) == 1
+        assert isinstance(msg.parts[0], TextPart)
+        assert msg.parts[0].text == "Hello from legacy storage"
+        assert msg.content == "Hello from legacy storage"
+        assert msg.created_at is None
 
     def test_roundtrip(self):
         """Test to_dict -> from_dict roundtrip."""
@@ -534,132 +760,32 @@ class TestMessageFromDict:
         assert isinstance(restored.parts[0], TextPart)
         assert isinstance(restored.parts[1], ContextPart)
 
+    def test_legacy_message_can_be_reloaded_and_extended(self):
+        """Legacy content-only rows should survive reload before appending new messages."""
+        legacy_row = {
+            "id": "msg-legacy",
+            "role": "user",
+            "content": "Legacy message",
+            "created_at": "2026-03-26T10:30:00Z",
+        }
+        fresh = Message(id="msg-fresh", role="user", parts=[TextPart("Fresh message")])
 
-class TestMessageFactoryMethods:
-    """Test Message factory methods."""
+        reloaded_messages = [Message.from_dict(legacy_row), Message.from_dict(fresh.to_dict())]
 
-    def test_create_user(self):
-        """Test create_user factory method."""
-        msg = Message.create_user("Hello, assistant!")
-
-        assert msg.role == "user"
-        assert msg.content == "Hello, assistant!"
-        assert len(msg.parts) == 1
-        assert msg.id.startswith("msg_")
-
-    def test_create_user_with_id(self):
-        """Test create_user with custom ID."""
-        msg = Message.create_user("Hello", msg_id="custom-id")
-
-        assert msg.id == "custom-id"
-
-    def test_create_assistant(self):
-        """Test create_assistant factory method."""
-        msg = Message.create_assistant("Hello, user!")
-
-        assert msg.role == "assistant"
-        assert msg.content == "Hello, user!"
-        assert len(msg.parts) == 1
-
-    def test_create_assistant_with_context_refs(self):
-        """Test create_assistant with context references."""
-        msg = Message.create_assistant(
-            content="Here's what I found:",
-            context_refs=[
-                {"uri": "viking://test/1.md", "context_type": "memory"},
-                {"uri": "viking://test/2.md", "context_type": "resource"},
-            ],
-        )
-
-        assert msg.role == "assistant"
-        assert len(msg.parts) == 3  # 1 text + 2 context
-
-    def test_create_assistant_with_tool_calls(self):
-        """Test create_assistant with tool calls."""
-        msg = Message.create_assistant(
-            content="Let me search for that.",
-            tool_calls=[
-                {"id": "call-1", "name": "search", "uri": "viking://tools/1"},
-            ],
-        )
-
-        assert msg.role == "assistant"
-        assert len(msg.parts) == 2  # 1 text + 1 tool
-
-    def test_create_assistant_empty(self):
-        """Test create_assistant with no content."""
-        msg = Message.create_assistant()
-
-        assert msg.role == "assistant"
-        assert msg.content == ""
-        assert len(msg.parts) == 0
+        assert [message.content for message in reloaded_messages] == [
+            "Legacy message",
+            "Fresh message",
+        ]
+        assert [
+            json.loads(message.to_jsonl())["parts"][0]["text"] for message in reloaded_messages
+        ] == [
+            "Legacy message",
+            "Fresh message",
+        ]
 
 
 class TestMessageMethods:
     """Test Message methods."""
-
-    def test_get_context_parts(self):
-        """Test get_context_parts method."""
-        msg = Message(
-            id="msg-1",
-            role="assistant",
-            parts=[
-                TextPart(text="Hello"),
-                ContextPart(uri="viking://test/1.md"),
-                TextPart(text="More text"),
-                ContextPart(uri="viking://test/2.md"),
-            ],
-        )
-
-        context_parts = msg.get_context_parts()
-
-        assert len(context_parts) == 2
-        assert all(isinstance(p, ContextPart) for p in context_parts)
-
-    def test_get_tool_parts(self):
-        """Test get_tool_parts method."""
-        msg = Message(
-            id="msg-1",
-            role="assistant",
-            parts=[
-                TextPart(text="Hello"),
-                ToolPart(tool_id="call-1"),
-                ToolPart(tool_id="call-2"),
-            ],
-        )
-
-        tool_parts = msg.get_tool_parts()
-
-        assert len(tool_parts) == 2
-        assert all(isinstance(p, ToolPart) for p in tool_parts)
-
-    def test_find_tool_part(self):
-        """Test find_tool_part method."""
-        msg = Message(
-            id="msg-1",
-            role="assistant",
-            parts=[
-                ToolPart(tool_id="call-1"),
-                ToolPart(tool_id="call-2"),
-            ],
-        )
-
-        part = msg.find_tool_part("call-1")
-
-        assert part is not None
-        assert part.tool_id == "call-1"
-
-    def test_find_tool_part_not_found(self):
-        """Test find_tool_part when not found."""
-        msg = Message(
-            id="msg-1",
-            role="assistant",
-            parts=[ToolPart(tool_id="call-1")],
-        )
-
-        part = msg.find_tool_part("nonexistent")
-
-        assert part is None
 
     def test_to_jsonl(self):
         """Test to_jsonl method."""

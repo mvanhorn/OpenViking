@@ -11,7 +11,7 @@ Layer 5: Validation Tolerance - TypeAdapter(strict=False) + list item filtering
 """
 
 import json
-from dataclasses import is_dataclass, asdict
+from dataclasses import asdict, is_dataclass
 from types import UnionType
 from typing import (
     Any,
@@ -26,9 +26,9 @@ from typing import (
 )
 
 import json_repair
-from pydantic import TypeAdapter, BaseModel, parse_obj_as
+from pydantic import BaseModel, TypeAdapter
 
-
+from openviking.telemetry import tracer
 from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
@@ -37,7 +37,6 @@ logger = get_logger(__name__)
 # Exported for testing
 __all__ = [
     "extract_json_content",
-    "remove_json_trailing_content",
     "parse_json_with_stability",
     "value_fault_tolerance",
     "parse_value_with_tolerance",
@@ -48,23 +47,17 @@ __all__ = [
 ]
 
 
-
-
 class PydanticEncoder(json.JSONEncoder):
     def default(self, obj):
-        if isinstance(obj, BaseModel) :
+        if isinstance(obj, BaseModel):
             # 保存类名和属性值
-            return {
-                **obj.model_dump(mode='python')
-            }
+            return {**obj.model_dump(mode="python")}
         elif is_dataclass(obj):
             return asdict(obj)
         return super().default(obj)
 
 
-
 class JsonUtils:
-
     @staticmethod
     def dumps(obj, indent=4, ensure_ascii=False):
         if obj is None:
@@ -76,7 +69,7 @@ class JsonUtils:
         if not json_str:
             return None
         if clazz:
-            return TypeAdapter.validate_python(clazz, json_repair.loads(json_str))
+            return TypeAdapter(clazz).validate_python(json_repair.loads(json_str), strict=False)
         return json_repair.loads(json_str)
 
 
@@ -144,21 +137,6 @@ def extract_json_content(s: str) -> str:
     return result
 
 
-def remove_json_trailing_content(s: str) -> str:
-    """
-    Layer 1: Remove extra content after JSON closing brace.
-
-    DEPRECATED: Use extract_json_content() instead which handles both leading and trailing content.
-
-    Args:
-        s: Raw LLM response string
-
-    Returns:
-        String with only the JSON part
-    """
-    return extract_json_content(s)
-
-
 def _get_origin_type(annotation) -> Type:
     """
     Extract base type from Optional or Union types.
@@ -175,7 +153,7 @@ def _get_origin_type(annotation) -> Type:
     if origin is Union or origin is UnionType:
         args = get_args(annotation)
         # Handle Optional[T] which is Union[T, None]
-        if len(args) == 2 and args[1] == type(None):
+        if len(args) == 2 and args[1] is type(None):
             return _get_origin_type(args[0])
     elif origin is list:
         return list
@@ -197,7 +175,7 @@ def _get_arg_type(annotation) -> Optional[Type]:
     origin = get_origin(annotation)
     if origin is Union or origin is UnionType:
         args = get_args(annotation)
-        if len(args) == 2 and args[1] == type(None):
+        if len(args) == 2 and args[1] is type(None):
             return _get_arg_type(args[0])
     elif origin is list:
         args = get_args(annotation)
@@ -344,7 +322,9 @@ def parse_value_with_tolerance(value, annotation):
         else:
             parsed_value = value
     elif origin_type is list:
-        if isinstance(value, str):
+        if value is None:
+            parsed_value = []
+        elif isinstance(value, str):
             parsed_value = [value]
         elif isinstance(value, dict):
             parsed_value = [value]
@@ -357,7 +337,7 @@ def parse_value_with_tolerance(value, annotation):
     try:
         return TypeAdapter(annotation).validate_python(parsed_value, strict=False)
     except Exception as e:
-        logger.warning(f"TypeAdapter validation failed: {e}")
+        tracer.info(f"TypeAdapter validation failed (recoverable): {e}")
 
         # For list types, try filtering invalid items
         if get_origin(annotation) is list and isinstance(parsed_value, list):
@@ -369,13 +349,13 @@ def parse_value_with_tolerance(value, annotation):
                         validated_item = TypeAdapter(item_type).validate_python(item, strict=False)
                         filtered_items.append(validated_item)
                     except Exception:
-                        logger.warning(f"Skipping invalid list item: {item}")
+                        tracer.info(f"Skipping invalid list item: {item}")
                         continue
 
             if filtered_items:
                 return filtered_items
             else:
-                logger.warning("All list items were filtered out, returning empty list")
+                tracer.info("All list items were filtered out, returning empty list")
                 return []
 
         # Re-raise for non-list types
@@ -399,7 +379,8 @@ def parse_json_with_stability(
     Args:
         content: Raw LLM response string
         model_class: Optional Pydantic model class to validate against
-        expected_fields: Optional list of field names to keep (filter out extra fields)
+        expected_fields: Optional field names to keep. Non-empty objects containing
+            none of these fields are rejected instead of becoming an empty result.
 
     Returns:
         Tuple of (parsed_data, error_message). error_message is None on success.
@@ -413,7 +394,7 @@ def parse_json_with_stability(
         if not cleaned_content:
             return None, "No JSON content found after cleanup"
     except Exception as e:
-        logger.warning(f"Layer 1 cleanup failed: {e}")
+        tracer.error(f"Layer 1 cleanup failed: {e}")
         cleaned_content = content
 
     # Layer 2: Parse with json_repair
@@ -421,7 +402,7 @@ def parse_json_with_stability(
     try:
         parsed_data = json_repair.loads(cleaned_content)
     except Exception as e:
-        logger.warning(f"Layer 2 json_repair failed: {e}")
+        tracer.error(f"Layer 2 json_repair failed: {e}")
         # Fallback: try regular json.loads
         try:
             parsed_data = json.loads(cleaned_content)
@@ -432,17 +413,28 @@ def parse_json_with_stability(
     # Handle case where model returns [{"xxx": ...}] instead of {"xxx": ...}
     if isinstance(parsed_data, list) and len(parsed_data) > 0:
         parsed_data = parsed_data[0]
-        logger.info("Extracted first item from list response")
+        tracer.info("Extracted first item from list response")
+    elif (
+        isinstance(parsed_data, list)
+        and len(parsed_data) == 0
+        and getattr(model_class, "_allow_empty_list_response", False)
+    ):
+        # The operations model opts in (via _allow_empty_list_response) to treating a
+        # bare `[]` as a valid "no operations" outcome: every field is default_factory=list,
+        # so map [] to {} and let it validate to an empty-ops object instead of raising
+        # downstream. Every other model keeps the fail-loud "Expected dict" path below.
+        parsed_data = {}
+        tracer.info("Empty list response treated as empty object (no operations)")
 
     if not isinstance(parsed_data, dict):
-        return None, f"Expected dict after parsing, got {type(parsed_data)}"
+        return None, f"Expected dict after parsing, got {parsed_data}"
 
     # Filter to only expected fields if provided
     if expected_fields:
-        filtered_data = {}
-        for k, v in parsed_data.items():
-            if k in expected_fields:
-                filtered_data[k] = v
+        filtered_data = {k: v for k, v in parsed_data.items() if k in expected_fields}
+        if parsed_data and not filtered_data:
+            fields = ", ".join(sorted(parsed_data))
+            return None, f"No expected fields found; got fields: {fields}"
         parsed_data = filtered_data
 
     # If no model class, return the raw dict
@@ -452,10 +444,10 @@ def parse_json_with_stability(
     # Layer 4 & 5: Validate with model
     try:
         # First try direct model validation
-        return model_class.model_validate(parsed_data), None
+        return model_class.model_validate(parsed_data, strict=False), None
     except Exception as e:
-        logger.warning(f"Direct model validation failed, trying parse_value_with_tolerance: {e}")
-        logger.warning(f"content={content}")
+        tracer.info(f"Direct model validation failed, trying parse_value_with_tolerance: {e}")
+        tracer.info(f"content={content}")
         # Fallback: Apply value fault tolerance to each field individually
         try:
             field_types = get_type_hints(model_class)
@@ -467,13 +459,11 @@ def parse_json_with_stability(
                             field_value, field_types[field_name]
                         )
                     except Exception as field_e:
-                        logger.warning(f"Field {field_name} parsing failed: {field_e}")
+                        tracer.error(f"Field {field_name} parsing failed: {field_e}")
                         # Skip this field rather than failing the whole parse
                         continue
 
             # Now try validating with the tolerant data
-            return model_class.model_validate(tolerant_data), None
+            return model_class.model_validate(tolerant_data, strict=False), None
         except Exception as e2:
             return None, f"Model validation failed even after tolerance: {e} (fallback: {e2})"
-
-

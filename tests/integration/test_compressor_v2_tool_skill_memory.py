@@ -14,14 +14,17 @@ from rich.panel import Panel
 from rich.table import Table
 
 import openviking as ov
+try:
+    from openviking_live_auth import API_KEY_HELP, resolve_api_key
+except ModuleNotFoundError:  # pytest/package import path
+    from tests.integration.openviking_live_auth import API_KEY_HELP, resolve_api_key
 
 # ── 常量 ───────────────────────────────────────────────────────────────────
 
 DISPLAY_NAME = "测试用户"
 DEFAULT_URL = "http://localhost:1934"
 PANEL_WIDTH = 78
-DEFAULT_API_KEY = "1cf407c39990e5dc874ccc697942da4892208a86a44c4781396dfdc57aa5c98d"
-DEFAULT_AGENT_ID = "test"
+DEFAULT_API_KEY = None
 DEFAULT_SESSION_ID = "tool-skill-memory-test"
 
 
@@ -37,21 +40,33 @@ CONVERSATION = [
         "user": "帮我创建一个PPT演示文稿，主题是季度工作报告。",
         "assistant": "好的，我先读取一下 ppt skill 的 SKILL.md 了解如何创建PPT。",
         "tool_calls": [
-            {"tool_name": "Read", "tool_uri": "tools:Read", "input": {"file_path": "/skills/ppt/SKILL.md"}}
+            {
+                "tool_name": "Read",
+                "tool_uri": "tools:Read",
+                "input": {"file_path": "/skills/ppt/SKILL.md"},
+            }
         ],
     },
     {
         "user": "PPT需要包含三个部分：业绩回顾、业务分析和下季度计划。",
         "assistant": "好的，我根据 SKILL.md 的指引来创建这三个部分的PPT。",
         "tool_calls": [
-            {"tool_name": "Read", "tool_uri": "tools:Read", "input": {"file_path": "/skills/ppt/SKILL.md"}}
+            {
+                "tool_name": "Read",
+                "tool_uri": "tools:Read",
+                "input": {"file_path": "/skills/ppt/SKILL.md"},
+            }
         ],
     },
     {
         "user": "把PPT的模板换成蓝色主题。",
         "assistant": "好的，我来修改PPT模板为蓝色主题。",
         "tool_calls": [
-            {"tool_name": "write_file", "tool_uri": "tools:write_file", "input": {"path": "template.pptx", "content": "蓝色主题模板"}}
+            {
+                "tool_name": "write_file",
+                "tool_uri": "tools:write_file",
+                "input": {"path": "template.pptx", "content": "蓝色主题模板"},
+            }
         ],
     },
     # ===== 工具调用：write_file =====
@@ -59,7 +74,14 @@ CONVERSATION = [
         "user": "帮我写一个Python函数，计算斐波那契数列。",
         "assistant": "我来写一个计算斐波那契数列的函数并保存到文件。",
         "tool_calls": [
-            {"tool_name": "write_file", "tool_uri": "tools:write_file", "input": {"path": "fibonacci.py", "content": "def fib(n):\n    if n <= 1:\n        return n\n    return fib(n-1) + fib(n-2)\nprint(fib(10))"}}
+            {
+                "tool_name": "write_file",
+                "tool_uri": "tools:write_file",
+                "input": {
+                    "path": "fibonacci.py",
+                    "content": "def fib(n):\n    if n <= 1:\n        return n\n    return fib(n-1) + fib(n-2)\nprint(fib(10))",
+                },
+            }
         ],
     },
     # ===== 工具调用：bash =====
@@ -67,7 +89,11 @@ CONVERSATION = [
         "user": "执行一下这个Python文件，看看结果对不对。",
         "assistant": "我来执行这个文件。",
         "tool_calls": [
-            {"tool_name": "Bash", "tool_uri": "tools:Bash", "input": {"command": "python fibonacci.py"}}
+            {
+                "tool_name": "Bash",
+                "tool_uri": "tools:Bash",
+                "input": {"command": "python fibonacci.py"},
+            }
         ],
     },
     # ===== Skill 调用：PDF =====
@@ -75,7 +101,11 @@ CONVERSATION = [
         "user": "帮我把这份PDF文件提取文字内容。",
         "assistant": "好的，我先读取一下 pdf skill 的 SKILL.md。",
         "tool_calls": [
-            {"tool_name": "Read", "tool_uri": "tools:Read", "input": {"file_path": "/skills/pdf/SKILL.md"}}
+            {
+                "tool_name": "Read",
+                "tool_uri": "tools:Read",
+                "input": {"file_path": "/skills/pdf/SKILL.md"},
+            }
         ],
     },
     {
@@ -103,7 +133,11 @@ CONVERSATION = [
         "user": "帮我写一封邮件给客户，主题是项目进度汇报。",
         "assistant": "好的，我先读取一下 email skill 的 SKILL.md 了解邮件格式。",
         "tool_calls": [
-            {"tool_name": "Read", "tool_uri": "tools:Read", "input": {"file_path": "/skills/email/SKILL.md"}}
+            {
+                "tool_name": "Read",
+                "tool_uri": "tools:Read",
+                "input": {"file_path": "/skills/email/SKILL.md"},
+            }
         ],
     },
     {
@@ -154,7 +188,7 @@ def run_ingest(client: ov.SyncHTTPClient, session_id: str, wait_seconds: float):
     console.rule(f"[bold]Phase 1: 写入对话 — {DISPLAY_NAME} ({len(CONVERSATION)} 轮)[/bold]")
 
     session = client.create_session()
-    session_id = session.get('session_id')
+    session_id = session.get("session_id")
     console.print(f"  Session: [bold cyan]{session_id}[/bold cyan]")
     console.print()
 
@@ -207,7 +241,7 @@ def run_ingest(client: ov.SyncHTTPClient, session_id: str, wait_seconds: float):
         console.print(f"  [green]任务 {status}，耗时 {elapsed:.2f}s[/green]")
         console.print(f"  Task 详情: {task}")
 
-    console.print(f"  [yellow]等待向量化完成...[/yellow]")
+    console.print("  [yellow]等待向量化完成...[/yellow]")
     client.wait_processed()
 
     if wait_seconds > 0:
@@ -223,7 +257,9 @@ def run_ingest(client: ov.SyncHTTPClient, session_id: str, wait_seconds: float):
 def run_verify(client: ov.SyncHTTPClient):
     """验证记忆召回"""
     console.print()
-    console.rule(f"[bold]Phase 2: 验证记忆召回 — {DISPLAY_NAME} ({len(VERIFY_QUERIES)} 条查询)[/bold]")
+    console.rule(
+        f"[bold]Phase 2: 验证记忆召回 — {DISPLAY_NAME} ({len(VERIFY_QUERIES)} 条查询)[/bold]"
+    )
 
     results_table = Table(
         title=f"记忆召回验证 — {DISPLAY_NAME}",
@@ -257,7 +293,11 @@ def run_verify(client: ov.SyncHTTPClient):
                     uri = getattr(m, "uri", "")
                     score = getattr(m, "score", 0)
                     console.print(f"    [green]Memory:[/green] {uri} (score: {score:.4f})")
-                    console.print(f"    [dim]{text[:120]}...[/dim]" if len(text) > 120 else f"    [dim]{text}[/dim]")
+                    console.print(
+                        f"    [dim]{text[:120]}...[/dim]"
+                        if len(text) > 120
+                        else f"    [dim]{text}[/dim]"
+                    )
                 count += len(results.memories)
 
             if hasattr(results, "resources") and results.resources:
@@ -265,9 +305,7 @@ def run_verify(client: ov.SyncHTTPClient):
                     text = getattr(r, "content", "") or getattr(r, "text", "") or str(r)
                     print(f"  [DEBUG] resource text: {repr(text)}")
                     recall_texts.append(text)
-                    console.print(
-                        f"    [blue]Resource:[/blue] {r.uri} (score: {r.score:.4f})"
-                    )
+                    console.print(f"    [blue]Resource:[/blue] {r.uri} (score: {r.score:.4f})")
                 count += len(results.resources)
 
             if hasattr(results, "skills") and results.skills:
@@ -275,8 +313,6 @@ def run_verify(client: ov.SyncHTTPClient):
 
             all_text = " ".join(recall_texts)
             hits = [kw for kw in expected if kw in all_text]
-            misses = [kw for kw in expected if kw not in all_text]
-
             # 格式化关键词，命中的绿色，未命中的红色
             formatted_keywords = []
             for kw in expected:
@@ -299,10 +335,9 @@ def run_verify(client: ov.SyncHTTPClient):
 
 def main():
     """入口函数"""
-    parser = argparse.ArgumentParser(description=f"OpenViking 记忆演示 — 工具调用和Skill调用")
+    parser = argparse.ArgumentParser(description="OpenViking 记忆演示 — 工具调用和Skill调用")
     parser.add_argument("--url", default=DEFAULT_URL, help=f"Server URL (默认: {DEFAULT_URL})")
-    parser.add_argument("--api-key", default=DEFAULT_API_KEY, help="API key")
-    parser.add_argument("--agent-id", default=DEFAULT_AGENT_ID, help="Agent ID")
+    parser.add_argument("--api-key", default=DEFAULT_API_KEY, help=API_KEY_HELP)
     parser.add_argument(
         "--phase",
         choices=["all", "ingest", "verify"],
@@ -312,16 +347,11 @@ def main():
     parser.add_argument(
         "--session-id", default=DEFAULT_SESSION_ID, help=f"Session ID (默认: {DEFAULT_SESSION_ID})"
     )
-    parser.add_argument(
-        "--wait", type=float, default=2, help="写入后等待秒数 (默认: 2)"
-    )
+    parser.add_argument("--wait", type=float, default=2, help="写入后等待秒数 (默认: 2)")
 
     args = parser.parse_args()
 
-    client = ov.SyncHTTPClient(
-        url=args.url, api_key=args.api_key, agent_id=args.agent_id,
-        timeout=180
-    )
+    client = ov.SyncHTTPClient(url=args.url, api_key=resolve_api_key(args.api_key), timeout=180)
 
     try:
         client.initialize()
@@ -342,9 +372,7 @@ def main():
         )
 
     except Exception as e:
-        console.print(
-            Panel(f"[bold red]Error:[/bold red] {e}", style="red", width=PANEL_WIDTH)
-        )
+        console.print(Panel(f"[bold red]Error:[/bold red] {e}", style="red", width=PANEL_WIDTH))
 
 
 if __name__ == "__main__":

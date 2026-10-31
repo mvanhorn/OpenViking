@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+import openviking
 from openviking.storage.vectordb.collection.collection import Collection, ICollection
 from openviking.storage.vectordb.collection.result import (
     AggregateResult,
@@ -13,12 +14,26 @@ from openviking.storage.vectordb.collection.result import (
     FetchDataInCollectionResult,
     SearchItemResult,
     SearchResult,
+    parse_remote_search_result,
 )
 
 # Default request timeout (seconds)
 DEFAULT_TIMEOUT = 30
 
-headers = {"Content-Type": "application/json"}
+headers = {
+    "Content-Type": "application/json",
+    "User-Agent": f"openviking/{openviking.__version__}",
+}
+
+
+def _parse_success_response(response, operation: str) -> Dict[str, Any]:
+    if response.status_code != 200:
+        raise RuntimeError(f"Failed to {operation}: HTTP {response.status_code}: {response.text}")
+    result = json.loads(response.text)
+    error_code = result.get("code")
+    if error_code != 0:
+        raise RuntimeError(f"Failed to {operation}: code {error_code}: {result.get('message', '')}")
+    return result
 
 
 def get_or_create_http_collection(
@@ -42,6 +57,10 @@ def get_or_create_http_collection(
     url = "http://{}:{}/CreateVikingdbCollection".format(host, port)
     if "Fields" in meta_data:
         meta_data["Fields"] = json.dumps(meta_data["Fields"])
+    if "FullText" in meta_data:
+        meta_data["FullText"] = json.dumps(meta_data["FullText"])
+    if "ScalarIndex" in meta_data:
+        meta_data["ScalarIndex"] = json.dumps(meta_data["ScalarIndex"])
     response = requests.post(url, headers=headers, json=meta_data, timeout=DEFAULT_TIMEOUT)
     # logger.info(f"CreateVikingdbCollection response: {response.text}")
     if response.status_code == 200:
@@ -199,7 +218,7 @@ class HttpCollection(ICollection):
     def update_index(
         self,
         index_name: str,
-        scalar_index: Optional[Dict[str, Any]] = None,
+        scalar_index: Optional[List[str]] = None,
         description: Optional[str] = None,
     ):
         data = {
@@ -207,7 +226,7 @@ class HttpCollection(ICollection):
             "CollectionName": self.collection_name,
             "IndexName": index_name,
         }
-        if scalar_index:
+        if scalar_index is not None:
             data["ScalarIndex"] = json.dumps(scalar_index)
         if description is not None:
             data["Description"] = description
@@ -279,6 +298,23 @@ class HttpCollection(ICollection):
         result = json.loads(response.text)
         return result.get("data", [])
 
+    def update_data(self, data_list: List[Dict[str, Any]]):
+        url = self.url_prefix + "api/vikingdb/data/update"
+        response = requests.post(
+            url,
+            headers=headers,
+            json={
+                "project": self.project_name,
+                "collection_name": self.collection_name,
+                "fields": json.dumps(data_list),
+            },
+            timeout=DEFAULT_TIMEOUT,
+        )
+        if response.status_code != 200:
+            return []
+        result = json.loads(response.text)
+        return result.get("data", [])
+
     def fetch_data(self, primary_keys: List[Any]) -> FetchDataInCollectionResult:
         url = self.url_prefix + "api/vikingdb/data/fetch_in_collection"
         response = requests.get(
@@ -301,8 +337,8 @@ class HttpCollection(ICollection):
         fetch_result = FetchDataInCollectionResult()
 
         if isinstance(data, dict):
-            if "fetch" in data:
-                fetch = data.get("fetch", [])
+            if "items" in data:
+                fetch = data.get("items", [])
                 fetch_result.items = [
                     DataItem(
                         id=item.get("id"),
@@ -328,9 +364,7 @@ class HttpCollection(ICollection):
             timeout=DEFAULT_TIMEOUT,
         )
         # logger.info(f"DeleteData response: {response.text}")
-        if response.status_code != 200:
-            return {}
-        result = json.loads(response.text)
+        result = _parse_success_response(response, "delete data")
         return result.get("data", {})
 
     def delete_all_data(self):
@@ -360,6 +394,8 @@ class HttpCollection(ICollection):
         filters: Optional[Dict[str, Any]] = None,
         sparse_vector: Optional[Dict[str, float]] = None,
         output_fields: Optional[List[str]] = None,
+        advance: Optional[Dict[str, Any]] = None,
+        return_detail_info: bool = False,
     ) -> SearchResult:
         url = self.url_prefix + "api/vikingdb/data/search/vector"
         response = requests.post(
@@ -375,6 +411,8 @@ class HttpCollection(ICollection):
                 "output_fields": json.dumps(output_fields) if output_fields else None,
                 "limit": limit,
                 "offset": offset,
+                **({"advance": advance} if advance is not None else {}),
+                **({"return_detail_info": True} if return_detail_info else {}),
             },
             timeout=DEFAULT_TIMEOUT,
         )
@@ -383,17 +421,7 @@ class HttpCollection(ICollection):
             return SearchResult()
 
         data = json.loads(response.text).get("data", {})
-        result = SearchResult()
-        if isinstance(data, dict) and "data" in data:
-            result.data = [
-                SearchItemResult(
-                    id=item.get("id"),
-                    fields=item.get("fields"),
-                    score=item.get("score"),
-                )
-                for item in data.get("data", [])
-            ]
-        return result
+        return parse_remote_search_result(data)
 
     def search_by_id(
         self,
@@ -490,27 +518,32 @@ class HttpCollection(ICollection):
         offset: int = 0,
         filters: Optional[Dict[str, Any]] = None,
         output_fields: Optional[List[str]] = None,
+        advance: Optional[Dict[str, Any]] = None,
     ) -> SearchResult:
         url = self.url_prefix + "api/vikingdb/data/search/random"
+        payload = {
+            "project": self.project_name,
+            "collection_name": self.collection_name,
+            "index_name": index_name,
+            "filter": json.dumps(filters) if filters else None,
+            "output_fields": json.dumps(output_fields) if output_fields else None,
+            "limit": limit,
+            "offset": offset,
+            "advance": json.dumps(advance) if advance else None,
+        }
+        payload = {k: v for k, v in payload.items() if v is not None}
         response = requests.post(
             url,
             headers=headers,
-            json={
-                "project": self.project_name,
-                "collection_name": self.collection_name,
-                "index_name": index_name,
-                "filter": json.dumps(filters) if filters else None,
-                "output_fields": json.dumps(output_fields) if output_fields else None,
-                "limit": limit,
-                "offset": offset,
-            },
+            json=payload,
             timeout=DEFAULT_TIMEOUT,
         )
         # logger.info(f"SearchByRandom response: {response.text}")
         if response.status_code != 200:
             return SearchResult()
+        payload = json.loads(response.text)
 
-        data = json.loads(response.text).get("data", {})
+        data = payload.get("data", {})
         result = SearchResult()
         if isinstance(data, dict) and "data" in data:
             result.data = [
@@ -532,22 +565,28 @@ class HttpCollection(ICollection):
         offset: int = 0,
         filters: Optional[Dict[str, Any]] = None,
         output_fields: Optional[List[str]] = None,
+        mode: Optional[str] = None,
+        fields: Optional[List[str]] = None,
     ) -> SearchResult:
         url = self.url_prefix + "api/vikingdb/data/search/keywords"
+        payload = {
+            "project": self.project_name,
+            "collection_name": self.collection_name,
+            "index_name": index_name,
+            "keywords": json.dumps(keywords) if keywords else None,
+            "query": query,
+            "mode": mode,
+            "fields": json.dumps(fields) if fields else None,
+            "filter": json.dumps(filters) if filters else None,
+            "output_fields": json.dumps(output_fields) if output_fields else None,
+            "limit": limit,
+            "offset": offset,
+        }
+        payload = {k: v for k, v in payload.items() if v is not None}
         response = requests.post(
             url,
             headers=headers,
-            json={
-                "project": self.project_name,
-                "collection_name": self.collection_name,
-                "index_name": index_name,
-                "keywords": json.dumps(keywords) if keywords else None,
-                "query": query,
-                "filter": json.dumps(filters) if filters else None,
-                "output_fields": json.dumps(output_fields) if output_fields else None,
-                "limit": limit,
-                "offset": offset,
-            },
+            json=payload,
             timeout=DEFAULT_TIMEOUT,
         )
         # logger.info(f"SearchByKeywords response: {response.text}")
@@ -595,8 +634,7 @@ class HttpCollection(ICollection):
             timeout=DEFAULT_TIMEOUT,
         )
         # logger.info(f"SearchByScalar response: {response.text}")
-        if response.status_code != 200:
-            return SearchResult()
+        response.raise_for_status()
 
         data = json.loads(response.text).get("data", {})
         result = SearchResult()
@@ -635,8 +673,7 @@ class HttpCollection(ICollection):
             },
             timeout=DEFAULT_TIMEOUT,
         )
-        if response.status_code != 200:
-            return AggregateResult(agg={}, op=op, field=field)
+        response.raise_for_status()
         result = json.loads(response.text)
         data = result.get("data", {})
         return self._parse_aggregate_result(data, op, field)

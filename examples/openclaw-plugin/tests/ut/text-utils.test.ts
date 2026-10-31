@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   sanitizeUserTextForCapture,
   getCaptureDecision,
-  isTranscriptLikeIngest,
+  extractNewTurnMessages,
   extractNewTurnTexts,
   extractLatestUserText,
   pickRecentUniqueTexts,
@@ -132,47 +132,6 @@ describe("getCaptureDecision", () => {
   });
 });
 
-describe("isTranscriptLikeIngest", () => {
-  it("multi-speaker transcript → shouldAssist=true", () => {
-    const text = "张三: 你好，今天项目进展如何？\n李四: 进展不错，基本完成了核心模块的开发工作\n张三: 很好，那我们下周可以开始测试了";
-    const result = isTranscriptLikeIngest(text, { minSpeakerTurns: 2, minChars: 50 });
-    expect(result.shouldAssist).toBe(true);
-    expect(result.reason).toBe("transcript_like_ingest");
-    expect(result.speakerTurns).toBeGreaterThanOrEqual(2);
-  });
-
-  it("single short text → shouldAssist=false", () => {
-    const result = isTranscriptLikeIngest("hello", { minSpeakerTurns: 2, minChars: 50 });
-    expect(result.shouldAssist).toBe(false);
-  });
-
-  it("empty text → shouldAssist=false", () => {
-    const result = isTranscriptLikeIngest("", { minSpeakerTurns: 2, minChars: 50 });
-    expect(result.shouldAssist).toBe(false);
-    expect(result.reason).toBe("empty_text");
-  });
-
-  it("command text → shouldAssist=false", () => {
-    const result = isTranscriptLikeIngest("/reset all the things and clear memory", { minSpeakerTurns: 2, minChars: 10 });
-    expect(result.shouldAssist).toBe(false);
-    expect(result.reason).toBe("command_text");
-  });
-
-  it("text below minChars → shouldAssist=false", () => {
-    const text = "Alice: hi\nBob: hello";
-    const result = isTranscriptLikeIngest(text, { minSpeakerTurns: 2, minChars: 200 });
-    expect(result.shouldAssist).toBe(false);
-    expect(result.reason).toBe("chars_below_threshold");
-  });
-
-  it("insufficient speaker turns → shouldAssist=false", () => {
-    const text = "这是一段很长的文本，但只有一个人在说话，没有任何说话人标签，只是纯粹的描述文字，超过了最小字符数要求";
-    const result = isTranscriptLikeIngest(text, { minSpeakerTurns: 2, minChars: 10 });
-    expect(result.shouldAssist).toBe(false);
-    expect(result.reason).toBe("speaker_turns_below_threshold");
-  });
-});
-
 describe("extractNewTurnTexts", () => {
   it("extracts user + assistant text messages", () => {
     const messages = [
@@ -196,18 +155,25 @@ describe("extractNewTurnTexts", () => {
     expect(texts[0]).toContain("[user]: hello");
   });
 
-  it("preserves toolUse content from assistant", () => {
+  it("preserves assistant text and associates toolUse with toolResult", () => {
     const messages = [
       {
         role: "assistant",
         content: [
           { type: "text", text: "Let me search" },
-          { type: "toolUse", name: "grep", input: { pattern: "TODO" } },
+          { type: "toolUse", id: "call_1", name: "grep", input: { pattern: "TODO" } },
         ],
+      },
+      {
+        role: "toolResult",
+        toolName: "grep",
+        toolCallId: "call_1",
+        content: [{ type: "text", text: "found 3 matches" }],
       },
     ];
     const { texts } = extractNewTurnTexts(messages, 0);
-    expect(texts.some((t) => t.includes("[toolUse: grep]"))).toBe(true);
+    expect(texts.some((t) => t.includes("[assistant]: Let me search"))).toBe(true);
+    expect(texts.some((t) => t.includes("[grep result]"))).toBe(true);
     expect(texts.some((t) => t.includes("TODO"))).toBe(true);
   });
 
@@ -253,6 +219,148 @@ describe("extractNewTurnTexts", () => {
     const { texts } = extractNewTurnTexts(messages, 0);
     expect(texts).toHaveLength(1);
     expect(texts[0]).toContain("[bash result]: exit code 0");
+  });
+});
+
+describe("extractNewTurnMessages", () => {
+  it("drops assistant toolCall messages that have no text block", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", text: "Need to inspect the file first." },
+          { type: "toolCall", id: "call_1", name: "read_file", arguments: { path: "a.txt" } },
+        ],
+      },
+    ];
+
+    const { messages: extracted, newCount } = extractNewTurnMessages(messages, 0);
+
+    expect(newCount).toBe(1);
+    expect(extracted).toEqual([]);
+  });
+
+  it("drops assistant toolUse messages that have no text block", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", text: "Search first." },
+          { type: "toolUse", id: "call_2", name: "grep", input: { pattern: "TODO" } },
+        ],
+      },
+    ];
+
+    const { messages: extracted, newCount } = extractNewTurnMessages(messages, 0);
+
+    expect(newCount).toBe(1);
+    expect(extracted).toEqual([]);
+  });
+
+  it("does not synthesize placeholders for multiple textless assistant tool calls", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          { type: "tool_call", id: "call_1", toolName: "read_file" },
+          { type: "tool_use", id: "call_2", name: "grep" },
+        ],
+      },
+    ];
+
+    const { messages: extracted } = extractNewTurnMessages(messages, 0);
+
+    expect(extracted).toEqual([]);
+  });
+
+  it("does not create a placeholder for textless assistant messages without tool calls", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [{ type: "thinking", text: "Internal reasoning only." }],
+      },
+    ];
+
+    const { messages: extracted, newCount } = extractNewTurnMessages(messages, 0);
+
+    expect(newCount).toBe(1);
+    expect(extracted).toEqual([]);
+  });
+
+  it("maps toolResult messages to assistant tool parts", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "call_1", name: "read", arguments: { path: "package.json" } },
+        ],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call_1",
+        toolName: "read",
+        content: [{ type: "text", text: "{\"name\":\"pkg\"}" }],
+      },
+    ];
+
+    const { messages: extracted } = extractNewTurnMessages(messages, 0);
+
+    expect(extracted).toEqual([
+      {
+        role: "assistant",
+        parts: [
+          {
+            type: "tool",
+            toolCallId: "call_1",
+            toolName: "read",
+            toolInput: { path: "package.json" },
+            toolOutput: "{\"name\":\"pkg\"}",
+            toolStatus: "completed",
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("preserves failed toolResult status", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "call_failed",
+            name: "ov_read",
+            arguments: { uri: "viking://user/test/memories/experiences/missing.md" },
+          },
+        ],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call_failed",
+        toolName: "ov_read",
+        content: [{ type: "text", text: "OpenViking request failed" }],
+        isError: true,
+      },
+    ];
+
+    const { messages: extracted } = extractNewTurnMessages(messages, 0);
+
+    expect(extracted).toEqual([
+      {
+        role: "assistant",
+        parts: [
+          {
+            type: "tool",
+            toolCallId: "call_failed",
+            toolName: "ov_read",
+            toolInput: { uri: "viking://user/test/memories/experiences/missing.md" },
+            toolOutput: "OpenViking request failed",
+            toolStatus: "error",
+          },
+        ],
+      },
+    ]);
   });
 });
 

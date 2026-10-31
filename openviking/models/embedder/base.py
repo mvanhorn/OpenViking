@@ -1,18 +1,123 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 import asyncio
+import contextvars
+import logging
 import random
 import time
 import weakref
 from abc import ABC, abstractmethod
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, TypeVar, Union
 
+from openviking.models.model_error import model_error_kind
 from openviking.telemetry import get_current_telemetry
-from openviking.utils.model_retry import retry_async, retry_sync
+from openviking.utils.embedding_input import (
+    resolve_embedding_max_input_tokens,
+    truncate_embedding_input,
+)
+from openviking.utils.exceptions import AllCredentialsFailedError
+from openviking.utils.model_retry import OrderedCredentialSwitcher
+from openviking_cli.utils import get_logger
 
 T = TypeVar("T")
+logger = get_logger(__name__)
+
+
+@dataclass
+class _SharedQueryEmbedding:
+    task: "asyncio.Task[EmbedResult]"
+    waiters: int = 0
+
+
+class QueryEmbeddingCache(dict[Any, _SharedQueryEmbedding]):
+    """Own in-flight query work for one request and track its waiters."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._pending_tasks: set[asyncio.Task] = set()
+
+    async def run(
+        self,
+        key: Any,
+        factory: Callable[[], Awaitable["EmbedResult"]],
+    ) -> "EmbedResult":
+        entry = self.get(key)
+        if entry is None:
+            entry = _SharedQueryEmbedding(asyncio.create_task(factory()))
+            self[key] = entry
+            entry.task.add_done_callback(lambda done: self._discard_unsuccessful(key, entry, done))
+
+        entry.waiters += 1
+        try:
+            return await asyncio.shield(entry.task)
+        finally:
+            entry.waiters -= 1
+            if entry.waiters == 0 and not entry.task.done():
+                if self.get(key) is entry:
+                    self.pop(key, None)
+                self._pending_tasks.add(entry.task)
+                entry.task.cancel()
+
+    def _discard_unsuccessful(
+        self,
+        key: Any,
+        entry: _SharedQueryEmbedding,
+        done: "asyncio.Task[EmbedResult]",
+    ) -> None:
+        self._pending_tasks.discard(done)
+        if (done.cancelled() or done.exception() is not None) and self.get(key) is entry:
+            self.pop(key, None)
+
+    async def close(self) -> None:
+        pending = {
+            entry.task for entry in self.values() if not entry.task.done()
+        } | {task for task in self._pending_tasks if not task.done()}
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self.clear()
+        self._pending_tasks.clear()
+
+
+# Request handlers install one cache around the fan-out that issues sibling
+# finds. Context copying gives every child task the same cache instance.
+query_embed_cache_var: contextvars.ContextVar[Optional[QueryEmbeddingCache]] = (
+    contextvars.ContextVar("ov_query_embed_cache", default=None)
+)
+
+
+@asynccontextmanager
+async def query_embed_cache_scope() -> AsyncIterator[None]:
+    """Install and clean up the request-scoped query embedding cache."""
+    cache = QueryEmbeddingCache()
+    token = query_embed_cache_var.set(cache)
+    try:
+        yield
+    finally:
+        await cache.close()
+        query_embed_cache_var.reset(token)
+
+
+def _query_cache_key(embedder: "EmbedderBase", embedding_input: "EmbeddingInput") -> tuple:
+    """Stable cache key for a prepared embedding input and its embedder.
+
+    Keyed by embedder identity rather than ``model_name`` so two embedder
+    instances that happen to share a name (e.g. a future dense/sparse pair)
+    never serve each other's vectors. The embedder is a long-lived process
+    singleton, so its id stays stable for the lifetime of the request scope.
+    """
+    if isinstance(embedding_input, str):
+        return (id(embedder), embedding_input)
+    return (id(embedder), repr(embedding_input))
+
+
+# A multimodal embedding input is a list of content parts, e.g.
+# [{"type": "text", "text": "..."}, {"type": "image_url", "image_url": {"url": "..."}}]
+EmbeddingInput = Union[str, List[Dict[str, Any]]]
 
 
 _token_tracker_instance = None
@@ -42,22 +147,85 @@ def _get_token_tracker():
     return _token_tracker_instance
 
 
-async def embed_compat(embedder: Any, text: str, *, is_query: bool = False) -> "EmbedResult":
-    """Call async embedding when available, otherwise fall back to sync embed()."""
-    embed_async = getattr(embedder, "embed_async", None)
-    if callable(embed_async):
-        return await embed_async(text, is_query=is_query)
-    return embedder.embed(text, is_query=is_query)
+def extract_text_from_content(content: "EmbeddingInput") -> str:
+    """Extract and join the text parts from a multimodal input.
+
+    ``content`` may be a plain string (returned as-is) or a list of content
+    parts such as ``[{"type": "text", "text": "..."}, {"type": "image_url", ...}]``.
+    Non-text parts (e.g. images) are ignored.
+    """
+    if isinstance(content, str):
+        return content
+    text_parts = [
+        part.get("text", "")
+        for part in content
+        if isinstance(part, dict) and part.get("type") == "text"
+    ]
+    return "\n".join(p for p in text_parts if p)
 
 
-async def embed_batch_compat(
-    embedder: Any, texts: List[str], *, is_query: bool = False
-) -> List["EmbedResult"]:
-    """Call async batch embedding when available, otherwise fall back to sync embed_batch()."""
-    embed_batch_async = getattr(embedder, "embed_batch_async", None)
-    if callable(embed_batch_async):
-        return await embed_batch_async(texts, is_query=is_query)
-    return embedder.embed_batch(texts, is_query=is_query)
+async def embed_compat(
+    embedder: "EmbedderBase", content: "EmbeddingInput", *, is_query: bool = False
+) -> "EmbedResult":
+    """Prepare input, then call the embedder's async-compatible entrypoint.
+
+    Accepts either a plain text string or a multimodal input (a list of content
+    parts). ``prepare_embedding_input`` downgrades multimodal inputs to text for
+    embedders that do not support images, so all embedders can be called the same
+    way.
+    """
+    from openviking.config.embedding import AccountBoundEmbedder
+    from openviking.telemetry import bind_telemetry_stage
+
+    if isinstance(embedder, AccountBoundEmbedder):
+        if is_query:
+            key = await embedder.query_embedding_cache_key(content)
+            return await _embed_from_request_cache(
+                key,
+                lambda: embedder.embed_compatible(content, is_query=True),
+            )
+        return await embedder.embed_compatible(content, is_query=is_query)
+    stage = "embed_query" if is_query else "embed_resource"
+    embedding_input = embedder.prepare_embedding_input(content)
+    if is_query:
+        return await _embed_from_request_cache(
+            _query_cache_key(embedder, embedding_input),
+            lambda: _embed_with_stage(embedder, embedding_input, stage),
+        )
+    with bind_telemetry_stage(stage):
+        return await embedder.embed_async(embedding_input, is_query=is_query)
+
+
+async def embedder_supports_multimodal(embedder: Any) -> bool:
+    """Whether ``embedder`` accepts image inputs.
+
+    Account-bound embedders resolve the account's current resource, so the
+    capability must be read asynchronously instead of from an attribute.
+    """
+    from openviking.config.embedding import AccountBoundEmbedder
+
+    if isinstance(embedder, AccountBoundEmbedder):
+        return await embedder.supports_multimodal_async()
+    return bool(getattr(embedder, "supports_multimodal", False))
+
+
+async def _embed_from_request_cache(
+    key: Any, factory: Callable[[], Awaitable["EmbedResult"]]
+) -> "EmbedResult":
+    """Run a query embed directly or through the current request cache."""
+    cache = query_embed_cache_var.get()
+    if cache is None:
+        return await factory()
+    return await cache.run(key, factory)
+
+
+async def _embed_with_stage(
+    embedder: "EmbedderBase", embedding_input: "EmbeddingInput", stage: str
+) -> "EmbedResult":
+    from openviking.telemetry import bind_telemetry_stage
+
+    with bind_telemetry_stage(stage):
+        return await embedder.embed_async(embedding_input, is_query=True)
 
 
 def truncate_and_normalize(embedding: List[float], dimension: Optional[int]) -> List[float]:
@@ -125,19 +293,59 @@ class EmbedderBase(ABC):
         """
         self.model_name = model_name
         self.config = config or {}
+        self.max_input_tokens = resolve_embedding_max_input_tokens(self.config)
         self.max_retries = int(self.config.get("max_retries", 3))
         self.max_concurrent = int(self.config.get("max_concurrent", 10))
         self.provider = self.config.get("provider", "unknown")
 
         # Token usage tracking
         self._token_tracker = _get_token_tracker()
+        self._active_call_started_at: float | None = None
+
+    def prepare_embedding_input(self, content: "EmbeddingInput") -> "EmbeddingInput":
+        """Apply this embedder's input guard before provider calls.
+
+        Plain text is truncated to ``max_input_tokens``. For embedders that
+        support images, multimodal inputs (a list of content parts) are kept as a
+        list. Embedders that do not support multimodal input get the
+        text parts extracted, so image parts are safely dropped.
+        """
+        if isinstance(content, list) and self.supports_multimodal:
+            if self.max_input_tokens is None:
+                return content
+            truncated_parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    part = {
+                        **part,
+                        "text": truncate_embedding_input(
+                            part.get("text", ""), self.max_input_tokens
+                        ),
+                    }
+                truncated_parts.append(part)
+            return truncated_parts
+        else:
+            content = extract_text_from_content(content)
+            if self.max_input_tokens is None:
+                return content
+            return truncate_embedding_input(content, self.max_input_tokens)
+
+    @property
+    def supports_multimodal(self) -> bool:
+        """Whether this embedder can consume multimodal (image) inputs directly.
+
+        Text-only embedders return False so that multimodal inputs are downgraded
+        to their text parts before being embedded.
+        """
+        return False
 
     @abstractmethod
-    def embed(self, text: str, is_query: bool = False) -> EmbedResult:
-        """Embed single text
+    def embed(self, content: "EmbeddingInput", is_query: bool = False) -> EmbedResult:
+        """Embed text or multimodal content.
 
         Args:
-            text: Input text
+            content: Input text, or a list of multimodal content parts such as
+                ``[{"type": "text", "text": "..."}, {"type": "image_url", "image_url": {"url": "..."}}]``
             is_query: Flag to indicate if this is a query embedding
 
         Returns:
@@ -145,87 +353,83 @@ class EmbedderBase(ABC):
         """
         pass
 
-    def embed_batch(self, texts: List[str], is_query: bool = False) -> List[EmbedResult]:
-        """Batch embedding (default implementation loops, subclasses can override for optimization)
+    def embed_query(self, text: str) -> EmbedResult:
+        """Embed query text with explicit retrieval-side semantics."""
+        return self.embed(text, is_query=True)
 
-        Args:
-            texts: List of texts
-            is_query: Flag to indicate if these are query embeddings
-
-        Returns:
-            List[EmbedResult]: List of embedding results
-        """
-        return [self.embed(text, is_query=is_query) for text in texts]
-
-    async def embed_async(self, text: str, is_query: bool = False) -> EmbedResult:
-        """Async embed single text.
+    async def embed_async(self, content: "EmbeddingInput", is_query: bool = False) -> EmbedResult:
+        """Async embed text or multimodal content.
 
         Subclasses should override this with a non-blocking implementation.
         The default implementation preserves compatibility for test doubles and
         third-party embedders that only implement the sync interface.
         """
-        return self.embed(text, is_query=is_query)
+        return self.embed(content, is_query=is_query)
 
-    async def embed_batch_async(
-        self, texts: List[str], is_query: bool = False
-    ) -> List[EmbedResult]:
-        """Async batch embedding."""
-        results: List[EmbedResult] = []
-        for text in texts:
-            results.append(await self.embed_async(text, is_query=is_query))
-        return results
+    async def embed_query_async(self, text: str) -> EmbedResult:
+        return await self.embed_async(text, is_query=True)
 
     def close(self):
         """Release resources, subclasses can override as needed"""
         pass
 
-    def _run_with_retry(self, func: Callable[[], T], *, logger=None, operation_name: str) -> T:
-        return retry_sync(
-            func,
-            max_retries=self.max_retries,
-            logger=logger,
-            operation_name=operation_name,
-        )
+    def _run_once(
+        self,
+        func: Callable[[], T],
+        *,
+        logger=None,
+        operation_name: str = "embedding",
+    ) -> T:
+        """Run one provider request with per-attempt timing state."""
+        previous_started_at = self._active_call_started_at
+        self._active_call_started_at = time.monotonic()
+        try:
+            return func()
+        finally:
+            self._active_call_started_at = previous_started_at
 
-    async def _run_with_async_retry(
+    async def _run_once_async(
         self,
         func: Callable[[], Awaitable[T]],
         *,
+        is_query: bool,
         logger=None,
         operation_name: str,
     ) -> T:
-        async def _wrapped() -> T:
-            semaphore = _get_async_embed_semaphore(self.max_concurrent)
+        """Limit document embedding concurrency while letting retrieval queries through."""
+        semaphore = None
+        wait_elapsed = 0.0
+        if not is_query:
+            semaphore = getattr(self, "_account_semaphore", None)
+            if semaphore is None:
+                semaphore = _get_async_embed_semaphore(self.max_concurrent)
             wait_started = time.monotonic()
             await semaphore.acquire()
             wait_elapsed = time.monotonic() - wait_started
-            telemetry = get_current_telemetry()
-            telemetry.set("embedding.async.max_concurrent", self.max_concurrent)
-            telemetry.set("embedding.async.wait_ms", round(wait_elapsed * 1000, 3))
+        telemetry = get_current_telemetry()
+        telemetry.set("embedding.async.max_concurrent", self.max_concurrent)
+        telemetry.set("embedding.async.wait_ms", round(wait_elapsed * 1000, 3))
 
-            started = time.monotonic()
-            try:
-                return await func()
-            finally:
-                elapsed = time.monotonic() - started
-                telemetry.set("embedding.async.duration_ms", round(elapsed * 1000, 3))
-                if logger and elapsed >= 1.0:
-                    logger.warning(
-                        "%s slow call provider=%s model=%s wait_ms=%.2f duration_ms=%.2f",
-                        operation_name,
-                        self.provider,
-                        self.model_name,
-                        wait_elapsed * 1000,
-                        elapsed * 1000,
-                    )
+        started = time.monotonic()
+        previous_started_at = self._active_call_started_at
+        self._active_call_started_at = started
+        try:
+            return await func()
+        finally:
+            elapsed = time.monotonic() - started
+            telemetry.set("embedding.async.duration_ms", round(elapsed * 1000, 3))
+            if logger and elapsed >= 3.0:
+                logger.warning(
+                    "%s slow call provider=%s model=%s wait_ms=%.2f duration_ms=%.2f",
+                    operation_name,
+                    self.provider,
+                    self.model_name,
+                    wait_elapsed * 1000,
+                    elapsed * 1000,
+                )
+            self._active_call_started_at = previous_started_at
+            if semaphore is not None:
                 semaphore.release()
-
-        return await retry_async(
-            _wrapped,
-            max_retries=self.max_retries,
-            logger=logger,
-            operation_name=operation_name,
-        )
 
     @property
     def is_dense(self) -> bool:
@@ -242,12 +446,25 @@ class EmbedderBase(ABC):
         """Check if result is hybrid (contains both dense and sparse vectors)"""
         return False
 
+    def _resolve_metrics_duration_seconds(self, duration_seconds: float = 0.0) -> float:
+        """Resolve per-call metrics duration from an explicit value or the active call timer."""
+        try:
+            normalized_duration = max(float(duration_seconds), 0.0)
+        except (TypeError, ValueError):
+            normalized_duration = 0.0
+        if normalized_duration > 0:
+            return normalized_duration
+        if self._active_call_started_at is None:
+            return 0.0
+        return max(time.monotonic() - self._active_call_started_at, 0.0)
+
     def update_token_usage(
         self,
         model_name: str,
         provider: str,
         prompt_tokens: int,
         completion_tokens: int,
+        duration_seconds: float = 0.0,
     ) -> None:
         """Update token usage
 
@@ -256,6 +473,7 @@ class EmbedderBase(ABC):
             provider: Provider name (openai, volcengine, etc.)
             prompt_tokens: Number of input tokens
             completion_tokens: Number of output tokens
+            duration_seconds: Wall-clock duration of the embedding provider call in seconds
         """
         self._token_tracker.update(
             model_name=model_name,
@@ -263,6 +481,33 @@ class EmbedderBase(ABC):
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
         )
+        try:
+            from openviking.metrics.datasources import EmbeddingEventDataSource
+            from openviking.observability.context import get_root_observability_context
+            from openviking.telemetry import get_ingestion_source_type
+
+            root_context = get_root_observability_context()
+
+            EmbeddingEventDataSource.record_call(
+                provider=str(provider),
+                model_name=str(model_name),
+                duration_seconds=self._resolve_metrics_duration_seconds(duration_seconds),
+                prompt_tokens=int(prompt_tokens),
+                completion_tokens=int(completion_tokens),
+                account_id=getattr(self, "_account_id", None)
+                or (root_context.account_id if root_context is not None else None),
+                source_type=get_ingestion_source_type(),
+            )
+        except Exception as e:
+            # Metrics must never break embedding execution.
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "embedding.update_token_usage metrics emit failed provider=%s model_name=%s err=%s: %s",
+                    provider,
+                    model_name,
+                    type(e).__name__,
+                    e,
+                )
 
     def get_token_usage(self) -> Dict[str, Any]:
         """Get token usage
@@ -303,11 +548,11 @@ class DenseEmbedderBase(EmbedderBase):
     """
 
     @abstractmethod
-    def embed(self, text: str, is_query: bool = False) -> EmbedResult:
-        """Perform dense embedding on text
+    def embed(self, content: "EmbeddingInput", is_query: bool = False) -> EmbedResult:
+        """Perform dense embedding on text or multimodal content
 
         Args:
-            text: Input text
+            content: Input text, or a list of multimodal content parts
             is_query: Flag to indicate if this is a query embedding
 
         Returns:
@@ -336,11 +581,11 @@ class SparseEmbedderBase(EmbedderBase):
     """
 
     @abstractmethod
-    def embed(self, text: str, is_query: bool = False) -> EmbedResult:
-        """Perform sparse embedding on text
+    def embed(self, content: "EmbeddingInput", is_query: bool = False) -> EmbedResult:
+        """Perform sparse embedding on text or multimodal content
 
         Args:
-            text: Input text
+            content: Input text, or a list of multimodal content parts
             is_query: Flag to indicate if this is a query embedding
 
         Returns:
@@ -365,11 +610,11 @@ class HybridEmbedderBase(EmbedderBase):
     """
 
     @abstractmethod
-    def embed(self, text: str, is_query: bool = False) -> EmbedResult:
-        """Perform hybrid embedding on text
+    def embed(self, content: "EmbeddingInput", is_query: bool = False) -> EmbedResult:
+        """Perform hybrid embedding on text or multimodal content
 
         Args:
-            text: Input text
+            content: Input text, or a list of multimodal content parts
             is_query: Flag to indicate if this is a query embedding
 
         Returns:
@@ -409,49 +654,61 @@ class CompositeHybridEmbedder(HybridEmbedderBase):
 
     def __init__(self, dense_embedder: DenseEmbedderBase, sparse_embedder: SparseEmbedderBase):
         """Initialize with two separate embedders"""
-        super().__init__(model_name=f"{dense_embedder.model_name}+{sparse_embedder.model_name}")
+        super().__init__(
+            model_name=f"{dense_embedder.model_name}+{sparse_embedder.model_name}",
+            config={},
+        )
         self.dense_embedder = dense_embedder
         self.sparse_embedder = sparse_embedder
 
-    def embed(self, text: str, is_query: bool = False) -> EmbedResult:
+    @property
+    def supports_multimodal(self) -> bool:
+        """Images are handled by the dense channel; sparse consumes only text."""
+        return self.dense_embedder.supports_multimodal
+
+    def _sparse_input(self, content: "EmbeddingInput") -> Optional[str]:
+        text = extract_text_from_content(content)
+        if isinstance(content, list) and not text.strip():
+            return None
+        return self.sparse_embedder.prepare_embedding_input(text)
+
+    def embed(self, content: "EmbeddingInput", is_query: bool = False) -> EmbedResult:
         """Combine results from both embedders"""
-        dense_res = self.dense_embedder.embed(text, is_query=is_query)
-        sparse_res = self.sparse_embedder.embed(text, is_query=is_query)
+        dense_input = self.dense_embedder.prepare_embedding_input(content)
+        sparse_input = self._sparse_input(content)
+        dense_res = self.dense_embedder.embed(dense_input, is_query=is_query)
+        sparse_res = (
+            self.sparse_embedder.embed(sparse_input, is_query=is_query)
+            if sparse_input is not None
+            else None
+        )
 
         return EmbedResult(
-            dense_vector=dense_res.dense_vector, sparse_vector=sparse_res.sparse_vector
+            dense_vector=dense_res.dense_vector,
+            sparse_vector=sparse_res.sparse_vector if sparse_res is not None else None,
         )
 
-    def embed_batch(self, texts: List[str], is_query: bool = False) -> List[EmbedResult]:
-        """Combine batch results"""
-        dense_results = self.dense_embedder.embed_batch(texts, is_query=is_query)
-        sparse_results = self.sparse_embedder.embed_batch(texts, is_query=is_query)
+    async def embed_async(self, content: "EmbeddingInput", is_query: bool = False) -> EmbedResult:
+        dense_input = self.dense_embedder.prepare_embedding_input(content)
+        sparse_input = self._sparse_input(content)
+        providers = [self.dense_embedder.embed_async(dense_input, is_query=is_query)]
+        if sparse_input is not None:
+            providers.append(self.sparse_embedder.embed_async(sparse_input, is_query=is_query))
+        calls = asyncio.gather(*providers, return_exceptions=True)
+        # Keep the parent borrow alive until every child has stopped. Shielding
+        # also lets cancellation wait for providers with asynchronous cleanup.
+        from openviking.service.task_tracker_concurrency import run_to_completion
 
-        return [
-            EmbedResult(dense_vector=d.dense_vector, sparse_vector=s.sparse_vector)
-            for d, s in zip(dense_results, sparse_results, strict=True)
-        ]
-
-    async def embed_async(self, text: str, is_query: bool = False) -> EmbedResult:
-        dense_res, sparse_res = await asyncio.gather(
-            self.dense_embedder.embed_async(text, is_query=is_query),
-            self.sparse_embedder.embed_async(text, is_query=is_query),
-        )
+        results = await run_to_completion(lambda: calls)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        dense_res = results[0]
+        sparse_res = results[1] if sparse_input is not None else None
         return EmbedResult(
-            dense_vector=dense_res.dense_vector, sparse_vector=sparse_res.sparse_vector
+            dense_vector=dense_res.dense_vector,
+            sparse_vector=sparse_res.sparse_vector if sparse_res is not None else None,
         )
-
-    async def embed_batch_async(
-        self, texts: List[str], is_query: bool = False
-    ) -> List[EmbedResult]:
-        dense_results, sparse_results = await asyncio.gather(
-            self.dense_embedder.embed_batch_async(texts, is_query=is_query),
-            self.sparse_embedder.embed_batch_async(texts, is_query=is_query),
-        )
-        return [
-            EmbedResult(dense_vector=d.dense_vector, sparse_vector=s.sparse_vector)
-            for d, s in zip(dense_results, sparse_results, strict=True)
-        ]
 
     def get_dimension(self) -> int:
         return self.dense_embedder.get_dimension()
@@ -524,3 +781,231 @@ def exponential_backoff_retry(
                 )
 
             time.sleep(delay)
+
+
+class FailoverEmbedder(EmbedderBase):
+    """Embedder wrapper that provides failover across multiple ordered credentials.
+
+    When a credential fails with a credential-level (auth) or quota/transient
+    error, this wrapper advances to the next credential in the list. After
+    failback thresholds are met, it attempts to move back to a higher-priority
+    credential.
+
+    Credentials are tried in order (index 0 is highest priority).
+    """
+
+    def __init__(
+        self,
+        embedders: List[EmbedderBase],
+        credential_ids: List[str],
+        failback_timeout_seconds: float = 600.0,
+        failback_request_count: int = 50,
+    ):
+        """Initialize FailoverEmbedder with multiple embedder instances.
+
+        Args:
+            embedders: List of embedder instances in priority order (0 is highest)
+            credential_ids: List of credential IDs corresponding to the embedder instances
+            failback_timeout_seconds: Time after which to attempt failback
+            failback_request_count: Number of requests after which to attempt failback
+
+        Note:
+            Request-level errors (e.g. HTTP 400 parameter error, input too
+            large, content safety) fail fast and re-raise the original
+            exception, since the same request fails on every credential of the
+            same model. Credential-level auth errors (401/403) advance to the
+            next credential; only the last credential fails fast. Per-credential
+            retry counts are handled by each underlying embedder; there is no
+            global retry cap.
+        """
+        if not embedders:
+            raise ValueError("At least one embedder instance is required")
+        if len(embedders) != len(credential_ids):
+            raise ValueError("embedders and credential_ids must have the same length")
+
+        # Use the first embedder's config as base
+        first = embedders[0]
+        super().__init__(
+            model_name=first.model_name,
+            config=first.config,
+        )
+
+        self._embedders = embedders
+        self._credential_ids = credential_ids
+        self._switcher = OrderedCredentialSwitcher(
+            n=len(embedders),
+            failback_timeout_seconds=failback_timeout_seconds,
+            failback_request_count=failback_request_count,
+        )
+
+    def _embed_with_failover(self, method_name: str, *args, **kwargs) -> EmbedResult:
+        """Execute an embedder method with multi-credential failover support.
+
+        Args:
+            method_name: Name of the method to call on embedder instances
+            *args: Positional arguments to pass to the method
+            **kwargs: Keyword arguments to pass to the method
+
+        Returns:
+            The result from the embedder method
+
+        Raises:
+            AllCredentialsFailedError if all credentials fail
+        """
+        aggregated_errors = []
+
+        # Start from the current (possibly failed-back) active credential, then
+        # cycle through the whole ring once so an unavailable active credential
+        # does not block the request. A credential that succeeds this cycle
+        # becomes the new active one (fast failover); slow sticky failback to
+        # higher priority is still handled by maybe_failback() across requests.
+        start = self._switcher.maybe_failback()
+        n = self._switcher.n
+
+        for offset in range(n):
+            idx = (start + offset) % n
+            credential_id = self._credential_ids[idx]
+            embedder = self._embedders[idx]
+
+            try:
+                method = getattr(embedder, method_name)
+                result = method(*args, **kwargs)
+                self._switcher.commit_success(idx)
+                return result
+            except Exception as exc:
+                kind = model_error_kind(exc)
+
+                if self._switcher.is_fail_fast(kind):
+                    # Request-level failure: re-raise the original exception;
+                    # trying other credentials is useless.
+                    raise
+                aggregated_errors.append((credential_id, kind, exc, idx))
+
+                logger.warning(
+                    "Credential %s failed with %s, trying next credential",
+                    credential_id,
+                    kind.value,
+                )
+
+        raise AllCredentialsFailedError(aggregated_errors)
+
+    async def _embed_with_failover_async(self, method_name: str, *args, **kwargs) -> EmbedResult:
+        """Execute an async embedder method with multi-credential failover support.
+
+        Args:
+            method_name: Name of the async method to call on embedder instances
+            *args: Positional arguments to pass to the method
+            **kwargs: Keyword arguments to pass to the method
+
+        Returns:
+            The result from the async embedder method
+
+        Raises:
+            AllCredentialsFailedError if all credentials fail
+        """
+        aggregated_errors = []
+
+        # See the sync variant for the ring-traversal rationale.
+        start = self._switcher.maybe_failback()
+        n = self._switcher.n
+
+        for offset in range(n):
+            idx = (start + offset) % n
+            credential_id = self._credential_ids[idx]
+            embedder = self._embedders[idx]
+
+            try:
+                method = getattr(embedder, method_name)
+                result = await method(*args, **kwargs)
+                self._switcher.commit_success(idx)
+                return result
+            except Exception as exc:
+                kind = model_error_kind(exc)
+
+                if self._switcher.is_fail_fast(kind):
+                    # Request-level failure: re-raise the original exception;
+                    # trying other credentials is useless.
+                    raise
+                aggregated_errors.append((credential_id, kind, exc, idx))
+
+                logger.warning(
+                    "Credential %s failed with %s, trying next credential",
+                    credential_id,
+                    kind.value,
+                )
+
+        raise AllCredentialsFailedError(aggregated_errors)
+
+    @property
+    def supports_multimodal(self) -> bool:
+        """Whether all embedders support multimodal input."""
+        return all(embedder.supports_multimodal for embedder in self._embedders)
+
+    def embed(self, content: "EmbeddingInput", is_query: bool = False) -> EmbedResult:
+        """Embed text or multimodal content with multi-credential failover support."""
+        return self._embed_with_failover("embed", content, is_query=is_query)
+
+    async def embed_async(self, content: "EmbeddingInput", is_query: bool = False) -> EmbedResult:
+        """Async embed with multi-credential failover support."""
+        return await self._embed_with_failover_async("embed_async", content, is_query=is_query)
+
+    def get_dimension(self) -> int:
+        """Get the dense dimension from the first embedder.
+
+        Raises:
+            AttributeError: if the wrapped embedders are sparse; sparse
+                embedders have no fixed dense dimension, so a dimension should
+                never be requested from them.
+        """
+        first = self._embedders[0]
+        if not hasattr(first, "get_dimension"):
+            raise AttributeError(
+                f"{type(first).__name__} has no get_dimension "
+                "(sparse embedders have no fixed dimension)"
+            )
+        return first.get_dimension()
+
+    @property
+    def active_credential_id(self) -> str:
+        """Get the ID of the currently active credential."""
+        idx = self._switcher.get_active_index()
+        if idx < len(self._credential_ids):
+            return self._credential_ids[idx]
+        return "exhausted"
+
+    @property
+    def is_dense(self) -> bool:
+        """Check if the first embedder is dense."""
+        return self._embedders[0].is_dense
+
+    @property
+    def is_sparse(self) -> bool:
+        """Check if the first embedder is sparse."""
+        return self._embedders[0].is_sparse
+
+    @property
+    def is_hybrid(self) -> bool:
+        """Check if the first embedder is hybrid."""
+        return self._embedders[0].is_hybrid
+
+    def close(self):
+        """Close all embedder instances."""
+        for embedder in self._embedders:
+            embedder.close()
+
+    def get_token_usage(self) -> Dict[str, Any]:
+        """Get combined token usage across credential instances.
+
+        Embedders share a process-wide singleton token tracker (see
+        ``_get_token_tracker``), so every wrapped embedder reports the same
+        usage. Return a single instance's usage directly; merging would
+        double-count.
+        """
+        if not self._embedders:
+            return {}
+        return self._embedders[0].get_token_usage()
+
+    def reset_token_usage(self) -> None:
+        """Reset token usage for all credential instances."""
+        for embedder in self._embedders:
+            embedder.reset_token_usage()

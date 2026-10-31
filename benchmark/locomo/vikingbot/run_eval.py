@@ -1,14 +1,22 @@
 import argparse
-import json
-import subprocess
-import time
+import contextlib
 import csv
+import json
 import os
 import re
+import subprocess
+import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+
+from progress_utils import (
+    ThreadSafeProgressTracker,
+    make_three_state_progress,
+    should_show_progress,
+)
 
 
 def get_evidence_text(evidence_list: list, sample: dict) -> list[str]:
@@ -154,9 +162,30 @@ def load_locomo_qa(
         samples = data
 
     for sample in samples:
-        sample_id = sample.get("sample_id", "")
+        original_sample_id = sample.get("sample_id", "")
+        # Find the sample's index in the full dataset
+        if sample_index is not None:
+            try:
+                data_idx = int(sample_index)
+            except ValueError:
+                data_idx = next(
+                    i for i, s in enumerate(data) if s.get("sample_id") == original_sample_id
+                )
+        else:
+            data_idx = next(
+                i for i, s in enumerate(data) if s.get("sample_id") == original_sample_id
+            )
+        benchmark_sample_id = f"sample_{data_idx}"
         question_time = get_sample_question_time(sample)
         qa_items = sample.get("qa", [])
+
+        # 获取对话中的所有说话者
+        conv = sample.get("conversation", {})
+        speakers = []
+        if conv.get("speaker_a"):
+            speakers.append(conv["speaker_a"])
+        if conv.get("speaker_b"):
+            speakers.append(conv["speaker_b"])
 
         # 如果指定了 question_index，只返回那一个问题
         if question_index is not None:
@@ -166,18 +195,20 @@ def load_locomo_qa(
                 )
             qa = qa_items[question_index]
             evidence_list = qa.get("evidence", [])
-            question_id = f"{sample_id}_qa{question_index}"
+            question_id = f"{benchmark_sample_id}_qa{question_index}"
             qa_list.append(
                 {
-                    "sample_id": sample_id,
+                    "sample_id": benchmark_sample_id,
                     "question_id": question_id,
                     "question_index": question_index,
                     "question": qa["question"],
-                    "answer": qa["answer"],
+                    "answer": qa.get("answer", qa.get("adversarial_answer", "")),
                     "category": qa.get("category", ""),
                     "evidence": evidence_list,
                     "evidence_text": get_evidence_text(evidence_list, sample),
                     "question_time": question_time,
+                    "speakers": speakers,
+                    "original_sample_id": original_sample_id,
                     "is_invalid": qa["question"] in invalid_questions
                     if invalid_questions
                     else False,
@@ -186,18 +217,20 @@ def load_locomo_qa(
         else:
             for q_idx, qa in enumerate(qa_items):
                 evidence_list = qa.get("evidence", [])
-                question_id = f"{sample_id}_qa{q_idx}"
+                question_id = f"{benchmark_sample_id}_qa{q_idx}"
                 qa_list.append(
                     {
-                        "sample_id": sample_id,
+                        "sample_id": benchmark_sample_id,
                         "question_id": question_id,
                         "question_index": q_idx,
                         "question": qa["question"],
-                        "answer": qa["answer"],
+                        "answer": qa.get("answer", qa.get("adversarial_answer", "")),
                         "category": qa.get("category", ""),
                         "evidence": evidence_list,
                         "evidence_text": get_evidence_text(evidence_list, sample),
                         "question_time": question_time,
+                        "speakers": speakers,
+                        "original_sample_id": original_sample_id,
                         "is_invalid": qa["question"] in invalid_questions
                         if invalid_questions
                         else False,
@@ -212,26 +245,47 @@ def load_locomo_qa(
 def run_vikingbot_chat(
     question: str,
     question_time: str | None = None,
-    sample_id: str | None = None,
+    sender_peer_id: str | None = None,
     question_id: str | None = None,
-) -> tuple[str, dict, float, int, list]:
+    config: str | None = None,
+    memory_peer_ids: list[str] | None = None,
+) -> tuple[str, dict, float, int, list, str]:
     """执行vikingbot chat命令，返回回答、token使用情况、耗时（秒）、迭代次数、使用的工具列表"""
+    bot_log_file = build_bot_log_file(question_id)
+    env = os.environ.copy()
+    if bot_log_file:
+        env["VIKINGBOT_LOG_FILE"] = bot_log_file
+    # LoCoMo disables general-purpose tools and OpenViking writes and exports.
+    chat_cmd = ["vikingbot", "chat"]
+    for tool_name in (
+        "web_search", "web_fetch", "exec", "read_file", "write_file", "edit_file",
+        "list_dir", "spawn", "message", "generate_image", "openviking_export",
+        "openviking_memory_commit", "openviking_add_resource",
+    ):
+        chat_cmd.extend(["--disable-tool", tool_name])
+
     # 先执行 /new 命令清除会话
-    if sample_id:
-        new_cmd = [
-            "vikingbot",
-            "chat",
-            "-m",
-            "/new",
-            "-e",
-            "--sender",
-            sample_id,
-            "--session",
-            question_id,
-        ]
+    if sender_peer_id:
+        new_cmd = chat_cmd.copy()
+        if config:
+            new_cmd.extend(["--config", config])
+        new_cmd.extend(
+            [
+                "-m",
+                "/new",
+                "-e",
+                "--sender",
+                sender_peer_id,
+                "--session",
+                question_id,
+            ]
+        )
+        if memory_peer_ids:
+            for peer_id in memory_peer_ids:
+                new_cmd.extend(["--memory-peer", peer_id])
         try:
             # print(f'new_cmd={new_cmd}')
-            subprocess.run(new_cmd, capture_output=True, text=True, timeout=60)
+            subprocess.run(new_cmd, capture_output=True, text=True, timeout=300, env=env)
         except Exception:
             # 忽略 /new 命令的错误
             pass
@@ -242,19 +296,28 @@ def run_vikingbot_chat(
     else:
         input = f"Answer the question directly: {question}"
 
-    cmd = ["vikingbot", "chat", "-m", input, "-e"]
-    # 添加 --sender 作为 user_id，--session 作为 agent_id，实现访问独立 userspace
-    if sample_id:
-        cmd.extend(["--sender", sample_id, "--session", question_id])
+    cmd = chat_cmd.copy()
+    if config:
+        cmd.extend(["--config", config])
+    cmd.extend(["-m", input, "-e"])
+    # 添加 --sender 作为当前 peer，--session 作为会话隔离标识
+    if sender_peer_id:
+        cmd.extend(["--sender", sender_peer_id, "--session", question_id])
+    # 添加 --memory-peer 参数，指定当前 User 下需要一并检索的额外 peer 记忆
+    if memory_peer_ids:
+        for peer_id in memory_peer_ids:
+            cmd.extend(["--memory-peer", peer_id])
     start_time = time.time()
     try:
         # print(f'cmd={cmd}')
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=300)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=True, timeout=600, env=env
+        )
         end_time = time.time()
         time_cost = end_time - start_time
 
         output = result.stdout.strip()
-        # 解析返回的json结果，处理换行、多余前缀等特殊情况
+        # 解析返回的 JSON 结果
         try:
             resp_json = json.loads(output, strict=False)
             response = resp_json.get("text", "")
@@ -264,12 +327,12 @@ def run_vikingbot_chat(
             time_cost = resp_json.get("time_cost", time_cost)
             iteration = resp_json.get("iteration", 0)
             tools_used_names = resp_json.get("tools_used_names", [])
-        except (json.JSONDecodeError, ValueError) as e:
+        except (json.JSONDecodeError, ValueError):
             response = f"[PARSE ERROR] {output}"
             token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
             iteration = 0
             tools_used_names = []
-        return response, token_usage, time_cost, iteration, tools_used_names
+        return response, token_usage, time_cost, iteration, tools_used_names, bot_log_file
     except subprocess.CalledProcessError as e:
         return (
             f"[CMD ERROR] {e.stderr}",
@@ -277,6 +340,7 @@ def run_vikingbot_chat(
             0,
             0,
             [],
+            bot_log_file,
         )
     except subprocess.TimeoutExpired:
         time_cost = 0
@@ -286,13 +350,62 @@ def run_vikingbot_chat(
             time_cost,
             0,
             [],
+            bot_log_file,
         )
 
 
-def load_processed_questions(output_path: str) -> set:
-    """加载已处理的问题集合（已禁用，每次重新运行）"""
-    # 注意：去重逻辑已禁用，每次运行都会重新执行所有问题
-    return set()
+def sanitize_log_name(value: str | None) -> str:
+    text = value or f"qa_{int(time.time() * 1000)}"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._") or "qa"
+
+
+def build_bot_log_file(question_id: str | None) -> str:
+    log_dir = os.environ.get("LOCOMO_VIKINGBOT_LOG_DIR")
+    if not log_dir:
+        return ""
+
+    path = Path(log_dir).expanduser()
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path / f"vikingbot.{sanitize_log_name(question_id)}.log")
+
+
+def load_processed_questions(output_path: str, skip_done: bool = False) -> set[str]:
+    """加载已处理的问题集合。"""
+    if not skip_done or not os.path.exists(output_path):
+        return set()
+
+    processed_questions = set()
+    with open(output_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            question = row.get("question")
+            if question:
+                processed_questions.add(question)
+    return processed_questions
+
+
+def append_row_to_csv(output_path: str, fieldnames: list[str], row: dict) -> None:
+    """追加单行结果到 CSV。"""
+    file_exists = os.path.exists(output_path)
+    if file_exists:
+        with open(output_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            existing_fieldnames = reader.fieldnames or []
+            existing_rows = list(reader)
+        missing_fields = [field for field in fieldnames if field not in existing_fieldnames]
+        if missing_fields:
+            merged_fieldnames = [*existing_fieldnames, *missing_fields]
+            with open(output_path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=merged_fieldnames)
+                writer.writeheader()
+                writer.writerows(existing_rows)
+            fieldnames = merged_fieldnames
+
+    with open(output_path, "a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def main():
@@ -310,13 +423,18 @@ def main():
     )
     parser.add_argument(
         "--output",
-        default="./result/locomo_qa_result.csv",
-        help="Path to output csv file, default: ./result/locomo_qa_result.csv",
+        default="./result/locomo/locomo_qa_result.csv",
+        help="Path to output csv file, default: ./result/locomo/locomo_qa_result.csv",
     )
     parser.add_argument(
         "--errors",
         default=default_errors,
         help="Path to invalid questions JSON file",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Path to config file to pass through to vikingbot chat",
     )
     parser.add_argument(
         "--sample",
@@ -334,12 +452,33 @@ def main():
         "--count", type=int, default=None, help="Number of QA questions to run, default all"
     )
     parser.add_argument(
-        "--threads", type=int, default=40, help="Number of concurrent threads, default: 40"
+        "--threads", type=int, default=100, help="Number of concurrent threads, default: 100"
     )
     parser.add_argument(
         "--update-mode",
         action="store_true",
         help="Update mode: if output file exists, update matching question_index rows instead of overwriting",
+    )
+    parser.add_argument(
+        "--group-chat",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Group-chat mode: use speaker peers for sender/memory-peer (default: false).",
+    )
+    parser.add_argument(
+        "--retry-wrong",
+        default=None,
+        help="Path to a judged result CSV. Only re-evaluate valid rows where result=WRONG.",
+    )
+    parser.add_argument(
+        "--skip-done",
+        action="store_true",
+        help="Skip questions already present in the output file",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable the live progress bar (fall back to line-by-line logs). Auto-disabled when stderr is not a TTY.",
     )
     args = parser.parse_args()
 
@@ -365,6 +504,25 @@ def main():
     else:
         print(f"No errors file found at {errors_path}, is_invalid will be False for all questions")
 
+    # --retry-wrong: 从结果 CSV 中提取有效错题
+    retry_wrong_questions = None
+    if args.retry_wrong:
+        retry_wrong_questions = set()
+        retry_wrong_samples = set()
+        with open(args.retry_wrong, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("is_invalid", "").lower() == "true":
+                    continue
+                if row.get("result") == "WRONG":
+                    retry_wrong_questions.add(row["question"])
+                    retry_wrong_samples.add(row["sample_id"])
+        print(
+            f"[retry-wrong] Found {len(retry_wrong_questions)} valid wrong questions from {args.retry_wrong}"
+        )
+        if retry_wrong_samples:
+            print(f"[retry-wrong] Affected samples: {', '.join(sorted(retry_wrong_samples))}")
+
     # 加载QA数据（所有题目，包括无效题目，只标记 is_invalid）
     qa_list = load_locomo_qa(
         args.input,
@@ -375,12 +533,18 @@ def main():
     )
     total = len(qa_list)
 
+    # --retry-wrong: 只保留错题
+    if retry_wrong_questions is not None:
+        before = len(qa_list)
+        qa_list = [qa for qa in qa_list if qa["question"] in retry_wrong_questions]
+        print(f"[retry-wrong] Filtered {before} -> {len(qa_list)} questions (only wrong ones)")
+
     # 过滤掉 category=5 的问题
     qa_list = [qa for qa in qa_list if str(qa.get("category")) != "5"]
     print(f"Filtered to {len(qa_list)} questions after removing category=5")
 
     # 加载已处理的问题
-    processed_questions = load_processed_questions(args.output)
+    processed_questions = load_processed_questions(args.output, skip_done=args.skip_done)
     remaining = total - len(processed_questions)
     print(
         f"Loaded {total} QA questions, {len(processed_questions)} already processed, {remaining} remaining"
@@ -402,10 +566,14 @@ def main():
         "time_cost",
         "iteration",
         "tools_used_names",
+        "bot_log_file",
     ]
 
     # 创建线程锁，确保多线程写文件安全
     write_lock = threading.Lock()
+
+    if not args.update_mode and not args.skip_done and os.path.exists(args.output):
+        os.remove(args.output)
 
     # 存储处理后的新行
     new_rows = []
@@ -415,108 +583,144 @@ def main():
     remaining_qa = [qa for qa in qa_list if qa["question"] not in processed_questions]
     remaining_count = len(remaining_qa)
     print(
-        f"Starting evaluation with {args.threads} concurrent threads, {remaining_count} questions to process"
+        f"Starting evaluation with {args.threads} concurrent threads, {remaining_count} questions to process",
+        file=sys.stderr,
     )
+
+    show_progress = should_show_progress(args.no_progress)
+
+    if show_progress:
+        progress, task_id = make_three_state_progress(description="Eval")
+        progress_tracker = ThreadSafeProgressTracker(progress, task_id, total=remaining_count)
+    else:
+        progress = None
+        progress_tracker = None
 
     def process_qa(qa_item, idx, total_count):
         """单个QA处理函数，供多线程调用"""
-        question = qa_item["question"]
-        answer = qa_item["answer"]
-        question_time = qa_item.get("question_time")
-        # 使用 question_id 作为 session_id，实现完全独立并行
-        sample_id = qa_item.get("sample_id")
-        question_id = qa_item.get("question_id")
-        print(f"Processing {idx}/{total_count}: {question[:60]}...")
-        if question_time:
-            print(f"  [time context: {question_time}]")
+        if progress_tracker is not None:
+            progress_tracker.job_started()
 
-        response, token_usage, time_cost, iteration, tools_used_names = run_vikingbot_chat(
-            question, question_time, sample_id, question_id
-        )
+        failed = False
+        try:
+            question = qa_item["question"]
+            answer = qa_item["answer"]
+            question_time = qa_item.get("question_time")
+            # 使用 question_id 作为 session_id，实现完全独立并行
+            question_id = qa_item.get("question_id")
+            speakers = qa_item.get("speakers", [])
+            source_sample_id = qa_item.get("original_sample_id")
+            sender_peer_id = source_sample_id
+            memory_peer_ids = None
+            if args.group_chat:
+                sender_peer_id = speakers[0] if speakers else source_sample_id
+                memory_peer_ids = speakers[1:] if len(speakers) > 1 else None
 
-        row = {
-            "sample_id": qa_item["sample_id"],
-            "question_index": qa_item.get("question_index", ""),
-            "result": "",
-            "question": question,
-            "answer": answer,
-            "category": qa_item.get("category", ""),
-            "question_time": question_time or "",
-            "evidence": json.dumps(qa_item.get("evidence", [])),
-            "evidence_text": json.dumps(qa_item.get("evidence_text", [])),
-            "response": response,
-            "token_usage": json.dumps(token_usage, ensure_ascii=False),
-            "time_cost": round(time_cost, 2),
-            "iteration": iteration,
-            "tools_used_names": json.dumps(tools_used_names, ensure_ascii=False),
-            "is_invalid": qa_item.get("is_invalid", False),
-        }
+            if not show_progress:
+                print(f"Processing {idx}/{total_count}: {question[:60]}...")
+                if question_time:
+                    print(f"  [time context: {question_time}]")
+                if source_sample_id:
+                    print(f"  [sample peer: {source_sample_id}]")
+                if speakers:
+                    print(f"  [speakers: {speakers}]")
+                if sender_peer_id:
+                    print(f"  [sender peer: {sender_peer_id}]")
+                if memory_peer_ids:
+                    print(f"  [memory peers: {memory_peer_ids}]")
 
-        # 线程安全的结果收集
-        with write_lock:
-            nonlocal processed_count
-            new_rows.append(row)
-            processed_questions.add(question)
-            processed_count += 1
-            print(f"Completed {processed_count}/{total_count}, time cost: {round(time_cost, 2)}s")
-        return True
+            response, token_usage, time_cost, iteration, tools_used_names, bot_log_file = (
+                run_vikingbot_chat(
+                    question,
+                    question_time,
+                    sender_peer_id,
+                    question_id,
+                    args.config,
+                    memory_peer_ids,
+                )
+            )
+
+            row = {
+                "sample_id": qa_item["sample_id"],
+                "question_index": qa_item.get("question_index", ""),
+                "result": "",
+                "question": question,
+                "answer": answer,
+                "category": qa_item.get("category", ""),
+                "question_time": question_time or "",
+                "evidence": json.dumps(qa_item.get("evidence", [])),
+                "evidence_text": json.dumps(qa_item.get("evidence_text", [])),
+                "response": response,
+                "token_usage": json.dumps(token_usage, ensure_ascii=False),
+                "time_cost": round(time_cost, 2),
+                "iteration": iteration,
+                "tools_used_names": json.dumps(tools_used_names, ensure_ascii=False),
+                "bot_log_file": bot_log_file,
+                "is_invalid": qa_item.get("is_invalid", False),
+            }
+
+            # 线程安全的结果收集
+            with write_lock:
+                nonlocal processed_count
+                if args.update_mode:
+                    if os.path.exists(args.output):
+                        with open(args.output, "r", encoding="utf-8", newline="") as f:
+                            reader = csv.DictReader(f)
+                            existing_rows = list(reader)
+                            existing_fieldnames = reader.fieldnames or fieldnames
+                        if "bot_log_file" not in existing_fieldnames:
+                            existing_fieldnames.append("bot_log_file")
+
+                        q_idx = str(row.get("question_index", ""))
+                        found = False
+                        for existing_row in existing_rows:
+                            if str(existing_row.get("question_index", "")) == q_idx:
+                                existing_row.update(row)
+                                found = True
+                                break
+                        if not found:
+                            existing_rows.append(row)
+
+                        with open(args.output, "w", encoding="utf-8", newline="") as f:
+                            writer = csv.DictWriter(f, fieldnames=existing_fieldnames)
+                            writer.writeheader()
+                            writer.writerows(existing_rows)
+                    else:
+                        append_row_to_csv(args.output, fieldnames, row)
+                else:
+                    append_row_to_csv(args.output, fieldnames, row)
+
+                new_rows.append(row)
+                processed_questions.add(question)
+                processed_count += 1
+                if not show_progress:
+                    print(f"Completed {processed_count}/{total_count}, time cost: {round(time_cost, 2)}s")
+
+            return True
+        except Exception:
+            failed = True
+            raise
+        finally:
+            if progress_tracker is not None:
+                progress_tracker.job_finished(failed=failed)
 
     # 使用线程池处理：全局并行，每个 question 独立 session
-    with ThreadPoolExecutor(max_workers=args.threads) as executor:
-        # 提交所有任务
-        futures = []
-        for idx, qa_item in enumerate(remaining_qa, 1):
-            futures.append(executor.submit(process_qa, qa_item, idx, remaining_count))
+    ctx = progress if show_progress else contextlib.nullcontext()
+    with ctx:
+        with ThreadPoolExecutor(max_workers=args.threads) as executor:
+            # 提交所有任务
+            futures = []
+            for idx, qa_item in enumerate(remaining_qa, 1):
+                futures.append(executor.submit(process_qa, qa_item, idx, remaining_count))
 
-        # 等待所有任务完成
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                print(f"Error processing QA item: {str(e)}")
+            # 等待所有任务完成
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Error processing QA item: {str(e)}", file=sys.stderr)
 
-    # 写文件逻辑
-    if args.update_mode and os.path.exists(args.output):
-        # 更新模式：读取现有文件，更新匹配行
-        print(f"Update mode: updating existing file {args.output}")
-        with open(args.output, "r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            existing_rows = list(reader)
-            existing_fieldnames = reader.fieldnames or fieldnames
-
-        # 更新匹配的行
-        updated_count = 0
-        for new_row in new_rows:
-            q_idx = str(new_row.get("question_index", ""))
-            found = False
-            for row in existing_rows:
-                if str(row.get("question_index", "")) == q_idx:
-                    row.update(new_row)
-                    found = True
-                    updated_count += 1
-                    break
-            if not found:
-                existing_rows.append(new_row)
-                updated_count += 1
-
-        # 写回文件
-        with open(args.output, "w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=existing_fieldnames)
-            writer.writeheader()
-            writer.writerows(existing_rows)
-
-        print(f"Updated {updated_count} rows in {args.output}")
-    else:
-        # 普通模式：覆盖写入
-        if os.path.exists(args.output):
-            os.remove(args.output)
-
-        with open(args.output, "w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(new_rows)
-
-        print(f"Evaluation completed, results saved to {args.output}")
+    print(f"Evaluation completed, results saved to {args.output}")
 
 
 if __name__ == "__main__":

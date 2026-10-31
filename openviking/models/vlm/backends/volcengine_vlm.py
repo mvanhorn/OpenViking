@@ -2,19 +2,56 @@
 # SPDX-License-Identifier: AGPL-3.0
 """VolcEngine VLM backend implementation."""
 
-import asyncio
 import base64
 import json
-import logging
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+from openviking.models.model_error import model_error_boundary
+from openviking.models.network import (
+    create_optional_async_httpx_client,
+    create_optional_sync_httpx_client,
+)
 from openviking.telemetry import tracer
+from openviking.utils.message_format import format_messages, sanitize_openai_messages
+from openviking.utils.multimodal import redact_image_data_urls
+from openviking_cli.utils import get_logger
+
 from ..base import ToolCall, VLMResponse
 from .openai_vlm import OpenAIVLM
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+
+VOLCENGINE_CLIENT_REQUEST_ID_HEADER = "X-Client-Request-Id"
+VOLCENGINE_CLIENT_REQUEST_ID = "ToB-direct,OpenViking_Service,openviking-service_cn-beijing"
+DEFAULT_VOLCENGINE_API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
+
+
+def _build_volcengine_headers(extra_headers: Optional[Dict[str, str]]) -> Dict[str, str]:
+    headers = dict(extra_headers or {})
+    if not any(k.lower() == VOLCENGINE_CLIENT_REQUEST_ID_HEADER.lower() for k in headers):
+        headers[VOLCENGINE_CLIENT_REQUEST_ID_HEADER] = VOLCENGINE_CLIENT_REQUEST_ID
+    return headers
+
+
+def build_volcengine_request_headers(
+    extra_headers: Optional[Dict[str, str]],
+) -> Dict[str, str]:
+    """Return per-request headers with a unique default client request ID.
+
+    The existing prefix identifies OpenViking service traffic. A UUID suffix
+    makes an individual Ark request searchable while custom client request ID
+    values remain unchanged.
+    """
+    headers = _build_volcengine_headers(extra_headers)
+    header_key = next(
+        key for key in headers if key.lower() == VOLCENGINE_CLIENT_REQUEST_ID_HEADER.lower()
+    )
+    if headers[header_key] == VOLCENGINE_CLIENT_REQUEST_ID:
+        headers[header_key] = f"{VOLCENGINE_CLIENT_REQUEST_ID},{uuid.uuid4().hex}"
+    return headers
 
 
 class VolcEngineVLM(OpenAIVLM):
@@ -23,13 +60,13 @@ class VolcEngineVLM(OpenAIVLM):
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
         self._sync_client = None
-        self._async_client = None
         self.provider = "volcengine"
+        self.extra_headers = _build_volcengine_headers(self.extra_headers)
 
         if not self.api_base:
-            self.api_base = "https://ark.cn-beijing.volces.com/api/v3"
+            self.api_base = DEFAULT_VOLCENGINE_API_BASE
         if not self.model:
-            self.model = "doubao-seed-2-0-pro-260215"
+            self.model = "doubao-seed-2-0-lite-260428"
 
     def _parse_tool_calls(self, message) -> List[ToolCall]:
         """Parse tool calls from VolcEngine response message."""
@@ -47,9 +84,13 @@ class VolcEngineVLM(OpenAIVLM):
 
     def _build_vlm_response(self, response, has_tools: bool) -> Union[str, VLMResponse]:
         """Build response from Chat Completions response. Returns str or VLMResponse based on has_tools."""
+        if isinstance(response, str):
+            return VLMResponse(content=response) if has_tools else response
+
         choice = response.choices[0]
         message = choice.message
-        tracer.info(f"message.content={message.content}")
+        if hasattr(message, "tool_calls") and message.tool_calls:
+            tracer.info(f"message.tool_calls={message.tool_calls}")
         if has_tools:
             usage = {}
             if hasattr(response, "usage") and response.usage:
@@ -58,6 +99,9 @@ class VolcEngineVLM(OpenAIVLM):
                     "completion_tokens": response.usage.completion_tokens,
                     "total_tokens": response.usage.total_tokens,
                     "prompt_tokens_details": getattr(response.usage, "prompt_tokens_details", None),
+                    "completion_tokens_details": getattr(
+                        response.usage, "completion_tokens_details", None
+                    ),
                 }
 
             return VLMResponse(
@@ -77,107 +121,192 @@ class VolcEngineVLM(OpenAIVLM):
                 raise ImportError(
                     "Please install volcenginesdkarkruntime: pip install volcenginesdkarkruntime"
                 )
-            self._sync_client = volcenginesdkarkruntime.Ark(
-                api_key=self.api_key,
-                base_url=self.api_base,
+            kwargs = {
+                "api_key": self.api_key,
+                "base_url": self.api_base,
+                "timeout": self.timeout,
+                "max_retries": 0,
+            }
+            http_client = create_optional_sync_httpx_client(
+                self.api_base,
+                timeout=self.timeout,
             )
+            if http_client is not None:
+                kwargs["http_client"] = http_client
+            self._sync_client = volcenginesdkarkruntime.Ark(**kwargs)
         return self._sync_client
 
-    def get_async_client(self):
-        """Get async client"""
-        if self._async_client is None:
-            try:
-                import volcenginesdkarkruntime
-            except ImportError:
-                raise ImportError(
-                    "Please install volcenginesdkarkruntime: pip install volcenginesdkarkruntime"
-                )
-            self._async_client = volcenginesdkarkruntime.AsyncArk(
-                api_key=self.api_key,
-                base_url=self.api_base,
+    def _build_async_client(self):
+        """Create an async client for the current event loop."""
+        try:
+            import volcenginesdkarkruntime
+        except ImportError:
+            raise ImportError(
+                "Please install volcenginesdkarkruntime: pip install volcenginesdkarkruntime"
             )
-        return self._async_client
+        kwargs = {
+            "api_key": self.api_key,
+            "base_url": self.api_base,
+            "timeout": self.timeout,
+            "max_retries": 0,
+        }
+        http_client = create_optional_async_httpx_client(
+            self.api_base,
+            timeout=self.timeout,
+        )
+        if http_client is not None:
+            kwargs["http_client"] = http_client
+        return volcenginesdkarkruntime.AsyncArk(**kwargs)
 
+    def supports_media(
+        self,
+        *,
+        media_type: str,
+        filename: str,
+        size_bytes: int,
+    ) -> bool:
+        from .volcengine_media import supports_media
+
+        return supports_media(
+            media_type=media_type,
+            filename=filename,
+            size_bytes=size_bytes,
+        )
+
+    async def get_media_completion_async(
+        self,
+        *,
+        prompt: str,
+        media_path: Path,
+        filename: str,
+        media_type: str,
+    ) -> str:
+        from .volcengine_media import understand_media
+
+        return await understand_media(
+            self,
+            prompt=prompt,
+            media_path=media_path,
+            filename=filename,
+            media_type=media_type,
+        )
+
+    @model_error_boundary
     def get_completion(
         self,
         prompt: str = "",
-        thinking: bool = False,
+        thinking: Optional[bool] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Union[str, VLMResponse]:
-        """Get text completion via Chat Completions API."""
-        kwargs_messages = messages or [{"role": "user", "content": prompt}]
+        """Get text completion; configured effort applies only when thinking is enabled."""
+        effective_thinking = self.thinking if thinking is None else thinking
+        kwargs_messages = sanitize_openai_messages(
+            messages or [{"role": "user", "content": prompt}]
+        )
         kwargs = {
-            "model": self.model or "doubao-seed-2-0-pro-260215",
+            "model": self.model or "doubao-seed-2-0-lite-260428",
             "messages": kwargs_messages,
             "temperature": self.temperature,
-            "thinking": {"type": "disabled" if not thinking else "enabled"},
+            "thinking": {"type": "disabled" if not effective_thinking else "enabled"},
+            "extra_headers": build_volcengine_request_headers(self.extra_headers),
         }
+        if self.extra_request_body:
+            kwargs["extra_body"] = dict(self.extra_request_body)
         if self.max_tokens is not None:
             kwargs["max_tokens"] = self.max_tokens
+        if effective_thinking and self.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = self.reasoning_effort
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
 
         client = self.get_client()
         t0 = time.perf_counter()
-        response = client.chat.completions.create(**kwargs)
+        try:
+            response = client.chat.completions.create(**kwargs)
+        except Exception as error:
+            self.record_failed_call(duration_seconds=time.perf_counter() - t0, error=error)
+            raise
         elapsed = time.perf_counter() - t0
         self._update_token_usage_from_response(response, duration_seconds=elapsed)
-        result = self._build_vlm_response(response, has_tools=bool(tools))
-        if tools:
+        if tools is not None:
+            result = self._build_vlm_response(response, has_tools=True)
+            if not tools:
+                result.content = self._clean_response(result.content or "")
             return result
+        result = self._build_vlm_response(response, has_tools=False)
         return self._clean_response(str(result))
 
-    @tracer("volcengine.vlm.call", ignore_result=True, ignore_args=False)
+    @model_error_boundary
     async def get_completion_async(
         self,
         prompt: str = "",
-        thinking: bool = False,
+        thinking: Optional[bool] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> Union[str, VLMResponse]:
-        """Get text completion asynchronously via Chat Completions API."""
-        kwargs_messages = messages or [{"role": "user", "content": prompt}]
+        """Get text completion; explicit effort overrides configured effort when thinking is enabled."""
+        effective_thinking = self.thinking if thinking is None else thinking
+        if reasoning_effort is None:
+            reasoning_effort = self.reasoning_effort
+        effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+        kwargs_messages = sanitize_openai_messages(
+            messages or [{"role": "user", "content": prompt}]
+        )
         kwargs = {
-            "model": self.model or "doubao-seed-2-0-pro-260215",
+            "model": self.model or "doubao-seed-2-0-lite-260428",
             "messages": kwargs_messages,
             "temperature": self.temperature,
-            "thinking": {"type": "disabled" if not thinking else "enabled"},
+            "thinking": {"type": "disabled" if not effective_thinking else "enabled"},
+            "extra_headers": build_volcengine_request_headers(self.extra_headers),
         }
-        if self.max_tokens is not None:
-            kwargs["max_tokens"] = self.max_tokens
+        if self.extra_request_body:
+            kwargs["extra_body"] = dict(self.extra_request_body)
+        if effective_max_tokens is not None:
+            kwargs["max_tokens"] = effective_max_tokens
+        if effective_thinking and reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
 
-        # 用 tracer.info 打印请求
-        tracer.info(f"request: {json.dumps(kwargs_messages, ensure_ascii=False, indent=2)}")
+        # 用 tracer.info 打印请求（人类可读格式）
+        tracer.info(
+            "llm_input_messages=" + format_messages(redact_image_data_urls(kwargs_messages))
+        )
+        if tools:
+            tracer.info(
+                f"tools: {json.dumps([t['function']['name'] for t in tools], ensure_ascii=False)}"
+            )
 
         client = self.get_async_client()
 
-        last_error = None
-        for attempt in range(self.max_retries + 1):
+        async def _call() -> Union[str, VLMResponse]:
+            t0 = time.perf_counter()
             try:
-                t0 = time.perf_counter()
                 response = await client.chat.completions.create(**kwargs)
-                elapsed = time.perf_counter() - t0
-                self._update_token_usage_from_response(response, duration_seconds=elapsed)
-                result = self._build_vlm_response(response, has_tools=bool(tools))
-                if tools:
-                    return result
-                return self._clean_response(str(result))
-            except Exception as e:
-                last_error = e
-                if attempt < self.max_retries:
-                    await asyncio.sleep(2**attempt)
+            except Exception as error:
+                self.record_failed_call(duration_seconds=time.perf_counter() - t0, error=error)
+                raise
+            elapsed = time.perf_counter() - t0
+            self._update_token_usage_from_response(response, duration_seconds=elapsed)
+            if tools is not None:
+                result = self._build_vlm_response(response, has_tools=True)
+                if not tools:
+                    result.content = self._clean_response(result.content or "")
+                return result
+            result = self._build_vlm_response(response, has_tools=False)
+            content = self._clean_response(str(result))
+            if content:
+                tracer.info(f"message.content={content}")
+            return content
 
-        if last_error:
-            raise last_error
-        else:
-            raise RuntimeError("Unknown error in async completion")
+        return await _call()
 
     def _detect_image_format(self, data: bytes) -> str:
         """Detect image format from magic bytes.
@@ -293,84 +422,110 @@ class VolcEngineVLM(OpenAIVLM):
         else:
             return {"type": "image_url", "image_url": {"url": image}}
 
+    @model_error_boundary
     def get_vision_completion(
         self,
         prompt: str = "",
         images: Optional[List[Union[str, Path, bytes]]] = None,
-        thinking: bool = False,
+        thinking: Optional[bool] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Union[str, VLMResponse]:
         """Get vision completion via Chat Completions API."""
+        effective_thinking = self.thinking if thinking is None else thinking
         if messages:
-            kwargs_messages = messages
+            kwargs_messages = sanitize_openai_messages(messages)
         else:
             content = []
             if images:
                 content.extend(self._prepare_image(img) for img in images)
             if prompt:
                 content.append({"type": "text", "text": prompt})
-            kwargs_messages = [{"role": "user", "content": content}]
+            kwargs_messages = sanitize_openai_messages([{"role": "user", "content": content}])
 
         kwargs = {
-            "model": self.model or "doubao-seed-2-0-pro-260215",
+            "model": self.model or "doubao-seed-2-0-lite-260428",
             "messages": kwargs_messages,
             "temperature": self.temperature,
-            "thinking": {"type": "disabled" if not thinking else "enabled"},
+            "thinking": {"type": "disabled" if not effective_thinking else "enabled"},
+            "extra_headers": build_volcengine_request_headers(self.extra_headers),
         }
+        if self.extra_request_body:
+            kwargs["extra_body"] = dict(self.extra_request_body)
         if self.max_tokens is not None:
             kwargs["max_tokens"] = self.max_tokens
         if tools:
             kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
+            kwargs["tool_choice"] = tool_choice or "auto"
 
         client = self.get_client()
         t0 = time.perf_counter()
-        response = client.chat.completions.create(**kwargs)
+        try:
+            response = client.chat.completions.create(**kwargs)
+        except Exception as error:
+            self.record_failed_call(duration_seconds=time.perf_counter() - t0, error=error)
+            raise
         elapsed = time.perf_counter() - t0
         self._update_token_usage_from_response(response, duration_seconds=elapsed)
-        result = self._build_vlm_response(response, has_tools=bool(tools))
-        if tools:
+        if tools is not None:
+            result = self._build_vlm_response(response, has_tools=True)
+            if not tools:
+                result.content = self._clean_response(result.content or "")
             return result
+        result = self._build_vlm_response(response, has_tools=False)
         return self._clean_response(str(result))
 
+    @model_error_boundary
     async def get_vision_completion_async(
         self,
         prompt: str = "",
         images: Optional[List[Union[str, Path, bytes]]] = None,
-        thinking: bool = False,
+        thinking: Optional[bool] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Union[str, VLMResponse]:
         """Get vision completion asynchronously via Chat Completions API."""
+        effective_thinking = self.thinking if thinking is None else thinking
         if messages:
-            kwargs_messages = messages
+            kwargs_messages = sanitize_openai_messages(messages)
         else:
             content = []
             if images:
                 content.extend(self._prepare_image(img) for img in images)
             if prompt:
                 content.append({"type": "text", "text": prompt})
-            kwargs_messages = [{"role": "user", "content": content}]
+            kwargs_messages = sanitize_openai_messages([{"role": "user", "content": content}])
 
         kwargs = {
-            "model": self.model or "doubao-seed-2-0-pro-260215",
+            "model": self.model or "doubao-seed-2-0-lite-260428",
             "messages": kwargs_messages,
             "temperature": self.temperature,
-            "thinking": {"type": "disabled" if not thinking else "enabled"},
+            "thinking": {"type": "disabled" if not effective_thinking else "enabled"},
+            "extra_headers": build_volcengine_request_headers(self.extra_headers),
         }
+        if self.extra_request_body:
+            kwargs["extra_body"] = dict(self.extra_request_body)
         if self.max_tokens is not None:
             kwargs["max_tokens"] = self.max_tokens
         if tools:
             kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
+            kwargs["tool_choice"] = tool_choice or "auto"
 
         client = self.get_async_client()
         t0 = time.perf_counter()
-        response = await client.chat.completions.create(**kwargs)
+        try:
+            response = await client.chat.completions.create(**kwargs)
+        except Exception as error:
+            self.record_failed_call(duration_seconds=time.perf_counter() - t0, error=error)
+            raise
         elapsed = time.perf_counter() - t0
         self._update_token_usage_from_response(response, duration_seconds=elapsed)
-        result = self._build_vlm_response(response, has_tools=bool(tools))
-        if tools:
+        if tools is not None:
+            result = self._build_vlm_response(response, has_tools=True)
+            if not tools:
+                result.content = self._clean_response(result.content or "")
             return result
+        result = self._build_vlm_response(response, has_tools=False)
         return self._clean_response(str(result))

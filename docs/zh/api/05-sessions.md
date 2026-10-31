@@ -1,34 +1,67 @@
-# 会话管理
+# 会话
 
-会话用于管理对话状态、跟踪上下文使用情况，并提取长期记忆。
+会话用于管理对话状态、跟踪上下文使用情况，并提取长期记忆。会话采用分层存储（L0/L1/L2）来优化 token 使用：
+- L0（abstract）: 会话概览摘要
+- L1（overview）: 关键决策和总结
+- L2（messages）: 完整消息
+
+会话存储在当前用户命名空间下：
+
+```text
+viking://user/{user_id}/sessions/{session_id}
+```
+
+Session API 按认证用户作用域访问会话，并返回 canonical user session URI。
+基于 URI 的 API 可以使用 `viking://~/sessions/{session_id}` 表示当前用户的会话。
 
 ## API 参考
 
 ### create_session()
 
-创建新会话。
+#### 1. API 实现介绍
+
+创建新会话。会话是对话的容器，用于存储消息、跟踪上下文使用情况，并支持提交以提取长期记忆。
+
+**处理流程**：
+1. 生成或使用提供的 session_id
+2. 初始化会话元数据（创建时间、用户信息等）
+3. 在存储中创建会话目录结构
+4. 返回会话信息
+
+**代码入口**：
+- `openviking/session/session.py:Session.__init__()` - Session 核心类
+- `openviking/session/auto_commit_policy.py:AutoCommitPolicy` - 自动 commit 策略的默认值与校验
+- `openviking/server/routers/sessions.py:create_session()` - HTTP 路由
+- `sdk/python/openviking_sdk/client.py:AsyncHTTPClient.create_session()` - Python SDK
+- `crates/ov_cli/src/commands/session.rs:new_session()` - CLI 命令
+
+#### 2. 接口和参数说明
 
 **参数**
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | session_id | str | 否 | None | 会话 ID。如果为 None，则创建一个自动生成 ID 的新会话 |
+| memory_policy | object | 否 | None | 会话默认的记忆抽取策略。可选的 `self` 和 `peer` 开关控制写入目标；`working_memory.enabled` 默认 `false`，不生成归档摘要和 checkpoint 摘要，显式设为 `true` 才会生成；可选的顶层 `memory_types` 将抽取限制为指定的 enabled memory schema。包含 `experiences` 时会自动激活 `cases` 和 `trajectories`；不包含 `experiences` 时，显式传入的 `cases` 和 `trajectories` 会被忽略。所有 `enabled` 值都应使用 JSON 布尔值。旧版 boolean-like 值暂时仍兼容（字符串 `"false"` 会正确解析为 false），但会产生弃用警告。`memory_types` 未传或为 `null` 时允许所有 enabled memory schema。非法结构或未知 memory type 会以 `InvalidArgumentError` 拒绝。 |
+| auto_commit_policy | object | 否 | None | 可选的自动 commit 策略（见下表）。传入的字段会被校验并 clamp 到取值范围，然后合并到默认值之上；最终生效的策略会在响应的 `result.auto_commit_policy` 中返回，并持久化到 session meta。省略时，新 Session 先继承 `server.user_config_defaults.auto_commit_policy`，再沿用现有 `memory.session_auto_commit.enabled` 行为。之后可通过 `update_session_config()` 部分更新或禁用该策略。 |
 
-**Python SDK (Embedded / HTTP)**
+`auto_commit_policy` 字段（均为可选；存在 policy 时，未传字段回退到默认值）：
 
-```python
-# 创建新会话（自动生成 ID）
-session = client.session()
-print(f"Session URI: {session.uri}")
+| 字段 | 类型 | 默认值 | 最小值 | 上限 | 说明 |
+|------|------|--------|--------|------|------|
+| `pending_token_threshold` | int | 150000 | 0 | 1000000 | 当未提交的 pending token 超过该值（严格大于）时，会在消息写入后触发一次自动 commit。 |
+| `message_count_threshold` | int | 100 | 0 | 1000 | 当未提交的 live message 数量超过该值（严格大于）时，会在消息写入后触发一次自动 commit。 |
+| `idle_timeout_seconds` | int | 86400 | 0（关闭）或 300 | 604800 | 有未提交内容的 session 在空闲这么多秒后，进入服务端 idle scheduler 的处理范围。idle 触发的 commit 会归档全部积压消息，并忽略 `keep_recent_count`。 |
+| `keep_recent_count` | int | 0 | 0 | 500 | 阈值触发的自动 commit 后保留（不归档）的最近 live message 数量。idle 超时触发的 commit 会忽略该值并归档所有消息。 |
+| `min_commit_interval_seconds` | int | 0 | 0 | 604800 | 两次自动 commit 之间的最小间隔秒数（节流）。 |
 
-# 创建指定 ID 的新会话
-session = client.create_session(session_id="my-custom-session-id")
-print(f"Session ID: {session['session_id']}")
-```
+新传入的 `idle_timeout_seconds` 必须为 `0`（关闭）或不小于 `300`，超过 `604800` 时会被 clamp 到该上限；为兼容存量数据，已经保存的小于 300 的正值仍按原值读取。其他字段最小值为 `0`，并会被 clamp 到各自范围。未知字段会以 `InvalidArgumentError` 拒绝。idle 超时还要求服务端开启 `memory.session_auto_commit.enabled`；仅设置 `idle_timeout_seconds` 不会启动扫描器。
+
+#### 3. 使用示例
 
 **HTTP API**
 
-```
+```http
 POST /api/v1/sessions
 ```
 
@@ -43,24 +76,93 @@ curl -X POST http://localhost:1933/api/v1/sessions \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-key" \
   -d '{"session_id": "my-custom-session-id"}'
+
+# 创建带自定义自动 commit 策略的新会话
+curl -X POST http://localhost:1933/api/v1/sessions \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{
+    "auto_commit_policy": {
+      "pending_token_threshold": 8000,
+      "message_count_threshold": 40,
+      "idle_timeout_seconds": 600,
+      "keep_recent_count": 10,
+      "min_commit_interval_seconds": 0
+    }
+  }'
+```
+
+**Python SDK**
+
+```python
+import openviking_sdk as ov
+
+# 使用 HTTP 客户端
+client = ov.SyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+client.initialize()
+
+# 创建新会话（自动生成 ID）
+result = client.create_session()
+print(f"Session ID: {result['session_id']}")
+
+# 创建指定 ID 的新会话
+result = client.create_session(session_id="my-custom-session-id")
+print(f"Session ID: {result['session_id']}")
+
+# 创建带自定义自动 commit 策略的新会话
+result = client.create_session(
+    options={
+        "auto_commit_policy": {
+            "pending_token_threshold": 8000,
+            "message_count_threshold": 40,
+            "idle_timeout_seconds": 600,
+            "keep_recent_count": 10,
+            "min_commit_interval_seconds": 0,
+        },
+    },
+)
+print(result["auto_commit_policy"])
+```
+
+**TypeScript SDK**
+
+```typescript
+const session = await client.createSession();
+console.log(session);
+```
+
+**Go SDK**
+
+```go
+session, err := client.CreateSession(ctx, &openviking.CreateSessionOptions{
+    SessionID: "my-custom-session-id",
+})
+if err != nil {
+    return err
+}
+fmt.Println(session["session_id"])
 ```
 
 **CLI**
 
 ```bash
-openviking session new
+ov session new
 ```
 
-**响应**
+**响应示例**
 
 ```json
 {
   "status": "ok",
   "result": {
     "session_id": "a1b2c3d4",
-    "user": "alice"
-  },
-  "time": 0.1
+    "uri": "viking://user/alice/sessions/a1b2c3d4",
+    "user": {
+      "account_id": "default",
+      "user_id": "alice"
+    },
+    "auto_commit_policy": null
+  }
 }
 ```
 
@@ -68,19 +170,26 @@ openviking session new
 
 ### list_sessions()
 
-列出所有会话。
+#### 1. API 实现介绍
 
-**Python SDK (Embedded / HTTP)**
+列出当前用户的所有会话。返回会话 ID 和 URI 信息，用于进一步操作会话。
 
-```python
-sessions = client.ls("viking://session/")
-for s in sessions:
-    print(f"{s['name']}")
-```
+**代码入口**：
+- `openviking/server/routers/sessions.py:list_sessions()` - HTTP 路由
+- `sdk/python/openviking_sdk/client.py:AsyncHTTPClient.list_sessions()` - Python SDK
+- `crates/ov_cli/src/commands/session.rs:list_sessions()` - CLI 命令
+
+#### 2. 接口和参数说明
+
+**参数**
+
+无参数。
+
+#### 3. 使用示例
 
 **HTTP API**
 
-```
+```http
 GET /api/v1/sessions
 ```
 
@@ -89,22 +198,60 @@ curl -X GET http://localhost:1933/api/v1/sessions \
   -H "X-API-Key: your-key"
 ```
 
+**Python SDK**
+
+```python
+from openviking_sdk import SyncHTTPClient
+
+client = SyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+client.initialize()
+
+sessions = client.list_sessions()
+for s in sessions:
+    print(f"{s['session_id']} -> {s['uri']}")
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.listSessions());
+```
+
+**Go SDK**
+
+```go
+sessions, err := client.ListSessions(ctx)
+if err != nil {
+    return err
+}
+for _, session := range sessions {
+    fmt.Println(session)
+}
+```
+
 **CLI**
 
 ```bash
-openviking session list
+ov session list
 ```
 
-**响应**
+**响应示例**
 
 ```json
 {
   "status": "ok",
   "result": [
-    {"session_id": "a1b2c3d4", "user": "alice"},
-    {"session_id": "e5f6g7h8", "user": "bob"}
-  ],
-  "time": 0.1
+    {
+      "session_id": "a1b2c3d4",
+      "uri": "viking://user/alice/sessions/a1b2c3d4",
+      "is_dir": true
+    },
+    {
+      "session_id": "e5f6g7h8",
+      "uri": "viking://user/alice/sessions/e5f6g7h8",
+      "is_dir": true
+    }
+  ]
 }
 ```
 
@@ -112,7 +259,25 @@ openviking session list
 
 ### get_session()
 
-获取会话详情。默认当会话不存在时返回 NOT_FOUND 错误，可通过 `auto_create=True` 自动创建。
+#### 1. API 实现介绍
+
+获取会话详情，包括元数据、消息统计、提交历史等。支持在会话不存在时自动创建。
+
+**返回字段说明**：
+- `message_count`: 当前 live session 中尚未归档的消息数
+- `total_message_count`: 已归档消息与当前 live 消息的累计总数（旧会话可能不返回此字段）
+- `commit_count`: 成功提交的次数
+- `memories_extracted`: 各类记忆的提取数量统计
+- `last_commit_at`: 最后一次提交的时间
+- `auto_commit_policy`: 填充默认值后的生效自动 commit 策略；未启用时为 `null`
+
+**代码入口**：
+- `openviking/session/session.py:Session.load()` - 会话加载
+- `openviking/server/routers/sessions.py:get_session()` - HTTP 路由
+- `sdk/python/openviking_sdk/client.py:AsyncHTTPClient.get_session()` - Python SDK
+- `crates/ov_cli/src/commands/session.rs:get_session()` - CLI 命令
+
+#### 2. 接口和参数说明
 
 **参数**
 
@@ -121,20 +286,11 @@ openviking session list
 | session_id | str | 是 | - | 会话 ID |
 | auto_create | bool | 否 | False | 会话不存在时是否自动创建 |
 
-**Python SDK (Embedded / HTTP)**
-
-```python
-# 获取已有会话（不存在时抛 NotFoundError）
-info = client.get_session("a1b2c3d4")
-print(f"Messages: {info['message_count']}, Commits: {info['commit_count']}")
-
-# 获取或创建会话
-info = client.get_session("a1b2c3d4", auto_create=True)
-```
+#### 3. 使用示例
 
 **HTTP API**
 
-```
+```http
 GET /api/v1/sessions/{session_id}?auto_create=false
 ```
 
@@ -143,13 +299,57 @@ curl -X GET http://localhost:1933/api/v1/sessions/a1b2c3d4 \
   -H "X-API-Key: your-key"
 ```
 
+**Python SDK**
+
+```python
+import openviking_sdk as ov
+
+client = ov.SyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+client.initialize()
+
+# 获取已有会话（不存在时抛 NotFoundError）
+info = client.get_session(session_id="a1b2c3d4")
+print(f"Live Messages: {info['message_count']}")
+print(f"Total Messages: {info.get('total_message_count', 'n/a')}")
+print(f"Commits: {info['commit_count']}")
+
+# 获取或创建会话
+info = client.get_session(session_id="a1b2c3d4", auto_create=True)
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.getSession("session-id"));
+```
+
+**Go SDK**
+
+```go
+// 获取已有会话
+info, err := client.GetSession(ctx, "a1b2c3d4", nil)
+if err != nil {
+    return err
+}
+fmt.Println(info["message_count"])
+
+// 获取或创建会话
+info, err = client.GetSession(ctx, "a1b2c3d4", &openviking.GetSessionOptions{
+    AutoCreate: true,
+})
+if err != nil {
+    return err
+}
+fmt.Println(info["session_id"])
+```
+
 **CLI**
 
 ```bash
-openviking session get a1b2c3d4
+ov session get a1b2c3d4
 ```
 
-**响应**
+**响应示例**
 
 ```json
 {
@@ -159,27 +359,41 @@ openviking session get a1b2c3d4
     "created_at": "2026-03-23T10:00:00+08:00",
     "updated_at": "2026-03-23T11:30:00+08:00",
     "message_count": 5,
+    "total_message_count": 20,
     "commit_count": 3,
     "memories_extracted": {
       "profile": 1,
       "preferences": 2,
       "entities": 3,
       "events": 1,
+      "identity": 1,
+      "soul": 1,
       "cases": 2,
-      "patterns": 1,
+      "trajectories": 1,
+      "experiences": 2,
       "tools": 0,
       "skills": 0,
-      "total": 10
+      "total": 14
     },
     "last_commit_at": "2026-03-23T11:00:00+08:00",
     "llm_token_usage": {
       "prompt_tokens": 5200,
       "completion_tokens": 1800,
-      "total_tokens": 7000
+      "total_tokens": 7000,
+      "cached_tokens": 1200,
+      "reasoning_tokens": 800
     },
     "user": {
-      "user_id": "alice",
-      "agent_id": "default"
+      "account_id": "default",
+      "user_id": "alice"
+    },
+    "pending_tokens": 450,
+    "auto_commit_policy": {
+      "pending_token_threshold": 150000,
+      "message_count_threshold": 100,
+      "idle_timeout_seconds": 86400,
+      "keep_recent_count": 0,
+      "min_commit_interval_seconds": 0
     }
   }
 }
@@ -187,44 +401,321 @@ openviking session get a1b2c3d4
 
 ---
 
+### update_session_config()
+
+#### 1. API 实现介绍
+
+部分更新已有 session 的可变配置。修改会在后续消息写入、idle 扫描和 commit
+中生效。只有 `/api/v1/sessions/{session_id}/config` 子路径接受 `PATCH`；基础
+`/api/v1/sessions/{session_id}` 端点不支持该方法。
+
+**代码入口**：
+- `openviking/server/routers/sessions.py:update_session_config()` - HTTP 路由
+- `openviking/service/session_service.py:SessionService.update_config()` - 配置校验与更新
+- `sdk/python/openviking_sdk/client.py:update_session_config()` - Python SDK
+- `sdk/typescript/src/client.ts:updateSessionConfig()` - TypeScript SDK
+- `sdk/go/sessions.go:UpdateSessionConfig()` - Go SDK
+- `crates/ov_cli/src/commands/session.rs:set_session_config()` - CLI 命令
+
+#### 2. 接口和参数说明
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| session_id | string | 是 | - | URL 路径中的 session ID |
+| memory_extraction_config | object | 否 | 未传 | 可变的抽取配置。目前支持 `events.tags`，其值为严格 `key=value` 字符串数组。省略时保留现有 tags；传 `events.tags=[]` 时清空。系统会 trim、转为小写并去重。 |
+| auto_commit_policy | object 或 null | 否 | 未传 | object 只把已提供的策略字段合并到现有策略中，并沿用 `create_session()` 记录的校验、clamp、默认值和上限。传 `null` 禁用自动 commit；省略该字段则保持策略不变。策略内部的单个字段不能为 `null`。 |
+| telemetry | boolean 或 object | 否 | `false` | 传 `true` 或 `{"summary": true}` 时在响应中包含本次操作的 telemetry summary；`false` 时省略。 |
+
+空请求对象是合法的 no-op，并会返回当前生效配置。未知请求字段会被拒绝。
+响应始终返回补齐默认值后的生效策略；自动 commit 已禁用时返回 `null`。
+
+#### 3. 使用示例
+
+**HTTP API**
+
+```http
+PATCH /api/v1/sessions/{session_id}/config
+```
+
+```bash
+# 合并一个策略字段，并替换事件记忆的默认 tags
+curl -X PATCH http://localhost:1933/api/v1/sessions/a1b2c3d4/config \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{
+    "memory_extraction_config": {
+      "events": {"tags": ["team=search", "channel=app"]}
+    },
+    "auto_commit_policy": {"message_count_threshold": 25},
+    "telemetry": true
+  }'
+
+# 禁用自动 commit，同时不修改事件记忆 tags
+curl -X PATCH http://localhost:1933/api/v1/sessions/a1b2c3d4/config \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{"auto_commit_policy": null}'
+```
+
+**Python SDK**
+
+```python
+result = client.update_session_config(
+    session_id="a1b2c3d4",
+    options={
+        "memory_extraction_config": {
+            "events": {"tags": ["team=search", "channel=app"]}
+        },
+        "auto_commit_policy": {"message_count_threshold": 25},
+    },
+)
+```
+
+**TypeScript SDK**
+
+```typescript
+const result = await client.updateSessionConfig("a1b2c3d4", {
+  memoryExtractionConfig: {
+    events: { tags: ["team=search", "channel=app"] },
+  },
+  autoCommitPolicy: { message_count_threshold: 25 },
+});
+```
+
+**Go SDK**
+
+```go
+policy := map[string]any{"message_count_threshold": 25}
+result, err := client.UpdateSessionConfig(ctx, "a1b2c3d4", &openviking.UpdateSessionConfigOptions{
+    MemoryExtractionConfig: map[string]any{
+        "events": map[string]any{"tags": []string{"team=search", "channel=app"}},
+    },
+    AutoCommitPolicy: &policy,
+})
+```
+
+**CLI**
+
+```bash
+ov session config set a1b2c3d4 \
+  --event-tags team=search,channel=app \
+  --auto-commit-policy-json '{"message_count_threshold":25}'
+
+# 清空默认 tags，或禁用自动 commit
+ov session config set a1b2c3d4 --no-event-tags
+ov session config set a1b2c3d4 --no-auto-commit
+```
+
+**响应示例**
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "session_id": "a1b2c3d4",
+    "auto_commit_policy": {
+      "pending_token_threshold": 150000,
+      "message_count_threshold": 25,
+      "idle_timeout_seconds": 86400,
+      "keep_recent_count": 0,
+      "min_commit_interval_seconds": 0
+    },
+    "memory_extraction_config": {
+      "events": {
+        "tags": ["team=search", "channel=app"]
+      }
+    }
+  },
+  "telemetry": {
+    "id": "tm_xxx",
+    "summary": {
+      "operation": "session.update_config",
+      "status": "ok",
+      "duration_ms": 4.2
+    }
+  }
+}
+```
+
+---
+
+### list_tool_results()
+
+列出会话中因体积较大而外置保存的工具结果。
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `session_id` | string | 是 | - | 会话 ID |
+| `tool_name` | string | 否 | - | 按工具名过滤 |
+| `limit` | integer | 否 | `50` | 最大返回数量 |
+
+**HTTP API**
+
+```http
+GET /api/v1/sessions/{session_id}/tool-results
+```
+
+```bash
+curl --get http://localhost:1933/api/v1/sessions/session-id/tool-results \
+  -H "X-API-Key: your-key" \
+  --data-urlencode "tool_name=search" \
+  --data-urlencode "limit=50"
+```
+
+**响应示例**
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "tool_results": [
+      {
+        "tool_result_id": "tr_search_a1b2c3",
+        "tool_name": "search",
+        "original_chars": 48210,
+        "preview_chars": 2000,
+        "mime_type": "text/plain",
+        "synopsis_kind": "text",
+        "storage_uri": "viking://user/default/sessions/session-id/tool-results/tr_search_a1b2c3",
+        "offset_unit": "unicode_code_point"
+      }
+    ]
+  }
+}
+```
+
+### read_tool_result()
+
+按 Unicode 字符范围读取一个外置工具结果。 此 API 返回的内容中可能含有敏感信息的占位符，若需还原，使用[内容 API](12-content.md) 读取对应文件。
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `session_id` | string | 是 | - | 会话 ID |
+| `tool_result_id` | string | 是 | - | 工具结果 ID |
+| `offset` | integer | 否 | `0` | 起始字符位置 |
+| `limit` | integer | 否 | `20000` | 最大字符数；`-1` 表示读取到结尾 |
+| `include_metadata` | boolean | 否 | `true` | 是否返回元数据 |
+
+**HTTP API**
+
+```http
+GET /api/v1/sessions/{session_id}/tool-results/{tool_result_id}
+```
+
+```bash
+curl --get http://localhost:1933/api/v1/sessions/session-id/tool-results/tool-result-id \
+  -H "X-API-Key: your-key" \
+  --data-urlencode "offset=0" \
+  --data-urlencode "limit=20000"
+```
+
+**响应示例**
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "tool_result_id": "tr_search_a1b2c3",
+    "content": "工具返回的文本片段……",
+    "offset": 0,
+    "limit": 20000,
+    "offset_unit": "unicode_code_point",
+    "total_chars": 48210,
+    "has_more": true,
+    "metadata": {
+      "tool_name": "search",
+      "mime_type": "text/plain",
+      "sha256": "..."
+    }
+  }
+}
+```
+
+`include_metadata=false` 时省略 `metadata`。继续读取时，将下一次请求的 `offset` 设为当前 `offset` 加上 `content` 的 Unicode 字符数。
+
+### search_tool_result()
+
+在一个外置工具结果中搜索文本，并返回命中位置附近的上下文。
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `q` | string | 是 | - | 搜索文本 |
+| `limit` | integer | 否 | `20` | 最大命中数 |
+| `context_chars` | integer | 否 | `300` | 每个命中前后的上下文字符数 |
+
+**HTTP API**
+
+```http
+GET /api/v1/sessions/{session_id}/tool-results/{tool_result_id}/search?q={query}
+```
+
+```bash
+curl --get http://localhost:1933/api/v1/sessions/session-id/tool-results/tool-result-id/search \
+  -H "X-API-Key: your-key" \
+  --data-urlencode "q=authentication" \
+  --data-urlencode "limit=20"
+```
+
+**响应示例**
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "tool_result_id": "tr_search_a1b2c3",
+    "matches": [
+      {
+        "offset": 1284,
+        "offset_unit": "unicode_code_point",
+        "snippet": "...authentication failed because..."
+      }
+    ]
+  }
+}
+```
+
+外置工具结果端点当前由 Server 和 Web Studio 使用，公共 SDK 与 CLI 暂未提供封装，因此以上小节只展示 HTTP Tab。
+
+---
+
 ### get_session_context()
 
-获取供上下文组装使用的会话上下文。
+#### 1. API 实现介绍
 
-该接口返回：
-- `latest_archive_overview`：最新一个已完成归档的 `overview` 文本，在 token budget 足够时返回
-- `pre_archive_abstracts`：已完成归档的轻量列表，每项只包含 `archive_id` 和 `abstract`
-- `messages`：最新已完成归档之后的所有未完成归档消息，再加上当前 live session 消息
-- `stats`：返回结果对应的 token 与纳入统计
+获取供上下文组装使用的会话上下文。该接口返回最新的归档摘要和当前活跃消息，用于 LLM 上下文构建。
 
-说明：
-- 没有可用 completed archive，或最新 overview 超出 token budget 时，`latest_archive_overview` 返回空字符串。
-- `token_budget` 会在 active `messages` 之后作用于 assembled archive payload：`latest_archive_overview` 优先级高于 `pre_archive_abstracts`，预算紧张时先淘汰最旧的 abstracts。
-- 只有最终实际返回的 archive 内容，才会计入 `estimatedTokens` 和 `stats.archiveTokens`。
-- 当前每次有消息的 session commit 都会在 Phase 2 生成 archive 摘要；只有带 `.done` 标记的 completed archive 才会被这里返回。
+**返回字段说明**：
+- `latest_archive_overview`: 最新一个已完成归档的 overview 文本，在 token budget 足够时返回
+- `pre_archive_abstracts`: 保持 API 向下兼容，返回空数组
+- `messages`: 最新已完成归档之后的未完成归档消息和当前 live session 消息，受 token budget 限制
+- `estimatedTokens`: 预估总 token 数
+- `stats`: 统计信息。`includedArchives` 统计 `pre_archive_abstracts` 的条目数，该数组目前为空；是否包含 overview 应查看 `latest_archive_overview` 本身
+
+**token budget 分配策略**：
+1. 先把待返回消息适配到预算内；必要时丢弃或截断消息，再计算剩余预算
+2. 剩余预算优先给最新归档的 overview
+3. pre_archive_abstracts 目前不返回
+
+**代码入口**：
+- `openviking/session/session.py:Session.get_session_context()` - 核心实现
+- `openviking/server/routers/sessions.py:get_session_context()` - HTTP 路由
+- `sdk/python/openviking_sdk/client.py:AsyncHTTPClient.get_session_context()` - Python SDK
+- `crates/ov_cli/src/commands/session.rs:get_session_context()` - CLI 命令
+
+#### 2. 接口和参数说明
 
 **参数**
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | session_id | str | 是 | - | 会话 ID |
-| token_budget | int | 否 | 128000 | active `messages` 之后留给 assembled archive payload 的 token 预算 |
+| token_budget | int | 否 | 128000 | 整个返回上下文的非负 token 预算；先为消息分配，再用剩余预算容纳归档概览 |
 
-**Python SDK (Embedded / HTTP)**
-
-```python
-context = await client.get_session_context("a1b2c3d4", token_budget=128000)
-print(context["latest_archive_overview"])
-print(context["pre_archive_abstracts"])
-print(len(context["messages"]))
-
-session = client.session("a1b2c3d4")
-context = await session.get_session_context(token_budget=128000)
-```
+#### 3. 使用示例
 
 **HTTP API**
 
-```
+```http
 GET /api/v1/sessions/{session_id}/context?token_budget=128000
 ```
 
@@ -233,29 +724,49 @@ curl -X GET "http://localhost:1933/api/v1/sessions/a1b2c3d4/context?token_budget
   -H "X-API-Key: your-key"
 ```
 
+**Python SDK**
+
+```python
+import openviking_sdk as ov
+
+client = ov.SyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+client.initialize()
+
+context = client.get_session_context(session_id="a1b2c3d4", token_budget=128000)
+print(context["latest_archive_overview"])
+print(len(context["messages"]))
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.getSessionContext("session-id"));
+```
+
+**Go SDK**
+
+```go
+contextPayload, err := client.GetSessionContext(ctx, "a1b2c3d4", 128000)
+if err != nil {
+    return err
+}
+fmt.Println(contextPayload["latest_archive_overview"])
+```
+
 **CLI**
 
 ```bash
 ov session get-session-context a1b2c3d4 --token-budget 128000
 ```
 
-**响应**
+**响应示例**
 
 ```json
 {
   "status": "ok",
   "result": {
     "latest_archive_overview": "# Session Summary\n\n**Overview**: User discussed deployment and auth setup.",
-    "pre_archive_abstracts": [
-      {
-        "archive_id": "archive_002",
-        "abstract": "用户讨论了部署和鉴权配置。"
-      },
-      {
-        "archive_id": "archive_001",
-        "abstract": "用户之前讨论了仓库初始化和鉴权配置。"
-      }
-    ],
+    "pre_archive_abstracts": [],
     "messages": [
       {
         "id": "msg_pending_1",
@@ -274,14 +785,14 @@ ov session get-session-context a1b2c3d4 --token-budget 128000
         "created_at": "2026-03-24T09:10:20Z"
       }
     ],
-    "estimatedTokens": 160,
+    "estimatedTokens": 29,
     "stats": {
       "totalArchives": 2,
-      "includedArchives": 2,
-      "droppedArchives": 0,
+      "includedArchives": 0,
+      "droppedArchives": 2,
       "failedArchives": 0,
-      "activeTokens": 98,
-      "archiveTokens": 62
+      "activeTokens": 10,
+      "archiveTokens": 19
     }
   }
 }
@@ -291,15 +802,19 @@ ov session get-session-context a1b2c3d4 --token-budget 128000
 
 ### get_session_archive()
 
-获取某次已完成归档的完整内容。
+正常完成的无 WM 归档仍返回 `messages` 原文，`abstract` 和 `overview` 为空字符串，读取时不会补生成摘要。pending、failed、不存在或损坏归档仍遵循原有错误契约。此接口主动展开单个归档，不改变 `/context` 的历史边界。
 
-该接口通常配合 `get_session_context()` 返回的 `pre_archive_abstracts[*].archive_id` 使用。
+#### 1. API 实现介绍
 
-该接口返回：
-- `archive_id`：被展开的 archive ID
-- `abstract`：该 archive 的轻量摘要
-- `overview`：该 archive 的完整 overview
-- `messages`：该次 archive 对应的完整消息内容
+获取某次已完成归档的完整内容。该接口通常配合 `get_session_context()` 使用，当需要查看更早的归档详情时调用。
+
+**代码入口**：
+- `openviking/session/session.py:Session.get_session_archive()` - 核心实现
+- `openviking/server/routers/sessions.py:get_session_archive()` - HTTP 路由
+- `sdk/python/openviking_sdk/client.py:AsyncHTTPClient.get_session_archive()` - Python SDK
+- `crates/ov_cli/src/commands/session.rs:get_session_archive()` - CLI 命令
+
+#### 2. 接口和参数说明
 
 **参数**
 
@@ -308,21 +823,11 @@ ov session get-session-context a1b2c3d4 --token-budget 128000
 | session_id | str | 是 | - | 会话 ID |
 | archive_id | str | 是 | - | 归档 ID，例如 `archive_002` |
 
-**Python SDK (Embedded / HTTP)**
-
-```python
-archive = await client.get_session_archive("a1b2c3d4", "archive_002")
-print(archive["archive_id"])
-print(archive["overview"])
-print(len(archive["messages"]))
-
-session = client.session("a1b2c3d4")
-archive = await session.get_archive("archive_002")
-```
+#### 3. 使用示例
 
 **HTTP API**
 
-```
+```http
 GET /api/v1/sessions/{session_id}/archives/{archive_id}
 ```
 
@@ -331,13 +836,46 @@ curl -X GET "http://localhost:1933/api/v1/sessions/a1b2c3d4/archives/archive_002
   -H "X-API-Key: your-key"
 ```
 
+**Python SDK**
+
+```python
+import openviking_sdk as ov
+
+client = ov.SyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+client.initialize()
+
+archive = client.get_session_archive(
+    session_id="a1b2c3d4",
+    archive_id="archive_002",
+)
+print(archive["archive_id"])
+print(archive["overview"])
+print(len(archive["messages"]))
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.getSessionArchive("session-id", "archive-id"));
+```
+
+**Go SDK**
+
+```go
+archive, err := client.GetSessionArchive(ctx, "a1b2c3d4", "archive_002")
+if err != nil {
+    return err
+}
+fmt.Println(archive["archive_id"])
+```
+
 **CLI**
 
 ```bash
 ov session get-session-archive a1b2c3d4 archive_002
 ```
 
-**响应**
+**响应示例**
 
 ```json
 {
@@ -368,13 +906,34 @@ ov session get-session-archive a1b2c3d4 archive_002
 }
 ```
 
-如果 archive 不存在、未完成，或者不属于该 session，接口返回 `404`。
+**错误响应**
+
+如果 archive 不存在、未完成，或者不属于该 session，接口返回 404：
+
+```json
+{
+  "status": "error",
+  "error": {
+    "code": "NOT_FOUND",
+    "message": "Archive archive_002 not found"
+  }
+}
+```
 
 ---
 
 ### delete_session()
 
-删除会话。
+#### 1. API 实现介绍
+
+删除该会话目录，包括消息、归档历史和会话内的审计记录。已经抽取到用户或 Peer 记忆目录的长期记忆不会随之删除；需要删除这些记忆时，单独定位并删除对应 URI。此接口不提供自动撤销。对应的 Privacy 配置（`category=session`、`target_key=session_id`）会保留。
+
+**代码入口**：
+- `openviking/server/routers/sessions.py:delete_session()` - HTTP 路由
+- `sdk/python/openviking_sdk/client.py:AsyncHTTPClient.delete_session()` - Python SDK
+- `crates/ov_cli/src/commands/session.rs:delete_session()` - CLI 命令
+
+#### 2. 接口和参数说明
 
 **参数**
 
@@ -382,15 +941,11 @@ ov session get-session-archive a1b2c3d4 archive_002
 |------|------|------|--------|------|
 | session_id | str | 是 | - | 要删除的会话 ID |
 
-**Python SDK (Embedded / HTTP)**
-
-```python
-client.rm("viking://session/a1b2c3d4/", recursive=True)
-```
+#### 3. 使用示例
 
 **HTTP API**
 
-```
+```http
 DELETE /api/v1/sessions/{session_id}
 ```
 
@@ -399,21 +954,46 @@ curl -X DELETE http://localhost:1933/api/v1/sessions/a1b2c3d4 \
   -H "X-API-Key: your-key"
 ```
 
+**Python SDK**
+
+```python
+import openviking_sdk as ov
+
+client = ov.SyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+client.initialize()
+
+# 删除会话
+client.delete_session(session_id="a1b2c3d4")
+```
+
+**TypeScript SDK**
+
+```typescript
+await client.deleteSession("session-id");
+```
+
+**Go SDK**
+
+```go
+if err := client.DeleteSession(ctx, "a1b2c3d4"); err != nil {
+    return err
+}
+```
+
 **CLI**
 
 ```bash
-openviking session delete a1b2c3d4
+ov session delete a1b2c3d4
 ```
 
-**响应**
+**响应示例**
 
 ```json
 {
   "status": "ok",
   "result": {
     "session_id": "a1b2c3d4"
-  },
-  "time": 0.1
+  }
 }
 ```
 
@@ -421,15 +1001,34 @@ openviking session delete a1b2c3d4
 
 ### add_message()
 
-向会话中添加消息。
+#### 1. API 实现介绍
+
+向会话中添加消息。支持两种模式：简单文本模式和 Parts 模式（支持文本、上下文引用、工具调用等）。
+
+**Part 类型**：
+- `TextPart`: 纯文本内容
+- `ImagePart`: OpenAI 风格的图片 URL 内容。记忆提取时，OpenViking 可调用配置的 VLM 将图片转为文字描述
+- `ContextPart`: 上下文引用，指向资源或记忆
+- `ToolPart`: 工具调用和结果
+
+**代码入口**：
+- `openviking/session/session.py:Session.add_message()` - 核心实现
+- `openviking/server/routers/sessions.py:add_message()` - HTTP 路由
+- `sdk/python/openviking_sdk/client.py:AsyncHTTPClient.add_message()` - Python SDK
+- `crates/ov_cli/src/commands/session.rs:add_message()` - CLI 命令
+
+#### 2. 接口和参数说明
 
 **参数**
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
+| session_id | str | 是 | - | 会话 ID |
 | role | str | 是 | - | 消息角色："user" 或 "assistant" |
-| parts | List[Part] | 条件必填 | - | 消息部分列表（Python SDK 必填；HTTP API 可选，与 content 二选一） |
-| content | str | 条件必填 | - | 消息文本内容（HTTP API 简单模式，与 parts 二选一） |
+| parts | List[dict \| MessagePart] | 条件必填 | - | SDK 可传消息片段字典或 `TextPart`/`ContextPart`/`ImagePart`/`ToolPart` 对象；HTTP API 仅接受字典；与 content 二选一 |
+| content | str | 条件必填 | - | 消息文本内容（简单模式，与 parts 二选一） |
+| peer_id | str | 否 | None | 可选的稳定交互对象 ID |
+| options | AddMessageOptions | 否 | None | 进阶消息选项，例如 `created_at`、`telemetry`、`turn_id`、`message_kind` 和 `source_message_ids` |
 
 > **注意**：HTTP API 支持两种模式：
 > 1. **简单模式**：使用 `content` 字符串（向后兼容）
@@ -440,50 +1039,38 @@ openviking session delete a1b2c3d4
 **Part 类型（Python SDK）**
 
 ```python
-from openviking.message import TextPart, ContextPart, ToolPart
+from openviking_sdk import ContextPart, ImagePart, TextPart, ToolPart
 
 # 文本内容
 TextPart(text="Hello, how can I help?")
+
+# 图片 URL
+ImagePart(url="https://example.com/photo.png", detail="auto")
 
 # 上下文引用
 ContextPart(
     uri="viking://resources/docs/auth/",
     context_type="resource",  # "resource"、"memory" 或 "skill"
-    abstract="Authentication guide..."
+    abstract="Authentication guide...",
 )
 
 # 工具调用
 ToolPart(
     tool_id="call_123",
     tool_name="search_web",
-    skill_uri="viking://skills/search-web/",
+    skill_uri="viking://~/skills/search-web/",
     tool_input={"query": "OAuth best practices"},
-    tool_output="",
-    tool_status="pending"  # "pending"、"running"、"completed"、"error"
+    tool_status="pending",  # "pending"、"running"、"completed"、"error"
 )
 ```
 
-**Python SDK (Embedded / HTTP)**
+如果需要与 HTTP、Go 或 TypeScript 代码复用同一 payload 结构，也可以传等价的字典。
 
-```python
-from openviking.message import TextPart
-
-session = client.session()
-
-# 添加用户消息
-session.add_message("user", [
-    TextPart(text="How do I authenticate users?")
-])
-
-# 添加助手回复
-session.add_message("assistant", [
-    TextPart(text="You can use OAuth 2.0 for authentication...")
-])
-```
+#### 3. 使用示例
 
 **HTTP API**
 
-```
+```http
 POST /api/v1/sessions/{session_id}/messages
 ```
 
@@ -526,15 +1113,87 @@ curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/messages \
       {"type": "tool", "tool_id": "call_123", "tool_name": "search_web", "tool_input": {"query": "OAuth"}, "tool_status": "completed", "tool_output": "Results..."}
     ]
   }'
+
+# 添加包含图片 URL 的用户消息
+curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/messages \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{
+    "role": "user",
+    "parts": [
+      {"type": "text", "text": "Remember this studio layout."},
+      {"type": "image_url", "image_url": {"url": "https://example.com/studio.png", "detail": "auto"}}
+    ]
+  }'
+```
+
+**Python SDK**
+
+```python
+import openviking_sdk as ov
+from openviking_sdk import ContextPart, ImagePart, TextPart
+
+client = ov.SyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+client.initialize()
+
+# 简单模式：添加用户消息
+client.add_message(
+    session_id="a1b2c3d4",
+    role="user",
+    content="How do I authenticate users?",
+)
+
+# Parts 模式：添加带有上下文引用的助手消息
+client.add_message(
+    session_id="a1b2c3d4",
+    role="assistant",
+    parts=[
+        TextPart(text="Based on the documentation, you can configure embedding..."),
+        ContextPart(
+            uri="viking://resources/docs/auth/",
+            context_type="resource",
+            abstract="Authentication guide",
+        ),
+    ],
+)
+
+# Parts 模式：添加包含图片 URL 的用户消息
+client.add_message(
+    session_id="a1b2c3d4",
+    role="user",
+    parts=[
+        TextPart(text="Remember this studio layout."),
+        ImagePart(url="https://example.com/studio.png", detail="auto"),
+    ],
+)
+```
+
+**TypeScript SDK**
+
+```typescript
+await client.addMessage("session-id", { role: "user", content: "Hello" });
+```
+
+**Go SDK**
+
+```go
+result, err := client.AddMessage(ctx, "a1b2c3d4", "user", openviking.AddMessageOptions{
+    Content: openviking.String("How do I authenticate users?"),
+    PeerID:  "web-visitor-alice",
+})
+if err != nil {
+    return err
+}
+fmt.Println(result["message_count"])
 ```
 
 **CLI**
 
 ```bash
-openviking session add-message a1b2c3d4 --role user --content "How do I authenticate users?"
+ov session add-message a1b2c3d4 --role user --content "How do I authenticate users?"
 ```
 
-**响应**
+**响应示例**
 
 ```json
 {
@@ -542,73 +1201,125 @@ openviking session add-message a1b2c3d4 --role user --content "How do I authenti
   "result": {
     "session_id": "a1b2c3d4",
     "message_count": 2
-  },
-  "time": 0.1
+  }
 }
 ```
 
 ---
 
-### used()
+### batch_add_messages()
 
-记录会话中实际使用的上下文和技能。调用 `commit()` 时，会根据此使用数据更新 `active_count`。
+#### 1. API 实现介绍
+
+在一次请求中向会话添加多条消息，适合导入历史对话。与逐条调用 `add_message()` 相比，批量提交可减少请求次数。
+
+**与 `add_message()` 的区别**：
+- `add_message()`：单次请求添加 1 条消息
+- `batch_add_messages()`：单次请求添加多条消息（上限 100 条），减少网络往返和文件 I/O
+
+**代码入口**：
+- `openviking/session/session.py:Session.add_messages()` - 核心实现
+- `openviking/server/routers/sessions.py:batch_add_messages()` - HTTP 路由
+- `sdk/python/openviking_sdk/client.py:AsyncHTTPClient.batch_add_messages()` - Python SDK
+- `crates/ov_cli/src/commands/session.rs:add_messages()` - CLI 命令
+
+#### 2. 接口和参数说明
 
 **参数**
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| contexts | List[str] | 否 | None | 实际使用的上下文 URI 列表 |
-| skill | Dict[str, Any] | 否 | None | 技能使用记录，包含 `uri`、`input`、`output`、`success` 字段 |
+| session_id | str | 是 | - | 会话 ID |
+| messages | List[AddMessageRequest] | 是 | - | 消息列表，每条消息格式与 `add_message()` 相同，最多 100 条 |
+| options | BatchAddMessagesOptions | 否 | None | 进阶批量选项，例如 `telemetry`；传入 `options={"telemetry": True}` 可附加操作遥测数据 |
 
-**Python SDK (Embedded / HTTP)**
+> **注意**：每条消息的格式与 `add_message()` 完全一致，支持 `content`（简单模式）和 `parts`（Parts 模式）。超过 100 条需分批调用。
 
-```python
-session = client.session(session_id="a1b2c3d4")
-session.load()
-
-# 记录使用的上下文
-session.used(contexts=["viking://resources/docs/auth/"])
-
-# 记录使用的技能
-session.used(skill={
-    "uri": "viking://skills/search-web/",
-    "input": {"query": "OAuth"},
-    "output": "Results...",
-    "success": True
-})
-```
+#### 3. 使用示例
 
 **HTTP API**
 
-```
-POST /api/v1/sessions/{session_id}/used
+```http
+POST /api/v1/sessions/{session_id}/messages/batch
 ```
 
 ```bash
-# 记录使用的上下文
-curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/used \
+# 批量添加多条消息
+curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/messages/batch \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-key" \
-  -d '{"contexts": ["viking://resources/docs/auth/"]}'
-
-# 记录使用的技能
-curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/used \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key" \
-  -d '{"skill": {"uri": "viking://skills/search-web/", "input": {"query": "OAuth"}, "output": "Results...", "success": true}}'
+  -d '{
+    "messages": [
+      {"role": "user", "content": "How do I authenticate users?"},
+      {"role": "assistant", "content": "You can use OAuth 2.0 for authentication."},
+      {"role": "user", "content": "Any specific recommendations?"}
+    ]
+  }'
 ```
 
-**响应**
+**Python SDK**
+
+```python
+from openviking_sdk import SyncHTTPClient
+
+client = SyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+client.initialize()
+
+# 批量添加消息
+result = client.batch_add_messages(
+    session_id="a1b2c3d4",
+    messages=[
+        {"role": "user", "content": "How do I authenticate users?"},
+        {"role": "assistant", "content": "You can use OAuth 2.0 for authentication."},
+        {"role": "user", "content": "Any specific recommendations?"},
+    ],
+)
+print(f"Added: {result['added']}, Total: {result['message_count']}")
+```
+
+**TypeScript SDK**
+
+```typescript
+await client.batchAddMessages("session-id", [
+  { role: "user", content: "Hello" },
+  { role: "assistant", content: "Hi" },
+]);
+```
+
+**Go SDK**
+
+```go
+result, err := client.BatchAddMessages(ctx, "a1b2c3d4", []openviking.Message{
+    {Role: "user", Content: openviking.String("How do I authenticate users?")},
+    {Role: "assistant", Content: openviking.String("You can use OAuth 2.0 for authentication.")},
+    {Role: "user", Content: openviking.String("Any specific recommendations?")},
+}, nil)
+if err != nil {
+    return err
+}
+fmt.Println(result["added"], result["message_count"])
+```
+
+**CLI**
+
+```bash
+# 向会话中批量添加消息
+ov session add-messages a1b2c3d4 '[{"role":"user","content":"Hello"},{"role":"assistant","content":"Hi"}]'
+
+# ov add-memory 内部也自动使用批量接口
+ov add-memory '[{"role":"user","content":"Hello"},{"role":"assistant","content":"Hi"}]'
+```
+
+**响应示例**
 
 ```json
 {
   "status": "ok",
   "result": {
     "session_id": "a1b2c3d4",
-    "contexts_used": 1,
-    "skills_used": 0
-  },
-  "time": 0.1
+    "message_count": 5,
+    "added": 3
+  }
 }
 ```
 
@@ -616,39 +1327,51 @@ curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/used \
 
 ### commit()
 
-提交会话。归档消息（Phase 1）立即完成，摘要生成和记忆提取（Phase 2）在后台异步执行。返回 `task_id` 用于查询后台任务进度。
+#### 1. API 实现介绍
 
-说明：
-- 同一 session 的多次快速连续 commit 会被接受；每次请求都会拿到独立的 `task_id`。
-- 后台 Phase 2 会按 archive 顺序串行推进：`archive N+1` 会等待 `archive N` 写出 `.done` 后再继续。
-- 如果更早的 archive 已失败且没有 `.done`，后续 commit 会直接返回 `FAILED_PRECONDITION`，直到该失败被处理。
+提交会话。归档消息（Phase 1）在响应返回前完成；有消息被归档时，摘要生成和记忆提取（Phase 2）在后台异步执行。产生归档的 commit 返回 `status: "accepted"` 和 `task_id`；没有可归档内容的 no-op commit 返回 `status: "skipped"` 和 `task_id: null`。
+
+原独立 session `extract` 接口已移除，记忆提取统一使用 `commit`。迁移后消息会按保留策略归档；请通过返回的 `task_id` 查询后台提取结果，不能将 `accepted` 当作提取完成。
+
+**两阶段提交流程**：
+- **Phase 1（同步）**: 按保留策略拆分消息，写入归档和恢复记录，入队 Phase 2，并将保留消息写回 live session
+- **Phase 2（异步）**: 生成摘要（L0/L1），提取长期记忆并更新关系
+
+**注意事项**：
+- 同一 session 可连续提交；只有实际产生归档的请求返回独立的 `task_id`，no-op 请求不创建任务
+- 空 session，或所有消息都仍在 `keep_recent_count` 保留窗口内时，会同步完成并返回 `archived: false`
+- 后台 Phase 2 会按 archive 顺序串行推进：`archive_N+1` 会等待 `archive_N` 写出 `.done` 后再继续
+- 如果更早的 archive 已失败且没有 `.done`，后续 commit 会直接返回错误，直到该失败被处理
+- 如果提交的消息中包含带 `viking://resources/...` 的长期事实、评价、偏好或事件，记忆抽取会把资源保留为 markdown 链接，并写入 `MEMORY_FIELDS.resource_refs`
+
+**代码入口**：
+- `openviking/session/session.py:Session.commit_async()` - 核心实现
+- `openviking/server/routers/sessions.py:commit_session()` - HTTP 路由
+- `sdk/python/openviking_sdk/client.py:AsyncHTTPClient.commit_session()` - Python SDK
+- `crates/ov_cli/src/commands/session.rs:commit_session()` - CLI 命令
+
+#### 2. 接口和参数说明
 
 **参数**
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | session_id | str | 是 | - | 要提交的会话 ID |
+| keep_recent_count | int | 否 | 0 | 提交后保留为 live 状态的最近消息数 (保持 live, 不归档)。`0` (默认) 归档全部消息。 |
+| enable_working_memory | bool 或 null | 否 | null | 仅覆盖本次 commit 的 WM 生成开关；省略/null 沿用有效策略，true/false 不改变 self、peer、memory_types 或已保存策略。拒绝字符串和数字；响应的 `effective_enable_working_memory` 返回实际生效值。 |
+| reset_context | bool | 否 | false | HTTP API：归档全部 live messages 后追加只含 `.done`（带 `context_reset`）的边界 archive，目录内没有消息文件。保留 session ID 和原始历史，清空注入上下文，并阻止后续摘要继承 reset 前的 overview。要求 `keep_recent_count=0`，且不设置 `retention_mode`。 |
 
-**Python SDK (Embedded / HTTP)**
+`reset_context` 供 OpenClaw 插件 reset hook 和 `Session.commit_async()` 使用；没有 live messages 时也会创建边界；若最新 archive 已是 reset 边界则不重复创建。旧 archive 的记忆提取可以继续完成，长期记忆保留。SDK 和 CLI 没有专用的 `reset_context` 参数，需要时使用 HTTP API。
 
-```python
-session = client.session(session_id="a1b2c3d4")
-session.load()
 
-# commit 立即返回 task_id，后台异步执行摘要生成和记忆提取
-result = session.commit()
-print(f"Status: {result['status']}")       # "accepted"
-print(f"Task ID: {result['task_id']}")
+有效策略按 Session `.meta.json`、最新 `settings/user_config.json`、内核默认值的
+顺序解析。Phase 2 开始前会将完整有效策略固化到异步任务。
 
-# 查询后台任务进度
-task = client.get_task(result["task_id"])
-if task["status"] == "completed":
-    print(f"Memories extracted: {sum(task['result']['memories_extracted'].values())}")
-```
+#### 3. 使用示例
 
 **HTTP API**
 
-```
+```http
 POST /api/v1/sessions/{session_id}/commit
 ```
 
@@ -663,13 +1386,62 @@ curl -X GET http://localhost:1933/api/v1/tasks/{task_id} \
   -H "X-API-Key: your-key"
 ```
 
+**Python SDK**
+
+```python
+from openviking_sdk import SyncHTTPClient
+
+client = SyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+client.initialize()
+
+# commit 完成 Phase 1 后返回，摘要生成和记忆提取在后台执行
+result = client.commit_session(session_id="a1b2c3d4")
+print(f"Status: {result['status']}")
+print(f"Task ID: {result['task_id']}")
+
+# 查询一次；若任务仍在等待或运行中，稍后继续查询
+task_id = result.get("task_id")
+if task_id:
+    task = client.get_task(task_id=task_id)
+    print(task["status"])
+    if task["status"] == "completed":
+        print(task["result"]["memories_extracted"])
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.commitSession("session-id"));
+```
+
+**Go SDK**
+
+```go
+commit, err := client.CommitSession(ctx, "a1b2c3d4", &openviking.CommitSessionOptions{
+    KeepRecentCount: openviking.Int(0),
+})
+if err != nil {
+    return err
+}
+fmt.Println(commit["status"], commit["task_id"])
+
+taskID, _ := commit["task_id"].(string)
+if taskID != "" {
+    task, err := client.GetTask(ctx, taskID)
+    if err != nil {
+        return err
+    }
+    fmt.Println(task["status"])
+}
+```
+
 **CLI**
 
 ```bash
-openviking session commit a1b2c3d4
+ov session commit a1b2c3d4
 ```
 
-**响应**
+**响应示例**
 
 ```json
 {
@@ -678,179 +1450,197 @@ openviking session commit a1b2c3d4
     "session_id": "a1b2c3d4",
     "status": "accepted",
     "task_id": "uuid-xxx",
-    "archive_uri": "viking://session/a1b2c3d4/history/archive_001",
+    "archive_uri": "viking://user/alice/sessions/a1b2c3d4/history/archive_001",
     "archived": true
   }
 }
 ```
 
----
-
-### get_task()
-
-查询后台任务状态（如 commit 的摘要生成和记忆提取进度）。
-
-**参数**
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| task_id | str | 是 | - | 任务 ID（由 commit 返回） |
-
-**Python SDK (Embedded / HTTP)**
-
-```python
-task = client.get_task(task_id)
-print(f"Status: {task['status']}")  # "pending" | "running" | "completed" | "failed"
-```
-
-**HTTP API**
-
-```
-GET /api/v1/tasks/{task_id}
-```
-
-```bash
-curl -X GET http://localhost:1933/api/v1/tasks/uuid-xxx \
-  -H "X-API-Key: your-key"
-```
-
-**响应（进行中）**
+**No-op 响应示例**
 
 ```json
 {
   "status": "ok",
   "result": {
-    "task_id": "uuid-xxx",
-    "task_type": "session_commit",
-    "status": "running"
+    "session_id": "a1b2c3d4",
+    "status": "skipped",
+    "task_id": null,
+    "archive_uri": null,
+    "archived": false,
+    "reason": "no_messages"
   }
 }
 ```
 
-**响应（完成）**
-
-```json
-{
-  "status": "ok",
-  "result": {
-    "task_id": "uuid-xxx",
-    "task_type": "session_commit",
-    "status": "completed",
-    "result": {
-      "session_id": "a1b2c3d4",
-      "archive_uri": "viking://session/a1b2c3d4/history/archive_001",
-      "memories_extracted": {
-        "profile": 1,
-        "preferences": 2,
-        "entities": 1,
-        "cases": 1
-      },
-      "active_count_updated": 2
-    }
-  }
-}
-```
-
-完成态任务结果里的 `memories_extracted` 表示本次 commit 的分类计数；如果只需要本次 commit 的总数，请把这些值求和。
-
----
+<a id="get_task"></a><a id="list_tasks"></a>
 
 ## 会话属性
 
 | 属性 | 类型 | 说明 |
 |------|------|------|
-| uri | str | 会话 Viking URI（`viking://session/{session_id}/`） |
+| uri | str | 会话 Viking URI（`viking://user/{user_id}/sessions/{session_id}/`） |
 | messages | List[Message] | 会话中的当前消息 |
 | stats | SessionStats | 会话统计信息 |
 | summary | str | 压缩摘要 |
-| usage_records | List[Usage] | 上下文和技能使用记录 |
 
 ---
 
 ## 会话存储结构
 
 ```
-viking://session/{session_id}/
-+-- .abstract.md              # L0：会话概览
-+-- .overview.md              # L1：关键决策
-+-- messages.jsonl            # 当前消息
-+-- tools/                    # 工具执行记录
-|   +-- {tool_id}/
-|       +-- tool.json
-+-- .meta.json                # 元数据
-+-- .relations.json           # 关联上下文
-+-- history/                  # 归档历史
-    +-- archive_001/
-    |   +-- messages.jsonl    # Phase 1 写入
-    |   +-- .abstract.md      # Phase 2 写入（后台）
-    |   +-- .overview.md      # Phase 2 写入（后台）
-    |   +-- .done             # Phase 2 完成标记
-    +-- archive_002/
+viking://user/{user_id}/sessions/{session_id}/
+├── .abstract.md              # L0：会话概览
+├── .overview.md              # L1：关键决策
+├── .meta.json                # 元数据
+├── messages.jsonl            # 当前消息
+├── tools/                    # 工具执行记录
+│   └── {tool_id}/
+│       └── tool.json
+└── history/                  # 归档历史
+    ├── archive_001/
+    │   ├── messages.jsonl    # Phase 1 写入
+    │   ├── .abstract.md      # Phase 2 写入（后台）
+    │   ├── .overview.md      # Phase 2 写入（后台）
+    │   ├── .meta.json        # 归档元数据
+    │   ├── memory_diff.json  # 长记忆抽取完成时写入
+    │   ├── .done             # Phase 2 完成标记
+    │   └── .failed.json      # Phase 2 失败标记
+    └── archive_002/
 ```
 
----
+### memory_diff.json 数据结构
 
-## 记忆分类
+长记忆抽取成功运行时，会在归档目录写入 `memory_diff.json`，记录所有记忆变更，便于审计和回溯：
 
-| 分类 | 位置 | 说明 |
+```json
+{
+  "archive_uri": "viking://user/{user_id}/sessions/{session_id}/history/archive_001",
+  "extracted_at": "2026-04-21T10:00:00Z",
+  "operations": {
+    "adds": [
+      {
+        "uri": "viking://user/alice/memories/profile.md",
+        "memory_type": "profile",
+        "after": "新创建的文件内容"
+      }
+    ],
+    "updates": [
+      {
+        "uri": "viking://user/alice/memories/preferences/project.md",
+        "memory_type": "preferences",
+        "before": "修改前的文件内容",
+        "after": "修改后的文件内容"
+      }
+    ],
+    "deletes": [
+      {
+        "uri": "viking://user/alice/memories/preferences/old.md",
+        "memory_type": "preferences",
+        "deleted_content": "被删除的文件内容"
+      }
+    ]
+  },
+  "skipped_operations": [
+    {
+      "memory_type": "events",
+      "page_id": 101,
+      "reason_code": "invalid_ranges",
+      "reason": "无法解析出有效的事件范围"
+    }
+  ],
+  "summary": {
+    "total_adds": 1,
+    "total_updates": 1,
+    "total_deletes": 1,
+    "total_skipped": 1
+  }
+}
+```
+
+| 字段 | 类型 | 说明 |
 |------|------|------|
-| profile | `user/memories/profile.md` | 用户个人信息 |
-| preferences | `user/memories/preferences/` | 按主题分类的用户偏好 |
-| entities | `user/memories/entities/` | 重要实体（人物、项目等） |
-| events | `user/memories/events/` | 重要事件 |
-| cases | `agent/memories/cases/` | 问题-解决方案案例 |
-| patterns | `agent/memories/patterns/` | 交互模式 |
-| tools | `agent/memories/tools/` | 工具使用经验与最佳实践 |
-| skills | `agent/memories/skills/` | 技能执行经验与工作流策略 |
+| `archive_uri` | str | 本次提交的归档目录 URI |
+| `extracted_at` | str | 提取时间的 ISO 8601 格式 |
+| `operations.adds` | array | 新增记忆（`uri`、`memory_type`、`after`） |
+| `operations.updates` | array | 修改记忆（`uri`、`memory_type`、`before`、`after`） |
+| `operations.deletes` | array | 删除记忆（`uri`、`memory_type`、`deleted_content`） |
+| `skipped_operations` | array | 策略性跳过的操作及稳定原因码；不代表文件变更 |
+| `summary.total_adds` | int | 新增记忆数 |
+| `summary.total_updates` | int | 修改记忆数 |
+| `summary.total_deletes` | int | 删除记忆数 |
+| `summary.total_skipped` | int | 策略性跳过的操作数 |
 
----
+如果长记忆抽取已运行但没有产生实际变更或策略性跳过，也会写入空结构的 `memory_diff.json`（所有计数为零）。
+
+<a id="内置记忆类型"></a>
 
 ## 完整示例
 
-**Python SDK (Embedded / HTTP)**
+**Python SDK**
 
 ```python
-import openviking as ov
-from openviking.message import TextPart, ContextPart
+import time
+
+from openviking_sdk import SyncHTTPClient, ContextPart, TextPart
 
 # 初始化客户端
-client = ov.OpenViking(path="./my_data")
+client = SyncHTTPClient(url="http://localhost:1933", api_key="your-key")
 client.initialize()
 
-# 创建新会话
-session = client.session()
+try:
+    # 创建新会话
+    session_result = client.create_session()
+    session_id = session_result["session_id"]
+    print(f"Session created: {session_id}")
 
-# 添加用户消息
-session.add_message("user", [
-    TextPart(text="How do I configure embedding?")
-])
-
-# 使用会话上下文进行搜索
-results = client.search("embedding configuration", session=session)
-
-# 添加带上下文引用的助手回复
-session.add_message("assistant", [
-    TextPart(text="Based on the documentation, you can configure embedding..."),
-    ContextPart(
-        uri=results.resources[0].uri,
-        context_type="resource",
-        abstract=results.resources[0].abstract
+    # 添加用户消息
+    client.add_message(
+        session_id=session_id,
+        role="user",
+        content="How do I configure embedding?",
     )
-])
 
-# 跟踪实际使用的上下文
-session.used(contexts=[results.resources[0].uri])
+    # 使用会话上下文进行搜索
+    results = client.search(
+        query="embedding configuration",
+        session_id=session_id,
+    )
 
-# 提交会话（立即返回，后台执行摘要生成和记忆提取）
-result = session.commit()
-print(f"Task ID: {result['task_id']}")
+    # 添加带有上下文引用的助手回复
+    resources = results.get("resources", [])
+    if resources:
+        resource = resources[0]
+        client.add_message(
+            session_id=session_id,
+            role="assistant",
+            parts=[
+                TextPart(text="Based on the documentation, you can configure embedding..."),
+                ContextPart(
+                    uri=resource["uri"],
+                    context_type="resource",
+                    abstract=resource.get("abstract", ""),
+                ),
+            ],
+        )
+    # 提交会话；摘要生成和记忆提取在后台执行
+    commit_result = client.commit_session(session_id=session_id)
+    print(f"Task ID: {commit_result['task_id']}")
 
-# 可选：等待后台任务完成
-task = client.get_task(result["task_id"])
-if task and task["status"] == "completed":
-    print(f"Memories extracted: {sum(task['result']['memories_extracted'].values())}")
-
-client.close()
+    # 可选：等待后台任务完成
+    task_id = commit_result.get("task_id")
+    if task_id:
+        for _ in range(30):
+            task = client.get_task(task_id=task_id)
+            if task and task["status"] == "completed":
+                print(task.get("result"))
+                break
+            if task and task["status"] in {"failed", "cancelled"}:
+                raise RuntimeError(task)
+            time.sleep(1)
+        else:
+            print(f"Still pending: {task_id}; check this task again later")
+finally:
+    client.close()
 ```
 
 **HTTP API**
@@ -880,19 +1670,13 @@ curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/messages \
   -H "X-API-Key: your-key" \
   -d '{"role": "assistant", "content": "Based on the documentation, you can configure embedding..."}'
 
-# 步骤 5：记录使用的上下文
-curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/used \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key" \
-  -d '{"contexts": ["viking://resources/docs/embedding/"]}'
-
-# 步骤 6：提交会话（立即返回 task_id）
+# 步骤 5：提交会话（产生归档时返回 task_id）
 curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/commit \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-key"
 # 返回：{"status": "ok", "result": {"status": "accepted", "task_id": "uuid-xxx", ...}}
 
-# 步骤 7：查询后台任务进度（可选）
+# 步骤 6：查询后台任务状态；未完成时稍后再查
 curl -X GET http://localhost:1933/api/v1/tasks/uuid-xxx \
   -H "X-API-Key: your-key"
 ```
@@ -903,31 +1687,16 @@ curl -X GET http://localhost:1933/api/v1/tasks/uuid-xxx \
 
 ```python
 # 在重要交互后提交
-if len(session.messages) > 10:
-    session.commit()
-```
-
-### 跟踪实际使用的内容
-
-```python
-# 仅标记实际有帮助的上下文
-if context_was_useful:
-    session.used(contexts=[ctx.uri])
+session_info = client.get_session(session_id=session_id)
+if session_info["message_count"] > 10:
+    client.commit_session(session_id=session_id)
 ```
 
 ### 使用会话上下文进行搜索
 
 ```python
-# 结合对话上下文可获得更好的搜索结果
-results = client.search(query, session=session)
-```
-
-### 继续会话前先加载
-
-```python
-# 恢复已有会话时务必先加载
-session = client.session(session_id="existing-id")
-session.load()
+# 用会话上下文解释当前查询；效果取决于上下文相关性和查询规划配置
+results = client.search(query=query, session_id=session_id)
 ```
 
 ---
@@ -935,5 +1704,7 @@ session.load()
 ## 相关文档
 
 - [上下文类型](../concepts/02-context-types.md) - 记忆类型
+- [记忆](16-memory.md) - 记忆类型与类型配额召回
 - [检索](06-retrieval.md) - 结合会话进行搜索
 - [资源管理](02-resources.md) - 资源管理
+- [后台任务](17-tasks.md) - 跟踪 commit 任务

@@ -65,27 +65,9 @@ impl KVFileSystem {
         }
     }
 
-    /// Get parent directory path
-    fn parent_key(key: &str) -> Option<String> {
-        if key == "/" || !key.contains('/') {
-            return Some("/".to_string());
-        }
-
-        let parts: Vec<&str> = key.split('/').collect();
-        if parts.len() <= 1 {
-            return Some("/".to_string());
-        }
-
-        Some(parts[..parts.len() - 1].join("/"))
-    }
-
     /// List all keys with a given prefix
     fn list_keys_with_prefix(&self, store: &HashMap<String, KVEntry>, prefix: &str) -> Vec<String> {
-        let search_prefix = if prefix == "/" {
-            ""
-        } else {
-            prefix
-        };
+        let search_prefix = if prefix == "/" { "" } else { prefix };
 
         store
             .keys()
@@ -211,6 +193,9 @@ impl FileSystem for KVFileSystem {
                     WriteFlag::Create | WriteFlag::Truncate => {
                         entry.value = data.to_vec();
                     }
+                    WriteFlag::CreateNew => {
+                        return Err(Error::AlreadyExists(key));
+                    }
                     WriteFlag::Append => {
                         entry.value.extend_from_slice(data);
                     }
@@ -229,7 +214,7 @@ impl FileSystem for KVFileSystem {
                 Ok(data.len() as u64)
             }
             None => {
-                if matches!(flags, WriteFlag::Create) {
+                if matches!(flags, WriteFlag::Create | WriteFlag::CreateNew) {
                     store.insert(key, KVEntry::new(data.to_vec()));
                     Ok(data.len() as u64)
                 } else {
@@ -239,7 +224,46 @@ impl FileSystem for KVFileSystem {
         }
     }
 
-    async fn read_dir(&self, path: &str) -> Result<Vec<FileInfo>> {
+    async fn compare_and_write(
+        &self,
+        path: &str,
+        expected: &[u8],
+        new_data: &[u8],
+    ) -> Result<bool> {
+        let key = Self::path_to_key(path);
+        let mut store = self.store.write().await;
+
+        match store.get_mut(&key) {
+            Some(entry) if entry.value.as_slice() == expected => {
+                entry.value = new_data.to_vec();
+                entry.touch();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn compare_and_remove(&self, path: &str, expected: &[u8]) -> Result<bool> {
+        let key = Self::path_to_key(path);
+        let mut store = self.store.write().await;
+
+        match store.get(&key) {
+            Some(entry) if entry.value.as_slice() == expected => {
+                store.remove(&key);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn read_dir(
+        &self,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+        sort_by: Option<crate::core::ListSortBy>,
+        sort_order: Option<crate::core::SortOrder>,
+    ) -> Result<Vec<FileInfo>> {
         let key = Self::path_to_key(path);
         let store = self.store.read().await;
 
@@ -264,7 +288,9 @@ impl FileSystem for KVFileSystem {
             }
         }
 
-        Ok(result)
+        Ok(crate::core::filesystem::apply_read_dir_options(
+            result, offset, limit, sort_by, sort_order,
+        ))
     }
 
     async fn stat(&self, path: &str) -> Result<FileInfo> {
@@ -464,43 +490,43 @@ KVFS has no configuration parameters.
 mod tests {
     use super::*;
 
+    /// Write one key in KVFS tests.
+    async fn write_key(fs: &KVFileSystem, path: &str, data: &[u8]) {
+        fs.write(path, data, 0, WriteFlag::Create).await.unwrap();
+    }
+
+    /// Read one key in KVFS tests.
+    async fn read_key(fs: &KVFileSystem, path: &str) -> Vec<u8> {
+        fs.read(path, 0, 0).await.unwrap()
+    }
+
     #[tokio::test]
     async fn test_kvfs_basic_operations() {
         let fs = KVFileSystem::new();
 
         // Create and write
-        fs.write("/key1", b"value1", 0, WriteFlag::Create)
-            .await
-            .unwrap();
+        write_key(&fs, "/key1", b"value1").await;
 
         // Read
-        let data = fs.read("/key1", 0, 0).await.unwrap();
-        assert_eq!(data, b"value1");
+        assert_eq!(read_key(&fs, "/key1").await, b"value1");
 
         // Update
         fs.write("/key1", b"value2", 0, WriteFlag::Truncate)
             .await
             .unwrap();
 
-        let data = fs.read("/key1", 0, 0).await.unwrap();
-        assert_eq!(data, b"value2");
+        assert_eq!(read_key(&fs, "/key1").await, b"value2");
     }
 
     #[tokio::test]
     async fn test_kvfs_list_keys() {
         let fs = KVFileSystem::new();
 
-        fs.write("/key1", b"val1", 0, WriteFlag::Create)
-            .await
-            .unwrap();
-        fs.write("/key2", b"val2", 0, WriteFlag::Create)
-            .await
-            .unwrap();
-        fs.write("/key3", b"val3", 0, WriteFlag::Create)
-            .await
-            .unwrap();
+        write_key(&fs, "/key1", b"val1").await;
+        write_key(&fs, "/key2", b"val2").await;
+        write_key(&fs, "/key3", b"val3").await;
 
-        let entries = fs.read_dir("/").await.unwrap();
+        let entries = fs.read_dir("/", None, None, None, None).await.unwrap();
         assert_eq!(entries.len(), 3);
     }
 
@@ -511,14 +537,10 @@ mod tests {
         // Create parent "directory" first
         fs.mkdir("/user", 0o755).await.unwrap();
 
-        fs.write("/user/123", b"alice", 0, WriteFlag::Create)
-            .await
-            .unwrap();
-        fs.write("/user/456", b"bob", 0, WriteFlag::Create)
-            .await
-            .unwrap();
+        write_key(&fs, "/user/123", b"alice").await;
+        write_key(&fs, "/user/456", b"bob").await;
 
-        let entries = fs.read_dir("/user").await.unwrap();
+        let entries = fs.read_dir("/user", None, None, None, None).await.unwrap();
         assert_eq!(entries.len(), 2);
     }
 
@@ -526,9 +548,7 @@ mod tests {
     async fn test_kvfs_delete() {
         let fs = KVFileSystem::new();
 
-        fs.write("/key1", b"value1", 0, WriteFlag::Create)
-            .await
-            .unwrap();
+        write_key(&fs, "/key1", b"value1").await;
         fs.remove("/key1").await.unwrap();
 
         assert!(fs.read("/key1", 0, 0).await.is_err());
@@ -538,14 +558,11 @@ mod tests {
     async fn test_kvfs_rename() {
         let fs = KVFileSystem::new();
 
-        fs.write("/oldkey", b"data", 0, WriteFlag::Create)
-            .await
-            .unwrap();
+        write_key(&fs, "/oldkey", b"data").await;
         fs.rename("/oldkey", "/newkey").await.unwrap();
 
         assert!(fs.read("/oldkey", 0, 0).await.is_err());
-        let data = fs.read("/newkey", 0, 0).await.unwrap();
-        assert_eq!(data, b"data");
+        assert_eq!(read_key(&fs, "/newkey").await, b"data");
     }
 
     #[tokio::test]
@@ -553,11 +570,7 @@ mod tests {
         let plugin = KVFSPlugin;
         assert_eq!(plugin.name(), "kvfs");
 
-        let config = PluginConfig {
-            name: "kvfs".to_string(),
-            mount_path: "/kvfs".to_string(),
-            params: HashMap::new(),
-        };
+        let config = PluginConfig::single_backend("kvfs", "/kvfs", HashMap::new());
 
         assert!(plugin.validate(&config).await.is_ok());
         assert!(plugin.initialize(config).await.is_ok());

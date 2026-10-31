@@ -8,10 +8,27 @@ from pydantic import BaseModel, Field, model_validator
 from openviking_cli.utils.logger import get_logger
 
 from .agfs_config import AGFSConfig
+from .parse_output_config import ParseOutputConfig
 from .transaction_config import TransactionConfig
 from .vectordb_config import VectorDBBackendConfig
 
 logger = get_logger(__name__)
+
+
+class TaskStoreConfig(BaseModel):
+    """Durable Task/Work backend selection."""
+
+    provider: str = "file"
+    params: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def normalize_provider(self):
+        self.provider = self.provider.strip().lower()
+        if self.provider not in {"file", "mysql"}:
+            raise ValueError(
+                f"storage.task_store.provider must be 'file' or 'mysql', got {self.provider!r}"
+            )
+        return self
 
 
 class StorageConfig(BaseModel):
@@ -23,37 +40,82 @@ class StorageConfig(BaseModel):
     """
 
     workspace: str = Field(default="./data", description="Local data storage path (primary)")
+    skip_process_lock: bool = Field(
+        default=False,
+        description=(
+            "Skip the workspace file lock for embedded vector backends ('local', 'cuvs'). "
+            "Other backends do not acquire this lock. Use only when you explicitly accept "
+            "the risk of multi-process contention on embedded vector storage."
+        ),
+    )
 
-    agfs: AGFSConfig = Field(default_factory=lambda: AGFSConfig(), description="AGFS configuration")
+    agfs: AGFSConfig = Field(default_factory=AGFSConfig, description="AGFS configuration")
 
     transaction: TransactionConfig = Field(
-        default_factory=lambda: TransactionConfig(),
+        default_factory=TransactionConfig,
         description="Transaction mechanism configuration",
     )
 
     vectordb: VectorDBBackendConfig = Field(
-        default_factory=lambda: VectorDBBackendConfig(),
+        default_factory=VectorDBBackendConfig,
         description="VectorDB backend configuration",
+    )
+
+    parse_output: ParseOutputConfig = Field(
+        default_factory=ParseOutputConfig,
+        description="Where parsers write intermediate artifacts (agfs temp or local dir)",
+    )
+
+    task_store: TaskStoreConfig = Field(
+        default_factory=TaskStoreConfig,
+        description="Persistent Task/Work storage backend",
     )
 
     params: Dict[str, Any] = Field(
         default_factory=dict, description="Additional storage-specific parameters"
     )
 
-    model_config = {"extra": "forbid"}
+    @model_validator(mode="before")
+    @classmethod
+    def ignore_deprecated_task_tracker(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "task_tracker" in data:
+            data = dict(data)
+            data.pop("task_tracker", None)
+            logger.warning(
+                "StorageConfig: 'task_tracker' is deprecated and ignored. "
+                "Task records are always persisted."
+            )
+        return data
 
     @model_validator(mode="after")
     def resolve_paths(self):
-        if self.agfs.path is not None:
+        """Normalize storage paths and map legacy transaction settings into native pathlock config."""
+        if "lock_timeout" in self.transaction.model_fields_set:
             logger.warning(
-                f"StorageConfig: 'agfs.path' is deprecated and will be ignored. "
-                f"Using '{self.workspace}' from workspace instead of '{self.agfs.path}'"
+                "StorageConfig: 'transaction.lock_timeout' is deprecated and ignored. "
+                "The runtime wait timeout is fixed at 0.0 seconds."
             )
 
-        if self.vectordb.path is not None:
+        if (
+            "lock_expire" in self.transaction.model_fields_set
+            and "lock_expire_secs" not in self.agfs.pathlock.model_fields_set
+        ):
+            self.agfs.pathlock.lock_expire_secs = self.transaction.lock_expire
             logger.warning(
-                f"StorageConfig: 'vectordb.path' is deprecated and will be ignored. "
-                f"Using '{self.workspace}' from workspace instead of '{self.vectordb.path}'"
+                "StorageConfig: 'transaction.lock_expire' is deprecated. "
+                "Mapped to 'storage.agfs.pathlock.lock_expire_secs'."
+            )
+        elif "lock_expire" in self.transaction.model_fields_set:
+            logger.warning(
+                "StorageConfig: 'transaction.lock_expire' is deprecated and ignored because "
+                "'storage.agfs.pathlock.lock_expire_secs' is set."
+            )
+
+        if "redo_recovery_enabled" in self.transaction.model_fields_set:
+            logger.warning(
+                "StorageConfig: 'transaction.redo_recovery_enabled' is deprecated and ignored. "
+                "Session commit phase-2 recovery now resumes from the persistent "
+                "'session_commit' queue."
             )
 
         # Update paths to use workspace (expand ~ first)
@@ -75,3 +137,19 @@ class StorageConfig(BaseModel):
         upload_temp_dir = workspace_path / "temp" / "upload"
         upload_temp_dir.mkdir(parents=True, exist_ok=True)
         return upload_temp_dir
+
+    def build_task_tracker(self, agfs: Any, *, service_name: str | None = None):
+        """Build the persistent TaskTracker from storage config."""
+        from openviking.service.task_store import TaskWorkStore
+        from openviking.service.task_tracker import TaskTracker
+
+        store: TaskWorkStore
+        if self.task_store.provider == "mysql":
+            from openviking.service.task_store_mysql import MySQLTaskWorkStore
+
+            store = MySQLTaskWorkStore(params=self.task_store.params, service_name=service_name)
+        else:
+            from openviking.service.task_store import PersistentTaskStore
+
+            store = PersistentTaskStore(agfs)
+        return TaskTracker(store=store)

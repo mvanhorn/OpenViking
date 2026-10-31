@@ -1,18 +1,12 @@
 """Shell execution tool."""
 
-import asyncio
-import os
-import re
-from pathlib import Path
+import shlex
 from typing import TYPE_CHECKING, Any
 
-from loguru import logger
-
 from vikingbot.agent.tools.base import Tool
-from vikingbot.config.schema import SessionKey
 
-
-from vikingbot.sandbox.manager import SandboxManager
+if TYPE_CHECKING:
+    from vikingbot.agent.tools.base import ToolContext
 
 
 class ExecTool(Tool):
@@ -37,7 +31,10 @@ class ExecTool(Tool):
                 "command": {"type": "string", "description": "The shell command to execute"},
                 "working_dir": {
                     "type": "string",
-                    "description": "Optional working directory for the command",
+                    "description": (
+                        "Optional working directory for the command, relative to the sandbox "
+                        "root or an absolute path inside the sandbox"
+                    ),
                 },
             },
             "required": ["command"],
@@ -50,12 +47,13 @@ class ExecTool(Tool):
         working_dir: str | None = None,
         **kwargs: Any,
     ) -> str:
-
         # Always use sandbox manager (includes direct mode)
         try:
             sandbox = await tool_context.sandbox_manager.get_sandbox(tool_context.session_key)
 
-            if command.strip() == "pwd":
+            if working_dir:
+                command = f"cd {shlex.quote(working_dir)} && {command}"
+            elif command.strip() == "pwd":
                 return sandbox.sandbox_cwd
 
             return await sandbox.execute(command, timeout=self.timeout)

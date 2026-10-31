@@ -2,13 +2,29 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Tests for config_loader utilities."""
 
+import json
+import logging
+import re
+from logging.handlers import QueueHandler
+from pathlib import Path
+
 import pytest
 
+from openviking_cli.utils.config import (
+    OPENVIKING_CONFIG_ENV,
+)
 from openviking_cli.utils.config.config_loader import (
     load_json_config,
     require_config,
     resolve_config_path,
 )
+from openviking_cli.utils.config.open_viking_config import (
+    CompileApiConfig,
+    OpenVikingConfig,
+    ParserApiConfig,
+)
+from openviking_cli.utils.config.parser_config import CodeHostingConfig, DirectoryConfig
+from openviking_cli.utils.config.queue_worker_config import QueueWorkersConfig
 
 
 class TestResolveConfigPath:
@@ -109,74 +125,560 @@ class TestRequireConfig:
             require_config(None, "TEST_MISSING_ENV", "nonexistent_file.conf", "test")
 
 
-def test_openviking_config_rejects_unknown_nested_parser_section(monkeypatch):
-    monkeypatch.setenv("OPENVIKING_CONFIG_FILE", "/tmp/codex-no-config.json")
+def test_runtime_concurrency_uses_scope_specific_defaults():
+    config = OpenVikingConfig.from_dict({})
 
+    assert config.queue_workers.external_parse.max_concurrent == 4
+    assert config.queue_workers.add_resource.max_concurrent == 4
+    assert config.queue_workers.reindex.max_concurrent == 4
+    assert config.queue_workers.add_resource.file_operation_concurrency == 16
+    assert config.queue_workers.add_resource.file_vectorization_concurrency == 8
+    assert config.queue_workers.session_commit.max_concurrent == 8
+    assert config.queue_workers.external_task.max_concurrent == 10
+    assert config.reindex.file_vectorization_concurrency == 8
+
+
+def test_glob_uses_safe_defaults():
+    config = OpenVikingConfig.from_dict({})
+
+    assert config.glob.engine == "fs"
+    assert config.glob.switch_to_remote_threshold == 100
+
+
+def test_runtime_concurrency_accepts_separate_values():
+    config = OpenVikingConfig.from_dict(
+        {
+            "queue_workers": {
+                "external_parse": {"max_concurrent": 9},
+                "add_resource": {
+                    "max_concurrent": 7,
+                    "file_operation_concurrency": 20,
+                    "file_vectorization_concurrency": 12,
+                },
+                "reindex": {"max_concurrent": 6},
+                "session_commit": {"max_concurrent": 50},
+                "external_task": {"max_concurrent": 11},
+            },
+            "reindex": {"file_vectorization_concurrency": 16},
+        }
+    )
+
+    assert config.queue_workers.external_parse.max_concurrent == 9
+    assert config.queue_workers.add_resource.max_concurrent == 7
+    assert config.queue_workers.reindex.max_concurrent == 6
+    assert config.queue_workers.add_resource.file_operation_concurrency == 20
+    assert config.queue_workers.add_resource.file_vectorization_concurrency == 12
+    assert config.queue_workers.session_commit.max_concurrent == 50
+    assert config.queue_workers.external_task.max_concurrent == 11
+    assert config.reindex.file_vectorization_concurrency == 16
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_queue_worker_concurrency_rejects_non_positive_value(value):
+    with pytest.raises(ValueError) as exc_info:
+        QueueWorkersConfig(reindex={"max_concurrent": value})
+
+    assert exc_info.value.errors()[0]["type"] == "greater_than"
+
+
+def test_parser_and_compile_api_validation():
+    assert ParserApiConfig(max_concurrent=9) == ParserApiConfig()
+    with pytest.raises(ValueError, match="compile_api.base_url must include scheme"):
+        CompileApiConfig(base_url="compile.example.com")
+
+    config = CompileApiConfig(
+        base_url="https://compile.example.com/",
+    )
+    assert config.base_url == "https://compile.example.com"
+    assert config.gateway_token == ""
+
+
+def test_parser_api_upload_defaults():
+    config = ParserApiConfig()
+
+    assert config.enable_resumable_upload is False
+    assert config.upload_simple_max_bytes == 512 * 1024 * 1024
+    assert config.upload_part_size_bytes == 8 * 1024 * 1024
+
+
+def test_directory_safety_limit_defaults():
+    config = DirectoryConfig()
+
+    assert config.max_files is None
+    assert config.max_depth == 10
+    assert config.max_concurrent == 4
+
+
+def test_directory_safety_limits_load_from_parser_config():
+    config = OpenVikingConfig.from_dict(
+        {
+            "parsers": {
+                "directory": {
+                    "max_files": None,
+                    "max_depth": 5,
+                    "max_concurrent": 2,
+                }
+            }
+        }
+    )
+
+    assert config.directory.max_files is None
+    assert config.directory.max_depth == 5
+    assert config.directory.max_concurrent == 2
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "max_files",
+        "max_depth",
+        "max_concurrent",
+    ],
+)
+def test_directory_safety_limits_reject_non_positive_values(field):
+    with pytest.raises(ValueError, match=field):
+        DirectoryConfig.from_dict({field: 0})
+
+
+def test_generic_code_hosting_domains_include_supported_platforms():
+    config = CodeHostingConfig()
+
+    assert config.code_hosting_domains == [
+        "github.com",
+        "gitlab.com",
+        "gitcode.com",
+        "gitee.com",
+        "bitbucket.org",
+        "codeberg.org",
+        "gitea.com",
+        "atomgit.com",
+        "git.sr.ht",
+    ]
+
+
+def test_example_config_loads_as_runtime_config():
+    example_path = Path(__file__).resolve().parents[1] / "examples" / "ov.conf.example"
+
+    config = OpenVikingConfig.from_dict(load_json_config(example_path))
+
+    assert config.storage.agfs.backend == "local"
+
+
+def test_example_code_hosting_domains_match_runtime_defaults():
+    example_path = Path(__file__).resolve().parents[1] / "examples" / "ov.conf.example"
+    example_text = example_path.read_text(encoding="utf-8")
+    domains_match = re.search(
+        r'"code_hosting_domains"\s*:\s*(\[[^\]]*\])',
+        example_text,
+    )
+
+    assert domains_match is not None
+    assert json.loads(domains_match.group(1)) == CodeHostingConfig().code_hosting_domains
+
+
+def test_generic_code_hosting_domains_load_from_config():
+    config = CodeHostingConfig.from_dict(
+        {
+            "code_hosting_domains": ["git.generic.example.com"],
+        }
+    )
+
+    assert config.code_hosting_domains == ["git.generic.example.com"]
+
+
+def test_openviking_config_handles_nested_parser_compatibility(monkeypatch):
+    monkeypatch.setenv(OPENVIKING_CONFIG_ENV, "/tmp/codex-no-config.json")
+
+    from openviking_cli.utils.config import open_viking_config as config_module
     from openviking_cli.utils.config.open_viking_config import (
         OpenVikingConfig,
         OpenVikingConfigSingleton,
     )
 
-    with pytest.raises(ValueError, match="markdown"):
-        OpenVikingConfig.from_dict(
-            {
-                "embedding": {
-                    "dense": {
-                        "provider": "openai",
-                        "api_key": "test-key",
-                        "model": "text-embedding-3-small",
-                    }
-                },
-                "parsers": {"markdwon": {}},
-            }
-        )
+    errors: list[str] = []
+    monkeypatch.setattr(
+        config_module._get_config_logger(),
+        "error",
+        lambda message, *args, **kwargs: errors.append(message % args if args else message),
+    )
+    config = OpenVikingConfig.from_dict(
+        {
+            "embedding": {
+                "dense": {
+                    "provider": "openai",
+                    "api_key": "test-key",
+                    "model": "text-embedding-3-small",
+                }
+            },
+            "parsers": {"excel": {"enable_process_pool": True}},
+        }
+    )
+
+    assert config.anydoc.enabled is True
+    assert any("Config field 'parsers.excel' was removed and is ignored" in item for item in errors)
 
     OpenVikingConfigSingleton.reset_instance()
 
 
-def test_openviking_config_rejects_unknown_top_level_section_with_suggestion(monkeypatch):
-    monkeypatch.setenv("OPENVIKING_CONFIG_FILE", "/tmp/codex-no-config.json")
+def test_openviking_config_ignores_unknown_fields(monkeypatch, caplog):
+    monkeypatch.setenv(OPENVIKING_CONFIG_ENV, "/tmp/codex-no-config.json")
+    logger = logging.getLogger("openviking_cli.utils.config.open_viking_config")
+    monkeypatch.setattr(logger, "handlers", [*logger.handlers, caplog.handler])
+    caplog.set_level(logging.WARNING, logger=logger.name)
+    config = OpenVikingConfig.from_dict(
+        {
+            "retired_section": {"api_key": "test-secret"},
+            "default_user": "alice",
+            "glob": {"retired_field": True, "engine": "fs"},
+            "memory": {"unknown_memory_field": "value", "session_skill_extraction_enabled": True},
+            "storage": {"agfs": {"cache": {"enabled": True}}},
+            "vlm": {
+                "model": "test-model",
+                "credentials": [
+                    {"provider": "openai", "api_key": "test-secret", "retired_field": True}
+                ],
+            },
+            "ingest": {
+                "harnesses": {
+                    "claude_code": {"enabled": True, "commit": {"keep_recent_count": 2}},
+                    "codex": {
+                        "retired_field": "test-secret",
+                        "commit": {"retired_field": "test-secret"},
+                    },
+                },
+                "memory_policy": {"custom_policy": {"value": "test-secret"}},
+            },
+            "parsers": {
+                "markdwon": {},
+                "memory": {"session_skill_extraction_enabled": False},
+                "markdown": {"unknown_field": True, "max_heading_depth": 4},
+                "code": {"unknown_field": True, "max_line_length": 120},
+                "anydoc": {"unknown_field": True, "max_table_rows": 20},
+            },
+        }
+    )
+
+    assert config.default_user == "alice"
+    assert config.glob.engine == "fs"
+    assert config.memory.session_skill_extraction_enabled is True
+    assert config.markdown.max_heading_depth == 4
+    assert config.code.max_line_length == 120
+    assert config.anydoc.max_table_rows == 20
+    assert config.ingest.harnesses["claude_code"].enabled is True
+    assert config.ingest.harnesses["claude_code"].commit.keep_recent_count == 2
+    assert config.ingest.memory_policy == {"custom_policy": {"value": "test-secret"}}
+    dumped = config.to_dict()
+    assert "retired_section" not in dumped
+    assert "retired_field" not in dumped["glob"]
+    assert "unknown_memory_field" not in dumped["memory"]
+    assert "cache" not in dumped["storage"]["agfs"]
+    assert "Ignoring unknown config field 'storage.agfs.cache'" in caplog.text
+    assert "Ignoring unknown config field 'parsers.markdown.unknown_field'" in caplog.text
+    assert "Ignoring unknown config field 'vlm.credentials[0].retired_field'" in caplog.text
+    assert "Ignoring unknown config field 'ingest.harnesses.claude_code'" not in caplog.text
+    assert "Ignoring unknown config field 'ingest.harnesses.codex'" not in caplog.text
+    assert "Ignoring unknown config field 'ingest.harnesses.codex.retired_field'" in caplog.text
+    assert (
+        "Ignoring unknown config field 'ingest.harnesses.codex.commit.retired_field'" in caplog.text
+    )
+    assert "ingest.memory_policy" not in caplog.text
+    assert "test-secret" not in caplog.text
+
+
+def test_memory_extraction_output_format_defaults_to_python_and_accepts_json(monkeypatch):
+    monkeypatch.setenv(OPENVIKING_CONFIG_ENV, "/tmp/codex-no-config.json")
+
+    default_config = OpenVikingConfig.from_dict({})
+    json_config = OpenVikingConfig.from_dict({"memory": {"extraction_output_format": "json"}})
+
+    assert default_config.memory.extraction_output_format == "python"
+    assert json_config.memory.extraction_output_format == "json"
+    with pytest.raises(ValueError):
+        OpenVikingConfig.from_dict({"memory": {"extraction_output_format": "yaml"}})
+
+
+def test_memory_maintenance_review_tokens_defaults_and_validates(monkeypatch):
+    monkeypatch.setenv(OPENVIKING_CONFIG_ENV, "/tmp/codex-no-config.json")
+
+    default_config = OpenVikingConfig.from_dict({})
+    custom_config = OpenVikingConfig.from_dict({"memory": {"maintenance_review_tokens": 4096}})
+
+    assert default_config.memory.maintenance_review_tokens == 1000
+    assert custom_config.memory.maintenance_review_tokens == 4096
+    with pytest.raises(ValueError):
+        OpenVikingConfig.from_dict({"memory": {"maintenance_review_tokens": 0}})
+
+
+def test_openviking_config_ignores_deprecated_memory_version(monkeypatch):
+    monkeypatch.setenv(OPENVIKING_CONFIG_ENV, "/tmp/codex-no-config.json")
 
     from openviking_cli.utils.config.open_viking_config import (
         OpenVikingConfig,
         OpenVikingConfigSingleton,
     )
 
-    with pytest.raises(
-        ValueError, match=r"Unknown config field 'erver' in OpenVikingConfig .*'server'"
-    ):
-        OpenVikingConfig.from_dict(
-            {
-                "erver": {
-                    "host": "127.0.0.1",
-                    "port": 1933,
-                    "root_api_key": "test",
-                    "cors_origins": ["*"],
-                },
-                "embedding": {
-                    "dense": {
-                        "provider": "openai",
-                        "api_key": "test-key",
-                        "model": "text-embedding-3-small",
-                    }
-                },
-            }
-        )
+    config = OpenVikingConfig.from_dict({})
+    assert config.memory.version == "v3"
+
+    for configured_version in ("v1", "v2", "v3", "unsupported"):
+        config = OpenVikingConfig.from_dict({"memory": {"version": configured_version}})
+        assert config.memory.version == "v3"
+
+    OpenVikingConfigSingleton.reset_instance()
+
+
+def test_openviking_config_ignores_deprecated_agent_memory_enabled(monkeypatch):
+    monkeypatch.setenv(OPENVIKING_CONFIG_ENV, "/tmp/codex-no-config.json")
+
+    from openviking_cli.utils.config.open_viking_config import (
+        OpenVikingConfig,
+        OpenVikingConfigSingleton,
+    )
+
+    legacy_config = OpenVikingConfig.from_dict({"memory": {"agent_memory_enabled": False}})
+    working_memory_config = OpenVikingConfig.from_dict(
+        {"memory": {"working_memory_enabled": False}}
+    )
+    experimental_config = OpenVikingConfig.from_dict(
+        {"memory": {"experimental_memory_switch": True}}
+    )
+
+    assert not hasattr(legacy_config.memory, "agent_memory_enabled")
+    assert not hasattr(working_memory_config.memory, "working_memory_enabled")
+    assert experimental_config.memory.experimental_memory_switch is True
+
+    OpenVikingConfigSingleton.reset_instance()
+
+
+def test_openviking_config_ignores_deprecated_code_summary_mode(monkeypatch):
+    monkeypatch.setenv(OPENVIKING_CONFIG_ENV, "/tmp/codex-no-config.json")
+
+    from openviking_cli.utils.config import parser_config
+    from openviking_cli.utils.config.open_viking_config import (
+        OpenVikingConfig,
+        OpenVikingConfigSingleton,
+    )
+
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        parser_config.logger,
+        "warning",
+        lambda message, *args, **kwargs: warnings.append(message % args if args else message),
+    )
+
+    config = OpenVikingConfig.from_dict({"code": {"code_summary_mode": "llm"}})
+
+    assert not hasattr(config.code, "code_summary_mode")
+    assert any("code.code_summary_mode is deprecated and ignored" in item for item in warnings)
+
+    OpenVikingConfigSingleton.reset_instance()
+
+
+def test_openviking_config_transaction_redo_recovery_enabled_defaults_true(monkeypatch):
+    monkeypatch.setenv(OPENVIKING_CONFIG_ENV, "/tmp/codex-no-config.json")
+
+    from openviking_cli.utils.config.open_viking_config import (
+        OpenVikingConfig,
+        OpenVikingConfigSingleton,
+    )
+
+    config = OpenVikingConfig.from_dict({})
+
+    assert config.storage.transaction.redo_recovery_enabled is True
+
+    OpenVikingConfigSingleton.reset_instance()
+
+
+def test_openviking_config_transaction_redo_recovery_enabled_can_be_disabled(monkeypatch):
+    monkeypatch.setenv(OPENVIKING_CONFIG_ENV, "/tmp/codex-no-config.json")
+
+    from openviking_cli.utils.config.open_viking_config import (
+        OpenVikingConfig,
+        OpenVikingConfigSingleton,
+    )
+
+    config = OpenVikingConfig.from_dict(
+        {"storage": {"transaction": {"redo_recovery_enabled": False}}}
+    )
+
+    assert config.storage.transaction.redo_recovery_enabled is False
 
     OpenVikingConfigSingleton.reset_instance()
 
 
 def test_openviking_config_singleton_preserves_value_error_for_bad_config(tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENVIKING_CONFIG_FILE", "/tmp/codex-no-config.json")
+    monkeypatch.setenv(OPENVIKING_CONFIG_ENV, "/tmp/codex-no-config.json")
 
     from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
 
     config_path = tmp_path / "ov.conf"
-    config_path.write_text(
-        '{"erver": {"host": "127.0.0.1"}, "embedding": {"dense": {"provider": "openai", "api_key": "x", "model": "m"}}}'
-    )
+    config_path.write_text('{"retrieval": {"recall_intent_timeout_s": 0}}')
 
     OpenVikingConfigSingleton.reset_instance()
-    with pytest.raises(ValueError, match="server"):
+    with pytest.raises(ValueError, match="retrieval.recall_intent_timeout_s"):
         OpenVikingConfigSingleton.initialize(config_path=str(config_path))
     OpenVikingConfigSingleton.reset_instance()
+
+
+def test_openviking_config_singleton_loads_utf8_bom_config(tmp_path, monkeypatch):
+    monkeypatch.setenv(OPENVIKING_CONFIG_ENV, "/tmp/codex-no-config.json")
+
+    from openviking_cli.utils.config import open_viking_config as config_module
+
+    class _ConfigStub:
+        default_account = "default"
+
+    loaded = {}
+
+    def _from_dict(data):
+        loaded.update(data)
+        return _ConfigStub()
+
+    monkeypatch.setattr(config_module.OpenVikingConfig, "from_dict", _from_dict)
+
+    config_path = tmp_path / "ov.conf"
+    config_path.write_text("\ufeff{}", encoding="utf-8")
+
+    config_module.OpenVikingConfigSingleton.reset_instance()
+    config = config_module.OpenVikingConfigSingleton.initialize(config_path=str(config_path))
+
+    assert config.default_account == "default"
+    assert loaded == {}
+
+    config_module.OpenVikingConfigSingleton.reset_instance()
+
+
+def test_require_config_missing_message_uses_openviking_ai_docs(tmp_path, monkeypatch):
+    import openviking_cli.utils.config.config_loader as loader
+
+    monkeypatch.delenv("TEST_MISSING_ENV", raising=False)
+    monkeypatch.setattr(loader, "DEFAULT_CONFIG_DIR", tmp_path / "user")
+    monkeypatch.setattr(loader, "SYSTEM_CONFIG_DIR", tmp_path / "system")
+
+    with pytest.raises(FileNotFoundError, match=r"https://openviking\.ai/docs"):
+        loader.require_config(None, "TEST_MISSING_ENV", "missing.conf", "test")
+
+
+def test_load_server_config_missing_message_uses_openviking_ai_docs(tmp_path, monkeypatch):
+    import openviking.server.config as server_config
+    import openviking_cli.utils.config.config_loader as loader
+
+    monkeypatch.delenv(OPENVIKING_CONFIG_ENV, raising=False)
+    monkeypatch.setattr(loader, "DEFAULT_CONFIG_DIR", tmp_path / "user")
+    monkeypatch.setattr(loader, "SYSTEM_CONFIG_DIR", tmp_path / "system")
+    monkeypatch.setattr(server_config, "DEFAULT_CONFIG_DIR", tmp_path / "user")
+    monkeypatch.setattr(server_config, "SYSTEM_CONFIG_DIR", tmp_path / "system")
+
+    with pytest.raises(FileNotFoundError, match=r"https://openviking\.ai/docs"):
+        server_config.load_server_config()
+
+
+def test_openviking_config_singleton_missing_message_uses_openviking_ai_docs(tmp_path, monkeypatch):
+    import openviking_cli.utils.config.config_loader as loader
+    import openviking_cli.utils.config.open_viking_config as config_module
+    from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
+
+    monkeypatch.delenv(OPENVIKING_CONFIG_ENV, raising=False)
+    monkeypatch.setattr(loader, "DEFAULT_CONFIG_DIR", tmp_path / "user")
+    monkeypatch.setattr(loader, "SYSTEM_CONFIG_DIR", tmp_path / "system")
+    monkeypatch.setattr(config_module, "DEFAULT_CONFIG_DIR", tmp_path / "user")
+    monkeypatch.setattr(config_module, "SYSTEM_CONFIG_DIR", tmp_path / "system")
+
+    OpenVikingConfigSingleton.reset_instance()
+    try:
+        with pytest.raises(FileNotFoundError, match=r"https://openviking\.ai/docs"):
+            OpenVikingConfigSingleton.get_instance()
+    finally:
+        OpenVikingConfigSingleton.reset_instance()
+
+
+def test_openviking_config_singleton_initialize_missing_message_uses_openviking_ai_docs(
+    tmp_path, monkeypatch
+):
+    import openviking_cli.utils.config.config_loader as loader
+    import openviking_cli.utils.config.open_viking_config as config_module
+    from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
+
+    monkeypatch.delenv(OPENVIKING_CONFIG_ENV, raising=False)
+    monkeypatch.setattr(loader, "DEFAULT_CONFIG_DIR", tmp_path / "user")
+    monkeypatch.setattr(loader, "SYSTEM_CONFIG_DIR", tmp_path / "system")
+    monkeypatch.setattr(config_module, "DEFAULT_CONFIG_DIR", tmp_path / "user")
+    monkeypatch.setattr(config_module, "SYSTEM_CONFIG_DIR", tmp_path / "system")
+
+    OpenVikingConfigSingleton.reset_instance()
+    try:
+        with pytest.raises(FileNotFoundError, match=r"https://openviking\.ai/docs"):
+            OpenVikingConfigSingleton.initialize()
+    finally:
+        OpenVikingConfigSingleton.reset_instance()
+
+
+def test_early_logger_initialization_is_reconfigured_to_file_output(tmp_path, monkeypatch):
+    from openviking_cli.utils import logger as logger_module
+    from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
+
+    logger_name = "openviking.test.early_init"
+    for name in ("openviking", "uvicorn", "uvicorn.error", "uvicorn.access", logger_name):
+        logger = logging.getLogger(name)
+        for handler in logger.handlers:
+            handler.close()
+        logger.handlers.clear()
+        logger.propagate = True
+    logger_module._shared_log_handler = None
+    logger_module._shared_log_handler_key = None
+    logger_module._stop_std_stream_listeners()
+
+    OpenVikingConfigSingleton.reset_instance()
+    monkeypatch.setenv("OPENVIKING_CONFIG_FILE", "/tmp/codex-no-config.json")
+
+    early_logger = logger_module.get_logger(logger_name)
+    openviking_root = logging.getLogger("openviking")
+    assert early_logger.handlers == []
+    assert any(isinstance(h, QueueHandler) for h in openviking_root.handlers)
+
+    config_path = tmp_path / "ov.conf"
+    config_path.write_text(
+        (
+            "{"
+            '"storage": {"workspace": "%s"}, '
+            '"log": {"output": "file", "level": "INFO", '
+            '"format": "%%(message)s", "rotation": false, "rotation_days": 7, '
+            '"rotation_interval": "midnight"}'
+            "}"
+        )
+        % str(tmp_path).replace("\\", "\\\\"),
+        encoding="utf-8",
+    )
+
+    try:
+        OpenVikingConfigSingleton.initialize(config_path=str(config_path))
+        refreshed_logger = logger_module.get_logger(logger_name)
+        logger_module.configure_uvicorn_logging()
+        openviking_root = logging.getLogger("openviking")
+        uvicorn_root = logging.getLogger("uvicorn")
+        uvicorn_access = logging.getLogger("uvicorn.access")
+        assert refreshed_logger.handlers == []
+        assert uvicorn_access.handlers == []
+        assert any(isinstance(h, logging.FileHandler) for h in openviking_root.handlers)
+        assert not any(type(h) is logging.StreamHandler for h in openviking_root.handlers)
+        assert openviking_root.handlers == uvicorn_root.handlers
+
+        refreshed_logger.info("child-line")
+        uvicorn_access.info("access-line")
+        for handler in openviking_root.handlers:
+            handler.flush()
+
+        content = (tmp_path / "log" / "openviking.log").read_text(encoding="utf-8")
+        assert content.count("child-line") == 1
+        assert content.count("access-line") == 1
+    finally:
+        for name in ("openviking", "uvicorn", "uvicorn.error", "uvicorn.access", logger_name):
+            logger = logging.getLogger(name)
+            for handler in logger.handlers:
+                handler.close()
+            logger.handlers.clear()
+            logger.propagate = True
+        logger_module._shared_log_handler = None
+        logger_module._shared_log_handler_key = None
+        logger_module._stop_std_stream_listeners()
+        OpenVikingConfigSingleton.reset_instance()

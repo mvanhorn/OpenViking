@@ -6,16 +6,17 @@ Uses litellm to provide a unified embedding interface across many providers
 (OpenRouter, Ollama, vLLM, and any OpenAI-compatible endpoint).
 """
 
-import logging
 import os
 from typing import Any, Dict, List, Optional
 
 import litellm
 
 from openviking.models.embedder.base import DenseEmbedderBase, EmbedResult
+from openviking.models.model_error import model_error_boundary
 from openviking.telemetry import get_current_telemetry
+from openviking_cli.utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class LiteLLMDenseEmbedder(DenseEmbedderBase):
@@ -68,6 +69,7 @@ class LiteLLMDenseEmbedder(DenseEmbedderBase):
             config: Additional configuration dict.
         """
         super().__init__(model_name, config)
+        self.provider = "litellm"
 
         os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
@@ -100,7 +102,7 @@ class LiteLLMDenseEmbedder(DenseEmbedderBase):
 
     def _build_kwargs(self, is_query: bool = False) -> Dict[str, Any]:
         """Build kwargs dict for litellm.embedding() call."""
-        kwargs: Dict[str, Any] = {"model": self.model_name}
+        kwargs: Dict[str, Any] = {"model": self.model_name, "num_retries": 0}
 
         if self.api_key:
             kwargs["api_key"] = self.api_key
@@ -165,6 +167,7 @@ class LiteLLMDenseEmbedder(DenseEmbedderBase):
             completion_tokens=output_tokens,
         )
 
+    @model_error_boundary
     def embed(self, text: str, is_query: bool = False) -> EmbedResult:
         """Perform dense embedding on text via litellm.
 
@@ -190,7 +193,7 @@ class LiteLLMDenseEmbedder(DenseEmbedderBase):
             return EmbedResult(dense_vector=vector)
 
         try:
-            return self._run_with_retry(
+            return self._run_once(
                 _call,
                 logger=logger,
                 operation_name="LiteLLM embedding",
@@ -198,6 +201,7 @@ class LiteLLMDenseEmbedder(DenseEmbedderBase):
         except Exception as e:
             raise RuntimeError(f"LiteLLM embedding failed: {e}") from e
 
+    @model_error_boundary
     async def embed_async(self, text: str, is_query: bool = False) -> EmbedResult:
         async def _call() -> EmbedResult:
             kwargs = self._build_kwargs(is_query=is_query)
@@ -205,74 +209,18 @@ class LiteLLMDenseEmbedder(DenseEmbedderBase):
             response = await litellm.aembedding(**kwargs)
             self._update_telemetry_token_usage(response)
             vector = response.data[0]["embedding"]
+            vector = self._truncate_vector(vector)
             return EmbedResult(dense_vector=vector)
 
         try:
-            return await self._run_with_async_retry(
+            return await self._run_once_async(
                 _call,
+                is_query=is_query,
                 logger=logger,
                 operation_name="LiteLLM async embedding",
             )
         except Exception as e:
             raise RuntimeError(f"LiteLLM embedding failed: {e}") from e
-
-    def embed_batch(self, texts: List[str], is_query: bool = False) -> List[EmbedResult]:
-        """Batch embedding via litellm.
-
-        Args:
-            texts: List of texts
-            is_query: Flag to indicate if these are query embeddings
-
-        Returns:
-            List[EmbedResult]: List of embedding results
-
-        Raises:
-            RuntimeError: When embedding call fails
-        """
-        if not texts:
-            return []
-
-        def _call() -> List[EmbedResult]:
-            kwargs = self._build_kwargs(is_query=is_query)
-            kwargs["input"] = texts
-            response = litellm.embedding(**kwargs)
-            self._update_telemetry_token_usage(response)
-            # Truncate vectors if needed
-            return [
-                EmbedResult(dense_vector=self._truncate_vector(item["embedding"]))
-                for item in response.data
-            ]
-
-        try:
-            return self._run_with_retry(
-                _call,
-                logger=logger,
-                operation_name="LiteLLM batch embedding",
-            )
-        except Exception as e:
-            raise RuntimeError(f"LiteLLM batch embedding failed: {e}") from e
-
-    async def embed_batch_async(
-        self, texts: List[str], is_query: bool = False
-    ) -> List[EmbedResult]:
-        if not texts:
-            return []
-
-        async def _call() -> List[EmbedResult]:
-            kwargs = self._build_kwargs(is_query=is_query)
-            kwargs["input"] = texts
-            response = await litellm.aembedding(**kwargs)
-            self._update_telemetry_token_usage(response)
-            return [EmbedResult(dense_vector=item["embedding"]) for item in response.data]
-
-        try:
-            return await self._run_with_async_retry(
-                _call,
-                logger=logger,
-                operation_name="LiteLLM async batch embedding",
-            )
-        except Exception as e:
-            raise RuntimeError(f"LiteLLM batch embedding failed: {e}") from e
 
     def get_dimension(self) -> int:
         """Get embedding dimension.

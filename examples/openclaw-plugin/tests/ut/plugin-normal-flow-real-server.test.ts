@@ -3,7 +3,6 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { localClientCache, localClientPendingPromises } from "../../client.js";
 import plugin from "../../index.js";
 
 type RequestRecord = {
@@ -44,8 +43,6 @@ describe("plugin normal flow with healthy backend", () => {
 
   beforeEach(async () => {
     requests = [];
-    localClientCache.clear();
-    localClientPendingPromises.clear();
 
     server = createServer(async (req, res) => {
       const method = req.method ?? "GET";
@@ -63,18 +60,18 @@ describe("plugin normal flow with healthy backend", () => {
         return;
       }
 
-      if (method === "POST" && url.pathname === "/api/v1/search/find") {
+      if (method === "POST" && url.pathname === "/api/v1/search/search") {
         json(res, 200, {
           result: {
-            memories: [
-              {
-                uri: "viking://user/default/memories/rust-pref",
-                level: 2,
-                abstract: "User prefers Rust for backend tasks.",
-                score: 0.91,
-              },
-            ],
-            total: 1,
+            entries: [{
+              uri: "viking://user/default/memories/rust-pref",
+              category: "preferences",
+              detail: "abstract",
+              text: "User prefers Rust for backend tasks.",
+              score: 0.91,
+            }],
+            rendered: '<memory uri="viking://user/default/memories/rust-pref">User prefers Rust for backend tasks.</memory>',
+            stats: { candidates: 1, used_tokens: 18 },
           },
           status: "ok",
         });
@@ -170,8 +167,6 @@ describe("plugin normal flow with healthy backend", () => {
   });
 
   afterEach(async () => {
-    localClientCache.clear();
-    localClientPendingPromises.clear();
     server.close();
     await once(server, "close");
   });
@@ -200,8 +195,7 @@ describe("plugin normal flow with healthy backend", () => {
         autoCapture: true,
         autoRecall: true,
         baseUrl,
-        commitTokenThreshold: 20000,
-        ingestReplyAssist: false,
+        commitTokenThresholdRatio: 0.1,
         mode: "remote",
       },
       registerContextEngine: (_id, factory) => {
@@ -218,20 +212,10 @@ describe("plugin normal flow with healthy backend", () => {
 
     await service!.start();
 
-    const beforePromptBuild = handlers.get("before_prompt_build");
-    expect(beforePromptBuild).toBeTruthy();
-    const hookResult = await beforePromptBuild!(
-      { messages: [{ role: "user", content: "what backend language should we use?" }] },
-      { agentId: "main", sessionId: "session-normal", sessionKey: "agent:main:normal" },
-    );
-
-    expect(hookResult).toMatchObject({
-      prependContext: expect.stringContaining("User prefers Rust for backend tasks."),
-    });
-
     const contextEngine = contextEngineFactory!() as {
       assemble: (params: {
         sessionId: string;
+        prompt?: string;
         messages: Array<{ role: string; content: string }>;
       }) => Promise<{ messages: Array<{ role: string; content: unknown }> }>;
       afterTurn: (params: {
@@ -244,17 +228,25 @@ describe("plugin normal flow with healthy backend", () => {
 
     const assembled = await contextEngine.assemble({
       sessionId: "session-normal",
+      prompt: "what backend language should we use?",
       messages: [{ role: "user", content: "fallback" }],
     });
 
-    expect(assembled.messages[0]).toEqual({
-      role: "user",
-      content: "[Session History Summary]\nEarlier work focused on backend stack choices.",
+    expect(assembled.messages).toEqual([{ role: "user", content: "fallback" }]);
+
+    const transformed = await contextEngine.assemble({
+      sessionId: "session-normal",
+      messages: [
+        ...(assembled.messages as Array<{ role: string; content: string }>),
+        { role: "user", content: "what backend language should we use?" },
+      ],
     });
-    expect(assembled.messages[1]).toEqual({
-      role: "assistant",
-      content: [{ type: "text", text: "Stored answer from OpenViking." }],
-    });
+
+    const latest = transformed.messages.at(-1);
+    expect(latest?.role).toBe("user");
+    expect(String(latest?.content)).toContain("Source: openviking-auto-recall");
+    expect(String(latest?.content)).toContain("User prefers Rust for backend tasks.");
+    expect(String(latest?.content)).toContain("what backend language should we use?");
 
     await contextEngine.afterTurn({
       sessionId: "session-normal",
@@ -268,11 +260,38 @@ describe("plugin normal flow with healthy backend", () => {
 
     expect(requests.some((entry) => entry.method === "GET" && entry.path === "/health")).toBe(true);
     expect(
-      requests.some((entry) => entry.method === "POST" && entry.path === "/api/v1/search/find"),
+      requests.some((entry) => entry.method === "POST" && entry.path === "/api/v1/search/search"),
     ).toBe(true);
+    const contextSearchRequest = requests.find(
+      (entry) => entry.method === "POST" && entry.path === "/api/v1/search/search",
+    );
+    const contextSearchBody = JSON.parse(contextSearchRequest?.body ?? "{}");
+    expect(contextSearchBody).toMatchObject({
+      mode: "context",
+      purpose: "coding",
+      quotas: {
+        events: 1,
+        entities: 1,
+        preferences: 1,
+        experiences: 1,
+        resources: 1,
+        skills: 1,
+      },
+      session_id: "session-normal",
+      context_type: "memory",
+      query_expansion: "auto",
+      max_tokens: 1000,
+      dedup_turns: 0,
+      peer_scope: "actor",
+    });
+    expect(contextSearchBody).not.toHaveProperty("limit");
+    const recallRequests = requests.filter(
+      (entry) => entry.method === "POST" && entry.path === "/api/v1/search/search",
+    );
+    expect(recallRequests.map((entry) => JSON.parse(entry.body ?? "{}").dedup_turns)).toEqual([0, 5]);
     expect(
       requests.some((entry) => entry.method === "GET" && entry.path.startsWith("/api/v1/sessions/session-normal/context")),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       requests.some((entry) => entry.method === "POST" && entry.path === "/api/v1/sessions/session-normal/messages"),
     ).toBe(true);

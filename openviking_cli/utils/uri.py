@@ -10,6 +10,26 @@ viking://<scope>/<path>
 import re
 from typing import Dict, Optional
 
+# Win32 reserved device names. A URI segment whose stem matches one of these
+# collides with a Windows device name and causes a silent write failure, so
+# sanitize_segment defuses it with a leading underscore. Mirrors the guard PR
+# #4517 added to the memory path (openviking/session/memory/utils/uri.py).
+_WINDOWS_RESERVED_STEMS = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{index}" for index in range(1, 10)),
+        *(f"LPT{index}" for index in range(1, 10)),
+    }
+)
+
+
+def _windows_reserved_stem(segment: str) -> str:
+    """Return the Win32 device-name stem used for portability checks."""
+    return segment.split(".", 1)[0].rstrip(" .").upper()
+
 
 class VikingURI:
     """
@@ -19,32 +39,47 @@ class VikingURI:
 
     Scopes:
     - resources: Independent resource scope (viking://resources/{project}/...)
-    - user: User scope (viking://user/...)
-    - agent: Agent scope (viking://agent/...)
-    - session: Session scope (viking://session/{session_id}/...)
+    - user: Explicit user scope (viking://user/{user_id}/...), including sessions under
+      viking://user/{user_id}/sessions/{session_id}.
+    - session: Historical scope parsed only for explicit data migration
+    - agent: Agent capabilities scope (viking://agent/skills/..., viking://agent/endpoints/...)
+    - system: Account-level system assets (viking://system/...)
     - queue: Queue scope (viking://queue/...)
+    - ~: Server-side alias for the caller's user root, expanded to viking://user/{user_id}
 
     Examples:
     - viking://resources/my_project/docs/api
-    - viking://user/memories/preferences/code_style
-    - viking://agent/skills/pdf
-    - viking://session/session123/messages
+    - viking://user/alice/memories/preferences/code_style
+    - viking://user/alice/skills/pdf
+    - viking://user/alice/sessions/session123/messages.jsonl
     """
 
     SCHEME = "viking"
-    VALID_SCOPES = {"resources", "user", "agent", "session", "queue", "temp"}
+    # SCOPES that can be listed in root directory (ov ls)
+    LISTABLE_SCOPES = {
+        "resources",
+        "user",
+        "agent",
+        "system",
+    }
+    PUBLIC_SCOPES = frozenset(LISTABLE_SCOPES)
+    LEGACY_SCOPES = frozenset({"session"})
+    INTERNAL_SCOPES = frozenset({"temp", "queue", "upload"})
+    # Server-side alias for the caller's user namespace root. Only valid as segment 0,
+    # and never persisted or echoed back: the server always expands it to viking://user/{user_id}.
+    ALIAS_SCOPES = frozenset({"~"})
+    # All valid scopes that can be addressed by the URI parser/storage internals.
+    # Public API handlers must not use this as their external whitelist.
+    VISITABLE_SCOPES = PUBLIC_SCOPES | LEGACY_SCOPES | INTERNAL_SCOPES | ALIAS_SCOPES
 
     def __init__(self, uri: str):
         """
         Initialize URI handler.
 
-        Accepts both full-format (viking://...) and short-format (/resources, resources)
-        URIs. Short-format URIs are automatically normalized to full format.
-
         Args:
-            uri: URI string (full or short format)
+            uri: URI string in full ``viking://`` format
         """
-        self.uri = self.normalize(uri)
+        self.uri = uri
         self._parsed = self._parse()
 
     def _parse(self) -> Dict[str, str]:
@@ -70,8 +105,10 @@ class VikingURI:
 
         # Parse scope
         scope = path.split("/")[0]
-        if scope not in self.VALID_SCOPES:
-            raise ValueError(f"Invalid scope '{scope}'. Must be one of {self.VALID_SCOPES}")
+        if scope not in self.VISITABLE_SCOPES:
+            # Alias scopes are accepted but never advertised in scope error messages.
+            scope_names = ", ".join(sorted(self.VISITABLE_SCOPES - self.ALIAS_SCOPES))
+            raise ValueError(f"Invalid scope '{scope}'. Must be one of: {scope_names}")
 
         return {
             "scheme": self.SCHEME,
@@ -178,14 +215,15 @@ class VikingURI:
         Build a Viking URI from components.
 
         Args:
-            scope: Scope (resources, user, agent, session, queue)
+            scope: Scope (resources, user, session, queue, temp)
             *path_parts: Additional path components
 
         Returns:
             Viking URI string
         """
-        if scope not in VikingURI.VALID_SCOPES:
-            raise ValueError(f"Invalid scope '{scope}'. Must be one of {VikingURI.VALID_SCOPES}")
+        # Alias scopes are inputs only: the server never mints a '~' URI.
+        if scope not in VikingURI.VISITABLE_SCOPES or scope in VikingURI.ALIAS_SCOPES:
+            raise ValueError(f"Invalid scope '{scope}'")
 
         parts = [scope] + list(path_parts)
         # Filter out empty parts
@@ -227,21 +265,28 @@ class VikingURI:
             URI-safe string
         """
         # Preserve:
-        # - Letters, numbers, underscores, hyphens (\w includes [a-zA-Z0-9_])
+        # - Letters, numbers, underscores, hyphens, dots (\w includes [a-zA-Z0-9_])
+        # - Latin-1 Supplement, Latin Extended-A/B (Western European languages: Spanish, Portuguese, French, German, etc.)
+        # - Cyrillic (Russian, Bulgarian, Serbian, etc.)
+        # - Arabic (Arabic, Persian, Urdu, etc.)
         # - CJK Unified Ideographs (Chinese, Japanese Kanji, Korean Hanja)
         # - Hiragana and Katakana (Japanese)
         # - Hangul Syllables (Korean)
-        # - CJK Unified Ideographs Extension A
-        # - CJK Unified Ideographs Extension B
+        # - CJK Unified Ideographs Extension A/B
         safe = re.sub(
-            r"[^\w\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af\u3400-\u4dbf\U00020000-\U0002a6df\-]",
+            r"[^\w\u0080-\u02af\u0400-\u052f\u0600-\u077f\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af\u3400-\u4dbf\U00020000-\U0002a6df\-.]",
             "_",
             text,
         )
         # Merge consecutive underscores
         safe = re.sub(r"_+", "_", safe)
-        # Strip leading/trailing underscores and limit length
-        safe = safe.strip("_")[:50]
+        # Strip leading/trailing underscores and dots, limit length
+        safe = safe.strip("_.")[:50]
+        # Defuse Win32 reserved device names (CON/PRN/NUL/AUX/COM1../LPT9..)
+        # so the segment is a valid path component on Windows, mirroring PR
+        # #4517's guard on the memory path.
+        if _windows_reserved_stem(safe) in _WINDOWS_RESERVED_STEMS:
+            safe = f"_{safe}"
         return safe or "unnamed"
 
     def __str__(self) -> str:
@@ -258,38 +303,24 @@ class VikingURI:
     def __hash__(self) -> int:
         return hash(self.uri)
 
-    @staticmethod
-    def normalize(uri: str) -> str:
-        """
-        Normalize URI by ensuring it has the viking:// scheme.
-
-        If the input already starts with viking://, returns it as-is.
-        If it starts with /, prepends viking:// (resulting in viking:///... which is invalid,
-        so we strip leading / first).
-        Otherwise, prepends viking://.
-
-        Examples:
-            "/resources/images" -> "viking://resources/images"
-            "resources/images" -> "viking://resources/images"
-            "viking://resources/images" -> "viking://resources/images"
-
-        Args:
-            uri: Input URI string
-
-        Returns:
-            Normalized URI with viking:// scheme
-        """
-        if uri.startswith(f"{VikingURI.SCHEME}://"):
-            return uri
-        # Strip leading slashes
-        uri = uri.lstrip("/")
-        return f"{VikingURI.SCHEME}://{uri}"
-
     @classmethod
-    def create_temp_uri(cls) -> str:
-        """Create temp directory URI like viking://temp/MMDDHHMM_XXXXXX"""
+    def create_temp_uri(cls, space: Optional[str] = None) -> str:
+        """Create temp directory URI.
+
+        When ``space`` is provided, generate a user-scoped temp URI like
+        ``viking://temp/<space>/MMDDHHMM_XXXXXX``. This preserves isolation
+        between users sharing the same account while keeping temp data in the
+        temp scope.
+
+        When ``space`` is omitted, fall back to the legacy shape
+        ``viking://temp/MMDDHHMM_XXXXXX`` for compatibility with callers that
+        do not have a user context.
+        """
         import datetime
         import uuid
 
         temp_id = uuid.uuid4().hex[:6]
-        return f"viking://temp/{datetime.datetime.now().strftime('%m%d%H%M')}_{temp_id}"
+        temp_leaf = f"{datetime.datetime.now().strftime('%m%d%H%M')}_{temp_id}"
+        if space:
+            return f"viking://temp/{space}/{temp_leaf}"
+        return f"viking://temp/{temp_leaf}"

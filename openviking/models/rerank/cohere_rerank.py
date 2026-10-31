@@ -8,14 +8,15 @@ Same interface: rerank_batch(query, documents) -> List[float]
 """
 
 # For logging, use Python's built-in logging
-import logging
+import time
 from typing import List, Optional
 
 import httpx
 
 from openviking.models.rerank.base import RerankBase
+from openviking_cli.utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class CohereRerankClient(RerankBase):
@@ -57,6 +58,7 @@ class CohereRerankClient(RerankBase):
             return []
 
         try:
+            started = time.monotonic()
             resp = self._client.post(
                 "/v2/rerank",
                 json={
@@ -71,7 +73,12 @@ class CohereRerankClient(RerankBase):
             data = resp.json()
 
             # Update token usage tracking
-            self._extract_and_update_token_usage(data, query, documents)
+            self._extract_and_update_token_usage(
+                data,
+                query,
+                documents,
+                duration_seconds=time.monotonic() - started,
+            )
 
             # Cohere returns results sorted by score desc with index field
             # We need to map back to original order

@@ -211,10 +211,23 @@ mod tests {
                 async fn read(&self, _path: &str, _offset: u64, _size: u64) -> Result<Vec<u8>> {
                     Ok(vec![])
                 }
-                async fn write(&self, _path: &str, _data: &[u8], _offset: u64, _flags: WriteFlag) -> Result<u64> {
+                async fn write(
+                    &self,
+                    _path: &str,
+                    _data: &[u8],
+                    _offset: u64,
+                    _flags: WriteFlag,
+                ) -> Result<u64> {
                     Ok(_data.len() as u64)
                 }
-                async fn read_dir(&self, _path: &str) -> Result<Vec<FileInfo>> {
+                async fn read_dir(
+                    &self,
+                    _path: &str,
+                    _offset: Option<usize>,
+                    _limit: Option<usize>,
+                    _sort_by: Option<crate::core::ListSortBy>,
+                    _sort_order: Option<crate::core::SortOrder>,
+                ) -> Result<Vec<FileInfo>> {
                     Ok(vec![])
                 }
                 async fn stat(&self, _path: &str) -> Result<FileInfo> {
@@ -254,11 +267,7 @@ mod tests {
     async fn test_plugin_lifecycle() {
         let plugin = MockPlugin;
 
-        let config = PluginConfig {
-            name: "mock".to_string(),
-            mount_path: "/mock".to_string(),
-            params: HashMap::new(),
-        };
+        let config = PluginConfig::single_backend("mock", "/mock", HashMap::new());
 
         assert!(plugin.validate(&config).await.is_ok());
         assert!(plugin.initialize(config).await.is_ok());

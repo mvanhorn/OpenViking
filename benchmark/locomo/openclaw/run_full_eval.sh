@@ -80,7 +80,7 @@ if [ "$SKIP_IMPORT" = false ]; then
         echo "[1/5] 导入数据到 OpenViking 和 OpenClaw..."
 
         # 后台运行 OpenViking 导入
-        python "$SCRIPT_DIR/import_to_ov.py" --no-user-agent-id --input "$INPUT_FILE" $FORCE_INGEST_ARG $SAMPLE_ARG > "$RESULT_DIR/import_ov.log" 2>&1 &
+        python "$SCRIPT_DIR/import_to_ov.py" --no-user-id --input "$INPUT_FILE" $FORCE_INGEST_ARG $SAMPLE_ARG > "$RESULT_DIR/import_ov.log" 2>&1 &
         PID_OV=$!
 
         # 后台运行 OpenClaw 导入
@@ -91,11 +91,9 @@ if [ "$SKIP_IMPORT" = false ]; then
         wait $PID_OV $PID_CLAW
     else
         echo "[1/5] 导入数据到 OpenViking..."
-        python "$SCRIPT_DIR/import_to_ov.py" --no-user-agent-id --input "$INPUT_FILE" $FORCE_INGEST_ARG $SAMPLE_ARG
+        python "$SCRIPT_DIR/import_to_ov.py" --no-user-id --input "$INPUT_FILE" $FORCE_INGEST_ARG $SAMPLE_ARG
     fi
 
-    echo "导入完成，等待 1 分钟..."
-    sleep 60
 else
     echo "[1/5] 跳过导入数据..."
 fi

@@ -7,9 +7,10 @@ Provides rerank functionality for hierarchical retrieval.
 """
 
 import json
+import math
 
 # For logging, use Python's built-in logging
-import logging
+import time
 from typing import List, Optional
 
 import requests
@@ -18,8 +19,9 @@ from volcengine.base.Request import Request
 from volcengine.Credentials import Credentials
 
 from openviking.models.rerank.base import RerankBase
+from openviking_cli.utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class RerankClient(RerankBase):
@@ -109,6 +111,7 @@ class RerankClient(RerankBase):
         }
 
         try:
+            started = time.monotonic()
             req = self._prepare_request(
                 method="POST",
                 path="/api/vikingdb/rerank",
@@ -123,17 +126,55 @@ class RerankClient(RerankBase):
                 timeout=30,
             )
 
-            result = response.json()
-            # print(f"[RerankClient] Raw response: {result}")
-            if "result" not in result or "data" not in result["result"]:
-                logger.warning(f"[RerankClient] Unexpected response format: {result}")
+            try:
+                result = response.json()
+            except Exception:
+                logger.warning(
+                    "[RerankClient] Non-JSON response: status=%s body=%s",
+                    response.status_code,
+                    response.text[:1000],
+                )
+                return None
+
+            if not isinstance(result, dict):
+                logger.warning(
+                    "[RerankClient] Unexpected response type: status=%s type=%s body=%s",
+                    response.status_code,
+                    type(result).__name__,
+                    str(result)[:1000],
+                )
+                return None
+
+            result_payload = result.get("result")
+            if not isinstance(result_payload, dict):
+                logger.warning(
+                    "[RerankClient] Unexpected response payload: status=%s result_type=%s body=%s",
+                    response.status_code,
+                    type(result_payload).__name__,
+                    str(result)[:1000],
+                )
+                return None
+
+            if "data" not in result_payload:
+                logger.warning(
+                    "[RerankClient] Missing rerank data field: status=%s body=%s",
+                    response.status_code,
+                    str(result)[:1000],
+                )
                 return None
 
             # Update token usage tracking (estimate, VikingDB doesn't provide token info)
-            self._extract_and_update_token_usage(result, query, documents)
+            self._extract_and_update_token_usage(
+                result,
+                query,
+                documents,
+                duration_seconds=time.monotonic() - started,
+            )
 
-            # Each document is a separate group, data array returns scores for each group sequentially
-            data = result["result"]["data"]
+            # The response is ranked by relevance; ids refer to input document groups.
+            data = result_payload["data"]
+            if not isinstance(data, list):
+                raise ValueError("Rerank data must be a list")
             if len(data) != len(documents):
                 logger.warning(
                     "[RerankClient] Unexpected rerank result length: expected=%s actual=%s",
@@ -141,7 +182,23 @@ class RerankClient(RerankBase):
                     len(data),
                 )
                 return None
-            scores = [item.get("score", 0.0) for item in data]
+            scores = [0.0] * len(documents)
+            seen = set()
+            for item in data:
+                if not isinstance(item, dict):
+                    raise ValueError("Invalid rerank result item")
+                index = item.get("id")
+                if isinstance(index, str) and index.isdecimal():
+                    index = int(index)
+                if type(index) is not int or not 0 <= index < len(documents):
+                    raise ValueError("Invalid rerank document id")
+                if index in seen:
+                    raise ValueError("Duplicate rerank document id")
+                score = float(item["score"])
+                if not math.isfinite(score):
+                    raise ValueError("Non-finite rerank score")
+                seen.add(index)
+                scores[index] = score
 
             logger.debug(f"[RerankClient] Reranked {len(documents)} documents")
             return scores
@@ -180,6 +237,11 @@ class RerankClient(RerankBase):
             from openviking.models.rerank.openai_rerank import OpenAIRerankClient
 
             return OpenAIRerankClient.from_config(config)
+
+        if provider == "jev":
+            from openviking.models.rerank.jev_rerank import JevRerankClient
+
+            return JevRerankClient.from_config(config)
 
         return cls(
             ak=config.ak,

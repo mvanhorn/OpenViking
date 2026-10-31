@@ -1,7 +1,7 @@
 import asyncio
 import importlib
 from collections import defaultdict
-from typing import List, Any, Dict, Type
+from typing import Any, Dict, List, Type
 
 from loguru import logger
 
@@ -40,6 +40,11 @@ class HookManager:
                 continue
             for event_type, hook_types in hooks.items():
                 for hook_type in hook_types:
+                    # AgentLoop is also constructed per Compile task. Module-level
+                    # hook instances must be registered once per event, not once
+                    # per AgentLoop; distinct hook instances remain independent.
+                    if any(existing is hook_type for existing in self._hooks[event_type]):
+                        continue
                     self._hooks[event_type].append(hook_type)
                     logger.debug(f"Registered hook '{hook_type}' for event '{event_type}'")
 
@@ -47,9 +52,6 @@ class HookManager:
         async_hooks = [hook for hook in self._hooks[context.event_type] if not hook.is_sync]
         sync_hooks = [hook for hook in self._hooks[context.event_type] if hook.is_sync]
         if async_hooks:
-            logger.debug(
-                f"Executing {len(async_hooks)} async hooks for event '{context.event_type}'"
-            )
             async_results = await asyncio.gather(
                 *[hook.execute(context, **kwargs) for hook in async_hooks], return_exceptions=True
             )
@@ -58,7 +60,7 @@ class HookManager:
                     logger.error(f"Hook '{async_hooks[i].name}' failed: {result}")
 
         if sync_hooks:
-            logger.debug(f"Executing {len(sync_hooks)} sync hooks for event '{context.event_type}'")
+            logger.info(f"Executing {len(sync_hooks)} sync hooks for event '{context.event_type}'")
             for hook in sync_hooks:
                 kwargs = await hook.execute(context, **kwargs)
         return kwargs

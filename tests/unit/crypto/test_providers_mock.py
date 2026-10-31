@@ -15,20 +15,25 @@ import base64
 import os
 import secrets
 import struct
+import sys
 import tempfile
+from types import ModuleType
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+import openviking.crypto.providers as providers_module
 from openviking.crypto.encryptor import FileEncryptor
 from openviking.crypto.providers import (
     PROVIDER_LOCAL,
     PROVIDER_VAULT,
     PROVIDER_VOLCENGINE,
+    ConfigError,
     LocalFileProvider,
     VaultProvider,
     VolcengineKMSProvider,
 )
+from openviking.metrics.datasources.encryption import EncryptionEventDataSource
 
 
 @pytest.fixture
@@ -61,6 +66,20 @@ def vault_mock_provider():
     provider._ensure_root_key_exists = AsyncMock()
 
     yield provider
+
+
+@pytest.fixture
+def vault_invalid_path(monkeypatch):
+    class InvalidPath(Exception):
+        pass
+
+    hvac = ModuleType("hvac")
+    exceptions = ModuleType("hvac.exceptions")
+    exceptions.InvalidPath = InvalidPath
+    hvac.exceptions = exceptions
+    monkeypatch.setitem(sys.modules, "hvac", hvac)
+    monkeypatch.setitem(sys.modules, "hvac.exceptions", exceptions)
+    return InvalidPath
 
 
 @pytest.fixture
@@ -196,6 +215,68 @@ class TestVaultProviderMock:
             assert ciphertext.startswith(b"OVE1")
             assert ciphertext[5] == PROVIDER_VAULT
 
+    @pytest.mark.asyncio
+    async def test_root_key_read_failure_never_creates(
+        self, vault_mock_provider, vault_invalid_path
+    ):
+        client = Mock()
+        client.secrets.kv.v1.read_secret.side_effect = RuntimeError("Vault unavailable")
+        vault_mock_provider._get_client = AsyncMock(return_value=client)
+
+        with pytest.raises(RuntimeError, match="Vault unavailable"):
+            await vault_mock_provider._get_or_create_root_key()
+
+        client.secrets.kv.v1.create_or_update_secret.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_root_key_is_created(self, vault_mock_provider, vault_invalid_path):
+        client = Mock()
+        client.secrets.kv.v1.read_secret.side_effect = vault_invalid_path()
+        vault_mock_provider._get_client = AsyncMock(return_value=client)
+        vault_mock_provider._encrypt_with_vault = AsyncMock(return_value=b"vault:ciphertext")
+
+        root_key = await vault_mock_provider._get_or_create_root_key()
+
+        assert len(root_key) == 32
+        client.secrets.kv.v1.create_or_update_secret.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_persist_failure_clears_cache_and_retries(
+        self, vault_mock_provider, vault_invalid_path
+    ):
+        """A failed persist must not leave an unpersisted ephemeral key cached."""
+        client = Mock()
+        client.secrets.kv.v1.read_secret.side_effect = vault_invalid_path()
+        client.secrets.kv.v1.create_or_update_secret.side_effect = RuntimeError("write outage")
+        vault_mock_provider._get_client = AsyncMock(return_value=client)
+        vault_mock_provider._encrypt_with_vault = AsyncMock(return_value=b"vault:ciphertext")
+
+        with pytest.raises(ConfigError, match="data loss risk"):
+            await vault_mock_provider.get_root_key()
+
+        # Cache must be cleared so a retry re-reads Vault instead of returning
+        # via the get_root_key fast path a key that was never persisted.
+        assert vault_mock_provider._root_key is None
+        with pytest.raises(ConfigError, match="data loss risk"):
+            await vault_mock_provider.get_root_key()
+        assert client.secrets.kv.v1.read_secret.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_root_key_decrypt_failure_never_creates(
+        self, vault_mock_provider, vault_invalid_path
+    ):
+        client = Mock()
+        client.secrets.kv.v1.read_secret.return_value = {
+            "data": {"encrypted_root_key": base64.b64encode(b"vault:ciphertext").decode()}
+        }
+        vault_mock_provider._get_client = AsyncMock(return_value=client)
+        vault_mock_provider._decrypt_with_vault = AsyncMock(side_effect=RuntimeError("bad key"))
+
+        with pytest.raises(RuntimeError, match="bad key"):
+            await vault_mock_provider._get_or_create_root_key()
+
+        client.secrets.kv.v1.create_or_update_secret.assert_not_called()
+
 
 class TestVolcengineKMSProviderMock:
     """Tests for VolcengineKMSProvider with mocked methods."""
@@ -224,6 +305,42 @@ class TestVolcengineKMSProviderMock:
         decrypted = await volcengine_mock_provider.decrypt_file_key(encrypted, iv, account_id)
         assert decrypted == plaintext_key
         volcengine_mock_provider.decrypt_file_key.assert_called_once_with(encrypted, iv, account_id)
+
+    @pytest.mark.asyncio
+    async def test_persist_failure_clears_cache_and_retries(
+        self, volcengine_mock_provider, tmp_path
+    ):
+        """A failed persist must not leave an unpersisted ephemeral key cached."""
+        volcengine_mock_provider.key_file = tmp_path / "root-key.enc"
+        volcengine_mock_provider._encrypt_with_kms = AsyncMock(side_effect=RuntimeError("KMS down"))
+
+        with pytest.raises(ConfigError, match="data loss risk"):
+            await volcengine_mock_provider.get_root_key()
+
+        # Cache must be cleared so a retry re-creates and re-persists the key
+        # instead of returning via the get_root_key fast path a key that was
+        # never written to disk.
+        assert volcengine_mock_provider._root_key is None
+        with pytest.raises(ConfigError, match="data loss risk"):
+            await volcengine_mock_provider.get_root_key()
+        assert volcengine_mock_provider._encrypt_with_kms.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_missing_key_file_never_shadows_the_default_root_key(
+        self, volcengine_mock_provider, tmp_path, monkeypatch
+    ):
+        """A key_file that earlier releases ignored must not replace the key they created."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        default_key_file = tmp_path / ".openviking" / VolcengineKMSProvider.ROOT_KEY_FILENAME
+        default_key_file.parent.mkdir()
+        default_key_file.write_bytes(b"existing-root-key")
+        volcengine_mock_provider.key_file = tmp_path / "configured" / "root-key.enc"
+        volcengine_mock_provider._encrypt_with_kms = AsyncMock()
+
+        with pytest.raises(ConfigError, match="move it to"):
+            await volcengine_mock_provider.get_root_key()
+        volcengine_mock_provider._encrypt_with_kms.assert_not_called()
+        assert not volcengine_mock_provider.key_file.exists()
 
 
 class TestCrossProviderEnvelope:
@@ -273,3 +390,73 @@ class TestCrossProviderEnvelope:
         finally:
             if os.path.exists(temp_path2):
                 os.unlink(temp_path2)
+
+
+@pytest.mark.asyncio
+async def test_hkdf_derive_logs_debug_when_metrics_recording_fails(
+    local_file_provider, monkeypatch: pytest.MonkeyPatch
+):
+    """HKDF derivation should log metrics side-effect failures without changing the result."""
+
+    debug = Mock()
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("metrics write failed")
+
+    monkeypatch.setattr(providers_module.logger, "debug", debug)
+    monkeypatch.setattr(EncryptionEventDataSource, "record_key_derivation", staticmethod(_boom))
+
+    result = await local_file_provider._hkdf_derive(
+        b"a" * 32,
+        "acct-1",
+        b"salt",
+        b"info:",
+    )
+
+    assert isinstance(result, bytes)
+    assert len(result) == 32
+    debug.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_factory", "provider_name"),
+    [
+        ("local_file_provider", "local"),
+        ("vault_mock_provider", "vault"),
+        ("volcengine_mock_provider", "volcengine_kms"),
+    ],
+)
+async def test_get_root_key_logs_debug_when_metrics_recording_fails(
+    request: pytest.FixtureRequest,
+    provider_factory: str,
+    provider_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Provider get_root_key should log metrics side-effect failures and still return the key."""
+
+    provider = request.getfixturevalue(provider_factory)
+    provider._root_key = None
+    debug = Mock()
+
+    if provider_name == "local":
+        provider._load_or_create_root_key = AsyncMock(return_value=b"k" * 32)
+    else:
+        provider._get_or_create_root_key = AsyncMock(return_value=b"k" * 32)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("metrics write failed")
+
+    monkeypatch.setattr(providers_module.logger, "debug", debug)
+    monkeypatch.setattr(EncryptionEventDataSource, "record_key_load", staticmethod(_boom))
+
+    result = await provider.get_root_key()
+
+    assert result == b"k" * 32
+    if provider_name == "local":
+        provider._load_or_create_root_key.assert_awaited_once()
+    else:
+        provider._get_or_create_root_key.assert_awaited_once()
+    debug.assert_called_once()
+    (message,) = debug.call_args.args[:1]
+    assert "Failed to record encryption key metrics" in str(message)

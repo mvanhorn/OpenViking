@@ -4,11 +4,22 @@
 //! We use `thiserror` for structured error definitions to ensure type safety
 //! and clear error messages.
 
-use std::io;
 use serde_json;
+use std::io;
 
 /// Result type alias for RAGFS operations
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Structured failure detail for one backup target in synchronous multi-write fanout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncWriteFailureDetail {
+    /// Logical backup backend name.
+    pub backend: String,
+    /// Stable error kind for programmatic inspection.
+    pub kind: String,
+    /// Human-readable error message including the original error display text.
+    pub message: String,
+}
 
 /// Main error type for RAGFS operations
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +56,10 @@ pub enum Error {
     #[error("invalid operation: {0}")]
     InvalidOperation(String),
 
+    /// Operation is intentionally unsupported by the current protocol.
+    #[error("not supported: {0}")]
+    NotSupported(String),
+
     /// I/O error
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
@@ -76,6 +91,33 @@ pub enum Error {
     /// Timeout error
     #[error("operation timed out: {0}")]
     Timeout(String),
+
+    /// Non-blocking operation would block and should be retried by the caller
+    #[error("operation would block: {0}")]
+    WouldBlock(String),
+
+    /// Preserve acquisition failures so callers can distinguish contention from corruption.
+    #[error(transparent)]
+    PathLock(#[from] crate::lock::types::PathLockError),
+
+    /// Multi-write synchronous fanout failed to reach the required acknowledgement quorum
+    #[error(
+        "sync write quorum failed: {succeeded}/{attempted} backups succeeded (required {required}); failures: {failures:?}"
+    )]
+    SyncWriteQuorum {
+        /// Number of backup targets that completed successfully.
+        succeeded: usize,
+        /// Minimum number of backup acknowledgements required for success.
+        required: usize,
+        /// Total number of backup targets that were attempted.
+        attempted: usize,
+        /// Structured failure details for each unsuccessful backup target.
+        failures: Vec<SyncWriteFailureDetail>,
+    },
+
+    /// Required filesystem context is missing from the current task
+    #[error("filesystem context missing: {0}")]
+    ContextMissing(String),
 
     /// Internal error
     #[error("internal error: {0}")]
@@ -124,9 +166,57 @@ impl Error {
         Self::Internal(msg.into())
     }
 
+    /// Create a ContextMissing error
+    pub fn context_missing(msg: impl Into<String>) -> Self {
+        Self::ContextMissing(msg.into())
+    }
+
+    /// Create a Timeout error
+    pub fn timeout(msg: impl Into<String>) -> Self {
+        Self::Timeout(msg.into())
+    }
+
+    /// Create a WouldBlock error
+    pub fn would_block(msg: impl Into<String>) -> Self {
+        Self::WouldBlock(msg.into())
+    }
+
+    /// Return a stable error kind name for structured reporting.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::NotFound(_) => "not_found",
+            Self::AlreadyExists(_) => "already_exists",
+            Self::PermissionDenied(_) => "permission_denied",
+            Self::InvalidPath(_) => "invalid_path",
+            Self::NotADirectory(_) => "not_a_directory",
+            Self::IsADirectory(_) => "is_a_directory",
+            Self::DirectoryNotEmpty(_) => "directory_not_empty",
+            Self::InvalidOperation(_) => "invalid_operation",
+            Self::NotSupported(_) => "not_supported",
+            Self::Io(_) => "io",
+            Self::Plugin(_) => "plugin",
+            Self::Config(_) => "config",
+            Self::MountPointNotFound(_) => "mount_point_not_found",
+            Self::MountPointExists(_) => "mount_point_exists",
+            Self::Serialization(_) => "serialization",
+            Self::Network(_) => "network",
+            Self::Timeout(_) => "timeout",
+            Self::WouldBlock(_) => "would_block",
+            Self::PathLock(_) => "path_lock",
+            Self::SyncWriteQuorum { .. } => "sync_write_quorum",
+            Self::ContextMissing(_) => "context_missing",
+            Self::Internal(_) => "internal",
+        }
+    }
+
     /// Create an InvalidOperation error
     pub fn invalid_operation(msg: impl Into<String>) -> Self {
         Self::InvalidOperation(msg.into())
+    }
+
+    /// Create a NotSupported error.
+    pub fn not_supported(msg: impl Into<String>) -> Self {
+        Self::NotSupported(msg.into())
     }
 }
 

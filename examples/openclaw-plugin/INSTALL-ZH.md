@@ -1,212 +1,462 @@
-# 为 OpenClaw 安装 OpenViking 记忆功能
+# 为 OpenClaw 安装 OpenViking
 
-通过 [OpenViking](https://github.com/volcengine/OpenViking) 为 [OpenClaw](https://github.com/openclaw/openclaw) 提供长效记忆能力。安装完成后，OpenClaw 会自动记住对话中的重要信息，并在回复前回忆相关内容。
+OpenViking 通过 `@openviking/openclaw-plugin` 插件为 OpenClaw 提供长期记忆、知识库检索、语义搜索和 RAG 上下文能力。
 
-> 当前文档介绍的是基于 `context-engine` 架构的新版 OpenViking 插件。
+这份文档同时面向用户和自动化 agent：用户可以按步骤执行，agent 可以按命令和 JSON 结果判断下一步。
 
-## 前置条件
+## 不要把插件和 Skill 装混
 
-| 组件 | 版本要求 |
+`@openviking/openclaw-plugin` 是 OpenClaw 插件。
+
+不要用下面这个命令安装本插件：
+
+```bash
+clawhub install openviking
+```
+
+这个命令安装的是名为 `openviking` 的 AgentSkill，不是 OpenClaw 插件。
+
+安装插件应使用：
+
+```bash
+openclaw plugins install clawhub:@openviking/openclaw-plugin
+```
+
+## 前置要求
+
+| 组件 | 要求 |
 | --- | --- |
-| Python | >= 3.10 |
 | Node.js | >= 22 |
-| OpenClaw | >= 2026.3.7 |
+| OpenClaw | >= 2026.5.27 |
+
+插件以远程模式连接到已有的 OpenViking 服务。它不会帮你启动 OpenViking server。需要先启动 OpenViking，并保持服务运行，再把插件的 `baseUrl` 指向这个 HTTP 服务。默认本地地址是 `http://127.0.0.1:1933`。
+
+OpenClaw 插件包版本边界：
+
+- `2026.5.27` 是当前插件支持的最低 OpenClaw 版本。这个版本下限包含 2026 年 7 月 2 日 OpenClaw 安全公告批次的修复，包括 GHSA-8wg3-5mcm-fjq8 和 GHSA-83w9-h5wv-j9xm。
+- `2026.5.3` 开始，OpenClaw 在安装包时会校验 TypeScript 插件入口是否有编译后的 JavaScript 产物。
+- `2026.5.4` 及之后，已安装/全局插件如果缺少编译后的 JavaScript，运行时不再回退加载 `.ts` 源码，插件可能被跳过。
+- 推荐的 `openclaw plugins install clawhub:@openviking/openclaw-plugin` 会安装已经发布并包含 `dist/*.js` 的插件包，普通用户不需要本地编译。
+- `ov-install` 是备用/源码安装路径。当 ClawHub 或 OpenClaw 插件管理器路径不可用、被限流，或者明确需要测试源码 ref 时才使用。目标 OpenClaw `>= 2026.5.3` 时，它会在安装过程中编译插件。
 
 快速检查：
 
 ```bash
-python3 --version
 node -v
 openclaw --version
 ```
 
-## 旧版升级说明
+## 火山 OpenViking Service 一键接入
 
-如果你之前安装过旧版 `memory-openviking`，先清理旧插件，再执行下面的安装或升级命令。
-
-- 新版 `openviking` 与旧版 `memory-openviking` 不兼容，不能混装。
-- 如果你从未安装过旧版插件，可以跳过本节。
+如果你使用的是火山控制台创建的 OpenViking Service 库，不需要启动本地 `openviking-server`。从控制台复制 OpenViking Service 的 server url、API Key，并按需配置 peer 标识：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/openclaw-plugin/upgrade_scripts/cleanup-memory-openviking.sh -o cleanup-memory-openviking.sh
-bash cleanup-memory-openviking.sh
+OPENVIKING_BASE_URL="https://api.vikingdb.cn-beijing.volces.com/openviking" \
+OPENVIKING_API_KEY="<your-openviking-service-api-key>" \
+bash scripts/install.sh --json
 ```
 
-## 安装
+这条命令会完成：
 
-推荐使用 `npm` + `ov-install`。macOS、Linux、Windows 的流程相同。
+- 默认从 TOS `latest` 安装 OpenViking 插件。
+- 写入 `$OPENCLAW_STATE_DIR/openviking.env`，默认是 `~/.openclaw/openviking.env`，权限为 `0600`。
+- 调用 `openclaw openviking setup --base-url ... --api-key ...` 写入插件配置。
+- 重启 `openclaw gateway`。
+- 执行 `openclaw openviking status --json` 和 `openclaw config get plugins.slots.contextEngine` 验证。
+
+如果需要把 OpenClaw assistant 说话人写成独立 `peer_id`，并让数据面 recall/search 使用对应 actor peer 视图，可以额外传：
 
 ```bash
-npm install -g openclaw-openviking-setup-helper
-
-# 安装插件
-ov-install
-
-# 安装插件到指定 OpenClaw 实例
-ov-install --workdir ~/.openclaw-second
+OPENVIKING_BASE_URL="https://api.vikingdb.cn-beijing.volces.com/openviking" \
+OPENVIKING_API_KEY="<your-openviking-service-api-key>" \
+OPENVIKING_PEER_ROLE="assistant" \
+OPENVIKING_PEER_PREFIX="openclaw-prod" \
+bash scripts/install.sh --json
 ```
 
-## 升级
-
-要把 OpenViking 和插件一起升级到最新版本，执行：
+如果使用 root key 或可信服务身份，补充租户信息：
 
 ```bash
-npm install -g openclaw-openviking-setup-helper@latest && ov-install -y
+OPENVIKING_BASE_URL="https://api.vikingdb.cn-beijing.volces.com/openviking" \
+OPENVIKING_API_KEY="<root-key>" \
+OPENVIKING_ACCOUNT_ID="<account-id>" \
+OPENVIKING_USER_ID="<user-id>" \
+bash scripts/install.sh --json
 ```
 
-## 安装或升级到指定版本
-
-如果要安装或升级到某个正式发布版本，执行：
+离线下载包安装：
 
 ```bash
-ov-install -y --version 0.2.9
+sh build.sh
+OPENVIKING_BASE_URL="https://api.vikingdb.cn-beijing.volces.com/openviking" \
+OPENVIKING_API_KEY="<your-openviking-service-api-key>" \
+OPENVIKING_PEER_ROLE="assistant" \
+OPENVIKING_PEER_PREFIX="openclaw-prod" \
+bash output/install.sh --source tarball --tarball output/openviking.tgz --json
 ```
 
-## 参数说明
+接入后，在火山 OpenViking Service 控制台检查：
 
-| 参数 | 含义 |
+- 发送一轮 OpenClaw 对话后，`Session` 下出现原始会话。
+- 触发 `/compact` 或等待 commit 后，`User/memories` 出现长期记忆。
+- 如果配置了 `peer_role=assistant`，数据面 recall/search 会携带对应 `X-OpenViking-Actor-Peer`，session message 仍用 body `peer_id` 做消息归因。
+- 通过手动 `/add-resource` 导入文档、URL 或目录后，`Resources` 下出现对应知识，并可做目录递归检索。Agent 可见的 `add_resource` 工具默认禁用，只有显式设置 `enableAddResourceTool=true` 后才暴露。
+
+## 启动 OpenViking Server
+
+如果 OpenViking 和 OpenClaw 在同一台机器上，最短流程是：
+
+```bash
+pip install openviking --upgrade --force-reinstall
+openviking-server init
+openviking-server doctor
+openviking-server
+```
+
+`openviking-server init` 用来生成服务端配置，`openviking-server doctor` 用来检查本地模型和 provider 鉴权是否可用，`openviking-server` 才是真正启动 HTTP API 的命令。OpenClaw 使用插件期间，这个服务进程需要一直运行。
+
+后台启动可以用：
+
+```bash
+mkdir -p ~/.openviking/data/log
+nohup openviking-server > ~/.openviking/data/log/openviking.log 2>&1 &
+```
+
+如果 OpenViking 跑在另一台机器上，需要监听可访问的地址和端口，例如：
+
+```bash
+openviking-server --host 0.0.0.0 --port 1933
+```
+
+然后把 OpenClaw 插件的 `baseUrl` 配成对应地址，例如 `http://your-server:1933`。
+
+安装或重启插件前，先确认服务能访问：
+
+```bash
+curl http://127.0.0.1:1933/health
+```
+
+## 推荐安装方式
+
+普通用户、正式环境和 agent 自动安装都优先使用这条路径。
+
+### 1. 安装插件
+
+```bash
+openclaw plugins install clawhub:@openviking/openclaw-plugin
+```
+
+如果你的 OpenClaw 环境需要显式 registry 前缀，使用：
+
+```bash
+openclaw plugins install clawhub:@openviking/openclaw-plugin
+```
+
+### 2. 配置插件
+
+用户交互式配置：
+
+```bash
+openclaw openviking setup
+```
+
+Agent 非交互配置：
+
+```bash
+openclaw openviking setup --base-url <OPENVIKING_URL> --api-key <API_KEY> --json
+```
+
+示例：
+
+```bash
+openclaw openviking setup --base-url http://127.0.0.1:1933 --api-key sk-xxx --json
+```
+
+`setup` 会写入 `plugins.entries.openviking.config`，并激活 `plugins.slots.contextEngine=openviking`。
+
+如果 OpenViking 服务暂时不可达，但你仍希望先保存配置：
+
+```bash
+openclaw openviking setup --base-url <OPENVIKING_URL> --api-key <API_KEY> --allow-offline --json
+```
+
+如果使用 root API key，可能还需要租户上下文：
+
+```bash
+openclaw openviking setup \
+  --base-url <OPENVIKING_URL> \
+  --api-key <ROOT_API_KEY> \
+  --account-id <ACCOUNT_ID> \
+  --user-id <USER_ID> \
+  --json
+```
+
+如果已有其他 context engine 占用 slot，setup 默认不会替换。确认要替换时再使用：
+
+```bash
+openclaw openviking setup --base-url <OPENVIKING_URL> --api-key <API_KEY> --force-slot --json
+```
+
+根据 OpenViking user 代表谁来选择 `--peer-role`：
+
+| 值 | 存储示例 | 适用场景 |
+| --- | --- | --- |
+| `none`（默认） | `viking://user/alice/memories/...` | 该 OpenViking 用户下的所有对话共享 user-level 记忆，不使用具体 peer 的记忆子树。 |
+| `assistant` | `viking://user/alice/peers/main/memories/...` | OpenViking user 代表人，并希望把 assistant 归因的 peer 记忆按不同 OpenClaw 助手分开。 |
+| `sender` | `viking://user/support-agent/peers/customer-42/memories/...` | OpenViking user 代表 agent，并希望把 sender 归因的 peer 记忆按不同发送者分开。 |
+
+安装和 setup 只接受 `sender`；已有配置里的 `person` 仍按 `sender` 生效。
+
+例如，让每个助手使用独立的 peer 记忆，并可选给 assistant id 加前缀：
+
+```bash
+openclaw openviking setup --base-url <OPENVIKING_URL> --api-key <API_KEY> --peer-role assistant --peer-prefix <PREFIX> --json
+```
+
+如果 OpenViking user 是 agent，按给它发消息的 sender 分开 peer 记忆：
+
+```bash
+openclaw openviking setup --base-url <OPENVIKING_URL> --api-key <API_KEY> --peer-role sender --json
+```
+
+OpenViking 会为每个用户初始化受管的 `peers/` 容器。`none` 表示插件不创建、也不路由到具体的 `peers/<peer_id>/memories` 子树。Actor-peer 召回同时包含用户共享记忆和当前 peer 记忆；切换配置不会搬迁已有记忆。
+
+#### 无法执行 CLI 时直接配置文件
+
+如果容器内无法执行 `openclaw` CLI，可以把以下字段合并到 OpenClaw 实际读取的配置文件。设置了 `OPENCLAW_CONFIG_PATH` 时使用该路径；否则通常是 `$OPENCLAW_STATE_DIR/openclaw.json`（默认 `~/.openclaw/openclaw.json`）。
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "openviking": {
+        "enabled": true,
+        "config": {
+          "mode": "remote",
+          "baseUrl": "http://openviking:1933",
+          "apiKey": "<API_KEY>",
+          "peer_role": "assistant"
+        }
+      }
+    },
+    "slots": {
+      "contextEngine": "openviking"
+    }
+  }
+}
+```
+
+- 插件必须已经安装；编辑前请备份配置，并把以上字段合并到现有 `plugins` 配置。
+- 如果配置中已有 `plugins.allow`，把 `openviking` 追加进去；如果没有，不要仅为本插件新建 allowlist。
+- `contextEngine` 是独占 slot；若已有其他 context engine，只有确认替换后再修改该字段。使用 root API key 时，还需在 `config` 中设置 `accountId` 和 `userId`。
+- 容器连接其他服务时，`baseUrl` 应使用容器内可访问的服务地址，而不是 `127.0.0.1`。
+- 推荐使用 `SecretRef` 对象作为 `apiKey`（而不是明文字符串），避免密钥直接落盘写入 `openclaw.json`。支持的形式与 OpenClaw 核心中 LLM/TTS/MCP 等 provider 配置使用的标准 `SecretRef` 一致：
+
+  | 类型 | 示例 | 说明 |
+  | --- | --- | --- |
+  | `env` | `{ "source": "env", "id": "OPENVIKING_API_KEY" }` | 启动时读取同名环境变量。 |
+  | `file` | `{ "source": "file", "id": "/etc/secrets/openviking.key" }` | 以 UTF-8 读取并去除首尾空白；`~` 可展开，适配 Kubernetes `secretKeyRef` 卷挂载、0600 权限文件。 |
+  | `exec` | 打包版插件不支持（应用市场安装扫描会拦截子进程执行） | 改用命令包一层环境变量：`OPENVIKING_API_KEY=$(op read op://vault/openviking/credential)`，然后配 `env`。 |
+
+  仍可使用纯字符串形式（含 `${ENV_VAR}` 插值）作为向后兼容路径；此时请限制文件权限或通过受控 Secret 卷提供，并在修改后重启 Gateway、容器或 Pod。
+
+### 3. 重启 OpenClaw Gateway
+
+```bash
+openclaw gateway restart
+```
+
+如果你的 OpenClaw 版本使用不同的重启命令，请使用对应的 gateway 重启方式。
+
+### 4. 验证
+
+```bash
+openclaw openviking status --json
+```
+
+期望结果：
+
+| JSON 字段 | 期望值 |
 | --- | --- |
-| `--workdir PATH` | 指定 OpenClaw 数据目录 |
-| `--version VER` | 同时指定插件版本和 OpenViking 版本，例如 `0.2.9` 会对应插件 `v0.2.9` |
-| `--current-version` | 查看当前已安装的插件版本和 OpenViking 版本 |
-| `--plugin-version REF` | 指定插件版本，支持 tag、分支或 commit |
-| `--openviking-version VER` | 指定 PyPI 上的 OpenViking 版本 |
-| `--github-repo owner/repo` | 指定插件来源仓库，默认 `volcengine/OpenViking` |
-| `--update` | 只升级插件，不升级 OpenViking 服务版本 |
-| `-y` | 非交互模式，使用默认配置 |
+| `configured` | `true` |
+| `slotActive` | `true` |
+| `health.ok` | 服务可达时应为 `true` |
 
-## OpenClaw 插件参数说明
+也可以直接查看 OpenClaw 配置：
 
-插件配置写在 `plugins.entries.openviking.config` 下。通常安装助手会自动写好，只有在你需要手动调整时，才需要关注下面这些参数。
+```bash
+openclaw config get plugins.entries.openviking.config
+openclaw config get plugins.slots.contextEngine
+```
 
-查看当前插件整体配置：
+`plugins.slots.contextEngine` 应输出 `openviking`。
+
+## Agent 判断规则
+
+Agent 应优先使用 `--json`，并根据这些字段判断下一步：
+
+| 结果 | 含义 | 建议动作 |
+| --- | --- | --- |
+| `success: true` | 配置已保存，setup 完成 | 重启 gateway，然后执行 status |
+| `success: false`, `action: "slot_blocked"` | 配置可能已保存，但其他插件占用 `contextEngine` | 询问用户后再用 `--force-slot` |
+| `success: false`, `action: "error"` | 校验失败 | 展示 `error`，不要宣称安装成功 |
+| `health.ok: false` | 服务不可达 | 检查 URL/服务状态；只有用户接受时才用 `--allow-offline` |
+| `keyProbe.keyType: "root_key"` | root key 需要租户上下文 | 追加 `--account-id` 和 `--user-id` |
+
+## 配置说明
+
+插件配置位于：
+
+```text
+plugins.entries.openviking.config
+```
+
+核心字段：
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `mode` | `remote` | 兼容旧配置的字段。当前只支持 remote。 |
+| `baseUrl` | `http://127.0.0.1:1933` | OpenViking HTTP 地址 |
+| `apiKey` | 空 | OpenViking API key |
+| `peer_role` | `none` | 记忆归属：`none`（共享 `viking://user/<user_id>/memories`）、`assistant`（`.../peers/<assistant_id>/memories`）或 `sender`（`.../peers/<sender_id>/memories`）。旧值 `person` 作为 `sender` 的别名兼容。Session message 使用 body `peer_id`；数据面 recall/search 使用 `X-OpenViking-Actor-Peer`。 |
+| `peer_prefix` | 空 | `peer_role=assistant` 时 assistant `peer_id` / actor peer 值的可选前缀。 |
+| `accountId` | 空 | 使用 root API key 时需要 |
+| `userId` | 空 | 使用 root API key 时需要 |
+
+普通修改优先使用 setup：
+
+```bash
+openclaw openviking setup --reconfigure
+```
+
+查看当前配置：
 
 ```bash
 openclaw config get plugins.entries.openviking.config
 ```
 
-### Local 模式
+### 配置参数
 
-适用于由 OpenClaw 插件在本机拉起 OpenViking 服务的场景。
-
-| 参数 | 默认值 | 含义 |
-| --- | --- | --- |
-| `mode` | `local` | `local` 表示由插件拉起本机 OpenViking；`remote` 表示连接已有远端 OpenViking 服务 |
-| `agentId` | `default` | 当前 OpenClaw 实例在 OpenViking 侧使用的标识 |
-| `configPath` | `~/.openviking/ov.conf` | 本机 OpenViking 配置文件路径 |
-| `port` | `1933` | 本机 OpenViking HTTP 端口 |
-
-`local` 模式下，VLM、Embedding、API Key 等服务端配置写在 `~/.openviking/ov.conf`，不写在 OpenClaw 插件参数里。常见项包括：
-
-| 配置项 | 含义 |
-| --- | --- |
-| `vlm.api_key` / `vlm.model` / `vlm.api_base` | 记忆抽取使用的 VLM 模型配置 |
-| `embedding.dense.api_key` / `embedding.dense.model` / `embedding.dense.api_base` | 向量化使用的 Embedding 模型配置 |
-| `server.port` | OpenViking 服务监听端口 |
-
-常见设置：
-
-```bash
-openclaw config set plugins.entries.openviking.config.mode local
-openclaw config set plugins.entries.openviking.config.configPath ~/.openviking/ov.conf
-openclaw config set plugins.entries.openviking.config.port 1933
-```
-
-### Remote 模式
-
-适用于连接已有远端 OpenViking 服务的场景。
+插件连接到已有的远端 OpenViking 服务。
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
-| `mode` | `remote` | 使用已有远端 OpenViking 服务 |
 | `baseUrl` | `http://127.0.0.1:1933` | 远端 OpenViking 服务地址 |
 | `apiKey` | 空 | 远端 OpenViking API Key；服务端未开启认证时可不填 |
-| `agentId` | `default` | 当前 OpenClaw 实例在远端 OpenViking 上的标识 |
+| `peer_role` | `none` | 记忆归属：`none`、`assistant` 或 `sender`；旧值 `person` 作为 `sender` 的别名兼容。Session message 使用 body `peer_id`，数据面 recall/search 使用 `X-OpenViking-Actor-Peer` |
+| `peer_prefix` | 空 | `peer_role=assistant` 时 assistant `peer_id` / actor peer 值的可选前缀 |
 
 常见设置：
 
 ```bash
-openclaw config set plugins.entries.openviking.config.mode remote
 openclaw config set plugins.entries.openviking.config.baseUrl http://your-server:1933
 openclaw config set plugins.entries.openviking.config.apiKey your-api-key
-openclaw config set plugins.entries.openviking.config.agentId your-agent-id
+openclaw config set plugins.entries.openviking.config.peer_role assistant
+openclaw config set plugins.entries.openviking.config.peer_prefix your-prefix
 ```
 
-## 启动
-
-安装完成后，运行：
+## 升级
 
 ```bash
-source ~/.openclaw/openviking.env && openclaw gateway restart
+openclaw plugins update openviking
+openclaw gateway restart
+openclaw openviking status --json
 ```
 
-Windows PowerShell：
+确认 `configured` 和 `slotActive` 都是 `true`。
 
-```powershell
-. "$HOME/.openclaw/openviking.env.ps1"
+## 卸载
+
+```bash
+openclaw plugins uninstall openviking
+openclaw config set plugins.slots.contextEngine legacy
 openclaw gateway restart
 ```
 
-## 验证
+当前 OpenClaw 原生卸载不一定会把 `plugins.slots.contextEngine` 恢复为 `legacy`。显式执行 `config set` 可以避免 slot 继续指向已卸载插件。
 
-检查插件是否已接管 `contextEngine`：
+## 可选链路健康检查
 
-```bash
-openclaw config get plugins.slots.contextEngine
-```
-
-输出 `openviking` 即表示插件已生效。
-
-查看运行日志：
-
-```bash
-openclaw logs --follow
-```
-
-日志中出现 `openviking: registered context-engine`，表示插件已成功加载。
-
-查看 OpenViking 自身日志：
-
-默认日志文件在你的 `workspace/data/log/openviking.log`。如果使用默认配置，通常对应：
-
-```bash
-cat ~/.openviking/data/log/openviking.log
-```
-
-查看当前已安装版本：
-
-```bash
-ov-install --current-version
-```
-
-### 链路检查（可选）
-
-如果上述验证都正常，还想进一步确认从 Gateway 到 OpenViking 的完整链路是否通畅，可以使用插件自带的健康检查脚本：
+如果 status 已通过，还想验证 Gateway 到 OpenViking 的完整链路，可以在仓库 checkout 中运行：
 
 ```bash
 python examples/openclaw-plugin/health_check_tools/ov-healthcheck.py
 ```
 
-该脚本会进行一次真实的对话注入，然后从 OpenViking 侧验证会话是否被正确捕获、提交、归档并提取出记忆。详细说明见 [health_check_tools/HEALTHCHECK-ZH.md](./health_check_tools/HEALTHCHECK-ZH.md)。
+该脚本会注入一次真实对话，并在 OpenViking 侧验证会话捕获、提交、归档和记忆提取。详见 [health_check_tools/HEALTHCHECK-ZH.md](./health_check_tools/HEALTHCHECK-ZH.md)。
 
-## 卸载
+## 备用路径：ov-install
 
-只卸载 OpenClaw 插件、保留 OpenViking 运行时：
+`ov-install` 是备用路径，不是主安装方式。仅当 `openclaw plugins install clawhub:@openviking/openclaw-plugin` 无法访问 ClawHub、被限流，或者你明确需要从 Git 分支/源码 ref 安装测试时使用。
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/openclaw-plugin/upgrade_scripts/uninstall-openclaw-plugin.sh -o uninstall-openviking.sh
-bash uninstall-openviking.sh
-```
-
-如果你的 OpenClaw 数据目录不是默认路径：
+先尝试 OpenClaw 插件管理器。如果该路径不可用，再执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/openclaw-plugin/upgrade_scripts/uninstall-openclaw-plugin.sh -o uninstall-openviking.sh
-bash uninstall-openviking.sh --workdir ~/.openclaw-second
+npm install -g openclaw-openviking-setup-helper
+ov-install
 ```
 
-如果还要一并删除本机 OpenViking 运行时和数据，再执行：
+常用备用/源码参数：
+
+| 参数 | 含义 |
+| --- | --- |
+| `--workdir PATH` | 指定 OpenClaw state 目录 |
+| `--plugin-version=REF` | 指定插件版本：npm 版本、npm dist-tag 或 Git ref |
+| `--current-version` | 查看 helper 记录的当前版本 |
+| `--base-url URL` | OpenViking 服务器地址（启用非交互模式） |
+| `--api-key KEY` | OpenViking API key |
+| `--peer-role ROLE` | 记忆归属：`none`、`assistant` 或 `sender` |
+| `--peer-prefix PREFIX` | assistant `peer_id` / actor peer 值的前缀 |
+| `--update` | 更新 helper 管理的安装 |
+
+面向用户的安装，请先使用 `openclaw plugins install clawhub:@openviking/openclaw-plugin`。只有作为备用路径时才选择 `ov-install`。
+
+## 从 ov-install 迁移到 openclaw plugin install
+
+如果之前通过 `ov-install` 安装了 OpenViking，切换到推荐的 `openclaw plugins install` 安装方式前需要清理。
+
+### 同一插件 ID（openviking，版本 >= 0.3.x）
+
+ov-install 的 context-engine 部署会将文件写入 `~/.openclaw/extensions/openviking/`。通过 npm 安装后，OpenClaw 可能仍从旧目录加载。清理步骤：
 
 ```bash
-python3 -m pip uninstall openviking -y && rm -rf ~/.openviking
+# 删除 ov-install 部署的文件
+rm -rf ~/.openclaw/extensions/openviking/
+
+# 通过 OpenClaw 插件管理器安装
+openclaw plugins install clawhub:@openviking/openclaw-plugin
+
+# 重新配置（openclaw.json 中的已有配置会保留）
+openclaw openviking setup --reconfigure
+openclaw gateway restart
+openclaw openviking status --json
 ```
+
+已有的配置字段（`baseUrl`、`apiKey`、`peer_role`、`peer_prefix` 等）会保留。
+
+### 旧插件 ID（memory-openviking，版本 < 0.3.x）
+
+旧版 memory 插件使用了不同的插件 ID 和 slot：
+
+```bash
+# 卸载旧插件
+openclaw plugins uninstall memory-openviking 2>/dev/null || true
+
+# 清理旧 slot 和文件
+openclaw config set plugins.slots.memory none
+rm -rf ~/.openclaw/extensions/memory-openviking/
+
+# 安装新插件
+openclaw plugins install clawhub:@openviking/openclaw-plugin
+openclaw openviking setup --base-url <OPENVIKING_URL> --api-key <API_KEY> --json
+openclaw gateway restart
+openclaw openviking status --json
+```
+
+或使用清理脚本：
+
+```bash
+bash examples/openclaw-plugin/upgrade_scripts/cleanup-memory-openviking.sh
+```
+
+另见：[INSTALL.md](./INSTALL.md)、[INSTALL-AGENT.md](./INSTALL-AGENT.md) 和 [docs/openviking-tos-install-guide.md](./docs/openviking-tos-install-guide.md)。

@@ -1,42 +1,86 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 
-"""Tenant-field backfill tests for EmbeddingMsgConverter."""
+"""Explicit account identity and URI owner tests for EmbeddingMsgConverter."""
 
 import pytest
 
-from openviking.core.context import Context
+from openviking.core.context import Context, Vectorize
+from openviking.storage.index_action import IndexAction
 from openviking.storage.queuefs.embedding_msg_converter import EmbeddingMsgConverter
+from openviking.telemetry import (
+    OperationTelemetry,
+    bind_ingestion_source_type,
+    bind_telemetry,
+)
 from openviking_cli.session.user_id import UserIdentifier
 
 
 @pytest.mark.parametrize(
-    ("uri", "expected_space"),
+    ("uri", "expected_uri", "expected_owner_user_id"),
     [
         (
-            "viking://user/memories/preferences/me.md",
-            lambda user: user.user_space_name(),
-        ),
-        (
-            "viking://agent/memories/cases/me.md",
-            lambda user: user.agent_space_name(),
+            "viking://user/alice/memories/preferences/me.md",
+            "viking://user/alice/memories/preferences/me.md",
+            lambda user: user.user_id,
         ),
         (
             "viking://resources/doc.md",
-            lambda _user: "",
+            "viking://resources/doc.md",
+            None,
         ),
     ],
 )
-def test_embedding_msg_converter_backfills_account_and_owner_space(uri, expected_space):
-    user = UserIdentifier("acme", "alice", "helper")
+def test_embedding_msg_converter_preserves_account_and_backfills_owner_fields(
+    uri, expected_uri, expected_owner_user_id
+):
+    user = UserIdentifier("acme", "alice")
     context = Context(uri=uri, abstract="hello", user=user)
 
-    # Simulate legacy producer that forgot tenant fields.
-    context.account_id = ""
-    context.owner_space = ""
+    # URI ownership may be derived, but account identity must remain explicit.
+    context.owner_user_id = None
 
     msg = EmbeddingMsgConverter.from_context(context)
 
     assert msg is not None
     assert msg.context_data["account_id"] == "acme"
-    assert msg.context_data["owner_space"] == expected_space(user)
+    resolved_uri = expected_uri(user) if callable(expected_uri) else expected_uri
+    assert msg.context_data["uri"] == resolved_uri
+    expected_user = (
+        expected_owner_user_id(user) if callable(expected_owner_user_id) else expected_owner_user_id
+    )
+    assert msg.context_data["owner_user_id"] == expected_user
+    assert msg.action is IndexAction.MERGE
+
+
+def test_embedding_msg_converter_keeps_only_embedding_input():
+    context = Context(uri="viking://resources/large.txt", abstract="short embedding text")
+    context.set_vectorize(Vectorize(text="bounded embedding text"))
+
+    msg = EmbeddingMsgConverter.from_context(context)
+
+    assert msg is not None
+    assert msg.message == "bounded embedding text"
+    assert "content" not in msg.context_data
+    assert msg.action is IndexAction.MERGE
+
+
+def test_embedding_msg_converter_prefers_explicit_telemetry_id():
+    context = Context(uri="viking://resources/doc.md", abstract="summary")
+    ambient = OperationTelemetry(operation="ambient", enabled=False)
+
+    with bind_telemetry(ambient):
+        msg = EmbeddingMsgConverter.from_context(context, telemetry_id="request-telemetry-id")
+
+    assert msg is not None
+    assert msg.telemetry_id == "request-telemetry-id"
+
+
+def test_embedding_msg_converter_persists_ingestion_source_type():
+    context = Context(uri="viking://resources/code.py", abstract="summary")
+
+    with bind_ingestion_source_type("repository"):
+        msg = EmbeddingMsgConverter.from_context(context)
+
+    assert msg is not None
+    assert msg.source_type == "repository"

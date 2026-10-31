@@ -8,30 +8,110 @@ Reference: bot/vikingbot/agent/loop.py AgentLoop structure
 
 import asyncio
 import json
-from typing import Any, Dict, List, Optional, Set, Tuple
+import re
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
-from openviking.models.vlm.base import VLMBase
+from openviking.models.vlm.base import ToolCall, VLMBase
 from openviking.server.identity import RequestContext
-from openviking.session.memory.schema_model_generator import (
-    SchemaModelGenerator,
-    SchemaPromptGenerator,
+from openviking.session.memory.dataclass import (
+    DeleteId,
+    MemoryFile,
+    MemoryOperationSkip,
+    MemoryOperationSkipCode,
+    ResolvedOperation,
+    ResolvedOperations,
+    StoredLink,
+    WikiLink,
 )
-from openviking.session.memory.tools import (
-    MEMORY_TOOLS_REGISTRY,
-    add_tool_call_pair_to_messages,
-    get_tool,
+from openviking.session.memory.extraction_output_protocol import (
+    ExtractionOutputContext,
+    ExtractionOutputProtocol,
+    create_extraction_output_protocol,
 )
-from openviking.session.memory.utils import (
-    parse_json_with_stability,
-    parse_memory_file_with_fields,
-    pretty_print_messages,
-    validate_operations_uris,
+from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
+from openviking.session.memory.merge_op import (
+    FieldType,
+    ImmutableOp,
+    MergeOp,
+    MergeOpFactory,
+    PatchOp,
 )
+from openviking.session.memory.page_id_map import ResponsePageIdAllocator
+from openviking.session.memory.schema_model_generator import SchemaModelGenerator
+from openviking.session.memory.tools import MEMORY_TOOLS_REGISTRY
+from openviking.session.memory.utils.json_parser import JsonUtils
+from openviking.session.memory.utils.uri import generate_uri
 from openviking.storage.viking_fs import VikingFS, get_viking_fs
-from openviking.telemetry import tracer
+from openviking.telemetry import bind_telemetry_stage, tracer
 from openviking_cli.utils import get_logger
+from openviking_cli.utils.config import get_openviking_config
 
 logger = get_logger(__name__)
+
+# Memory extraction may rewrite an entire memory file in one response. Without an
+# explicit cap, providers fall back to a small server-side default (e.g. Ark's
+# 4096) and truncate the program mid-string, making the output unusable. This is
+# a functional floor for extraction, tuned for the primary Doubao models.
+# Models whose max output tokens is BELOW this value (e.g. gpt-4o-mini at 16384)
+# must set `vlm.max_tokens` in ov.conf to their own limit to override this default.
+_DEFAULT_EXTRACTION_MAX_OUTPUT_TOKENS = 32768
+
+
+@dataclass
+class _EventRepairOperations:
+    """Server-filtered operation set accepted from one Event repair response."""
+
+    events: List[Dict[str, Any]]
+    delete_ids: List[Any] = field(default_factory=list)
+    links: List[WikiLink] = field(default_factory=list)
+
+
+_EVENT_RETRYABLE_RESOLUTION_SKIP_CODES = {
+    MemoryOperationSkipCode.INVALID_PEER_ID,
+    MemoryOperationSkipCode.INVALID_RANGES,
+    MemoryOperationSkipCode.AMBIGUOUS_TARGET,
+    MemoryOperationSkipCode.NO_WRITABLE_TARGET,
+}
+
+
+_CANNED_REFUSAL_RE = re.compile(
+    r"(抱歉|不好意思|很遗憾|sorry).{0,20}"
+    r"(无法|不能|未能|不给|没有找到|未找到|can't|cannot|unable|won't|not able)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_canned_refusal(content: str) -> bool:
+    """Return whether a non-JSON LLM response looks like a generic refusal."""
+
+    text = " ".join(str(content or "").split())
+    if not text:
+        return False
+    if _CANNED_REFUSAL_RE.search(text):
+        return True
+    return any(
+        phrase in text
+        for phrase in (
+            "您的问题我无法回答",
+            "您的问题我无法识别",
+            "我无法回答这个问题",
+            "我无法给到相关内容",
+            "这个问题未找到相关结果",
+            "没有找到相关的结果",
+            "I can't answer that",
+            "I cannot answer that",
+            "I can't help with that",
+            "I cannot help with that",
+        )
+    )
+
+
+def _preview_text(content: str, *, limit: int = 240) -> str:
+    text = " ".join(str(content or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
 
 
 class ExtractLoop:
@@ -53,6 +133,9 @@ class ExtractLoop:
         max_iterations: int = 3,
         ctx: Optional[RequestContext] = None,
         context_provider: Optional[Any] = None,  # ExtractContextProvider
+        isolation_handler: MemoryIsolationHandler = None,
+        thinking: Optional[bool] = None,
+        max_output_tokens: Optional[int] = None,
     ):
         """
         Initialize the ExtractLoop.
@@ -64,6 +147,13 @@ class ExtractLoop:
             max_iterations: Maximum number of ReAct iterations (default: 5)
             ctx: Request context
             context_provider: ExtractContextProvider - 必须提供（由 provider 加载 schema）
+            thinking: Per-call thinking override for this extraction loop. True/False
+                force the mode for every call; None (default) defers to the VLM
+                backend's configured thinking policy.
+            max_output_tokens: Per-call output cap for the extraction LLM. When None, the
+                configured vlm.max_tokens is used, falling back to a value large enough for
+                full memory rewrites so providers do not apply a small server-side default
+                (e.g. Ark's 4096) and truncate the program mid-string.
         """
         self.vlm = vlm
         self.viking_fs = viking_fs or get_viking_fs()
@@ -71,23 +161,38 @@ class ExtractLoop:
         self.max_iterations = max_iterations
         self.ctx = ctx
         self.context_provider = context_provider
+        self.thinking = thinking
+        self.max_output_tokens = max_output_tokens
+        # Resolved in run() via _resolve_effective_max_output_tokens(); default to
+        # the extraction floor so a direct _call_llm() before run() stays safe.
+        self._effective_max_output_tokens = (
+            max_output_tokens
+            if max_output_tokens is not None
+            else _DEFAULT_EXTRACTION_MAX_OUTPUT_TOKENS
+        )
+        # Use provided isolation_handler or create one in run()
+        self._isolation_handler = isolation_handler
+        # Track format error retry (max 1 retry)
+        self._format_retry_count = 0
+        self._last_llm_failure_kind: Optional[str] = None
+        self._last_llm_failure_content: str = ""
+        self._last_parse_error: Optional[str] = None
 
         # Schema 生成器（在 run() 中初始化）
         self.schema_model_generator = None
-        self.schema_prompt_generator = None
-        self._json_schema = None
 
         # 预计算：避免每次迭代重复计算
         self._tool_schemas: Optional[List[Dict[str, Any]]] = None
-        self._expected_fields: Optional[List[str]] = None
         self._operations_model: Optional[Any] = None
+        self._output_protocol: Optional[ExtractionOutputProtocol] = None
+        self._output_context: Optional[ExtractionOutputContext] = None
 
-        # Track files read during ReAct for refetch detection
-        self._read_files: Set[str] = set()
         # Transaction handle for file locking
         self._transaction_handle = None
         # Flag to disable tools in next iteration after unknown tool error
         self._disable_tools_for_iteration = False
+
+        self._tool_ctx = None
 
     async def run(self) -> Tuple[Optional[Any], List[Dict[str, Any]]]:
         """
@@ -99,16 +204,27 @@ class ExtractLoop:
         iteration = 0
         max_iterations = self.max_iterations
         final_operations = None
+        raw_links = []
         tools_used: List[Dict[str, Any]] = []
+        # Reset format retry counter for each run
+        self._format_retry_count = 0
+        patch_repair_count = 0
+        resolution_repair_count = 0
+        pending_resolution_repair: Optional[Tuple[ResolvedOperations, List]] = None
 
         # 从 provider 获取 schemas（内部自动加载 registry）
         schemas = self.context_provider.get_memory_schemas(self.ctx)
 
         # 初始化 schema 生成器（使用 schemas 而非 registry）
-        self.schema_model_generator = SchemaModelGenerator(schemas)
-        self.schema_prompt_generator = SchemaPromptGenerator(schemas)
+        output_language = self.context_provider.get_output_language()
+        self.schema_model_generator = SchemaModelGenerator(
+            schemas,
+            template_context={"language": output_language},
+            # include_decision_reasoning=(
+            #     type(self.context_provider).__name__ != "PatchMergeContextProvider"
+            # ),
+        )
         self.schema_model_generator.generate_all_models()
-        self._json_schema = self.schema_model_generator.get_llm_json_schema()
 
         # 预计算工具 schemas
         allowed_tools = self.context_provider.get_tools()
@@ -118,71 +234,67 @@ class ExtractLoop:
             if tool.name in allowed_tools
         ]
 
-        # 预计算 expected_fields
-        # self._expected_fields = ["reasoning", "edit_overview_uris", "delete_uris"]
-        self._expected_fields = ["delete_uris"]
+        # Resolve global link support before generating the operations model.
+        config = get_openviking_config()
+        self._link_enabled = config.memory.link_enabled if config.memory else False
+
+        self._resolve_effective_max_output_tokens()
 
         # 获取 ExtractContext（整个流程复用）
         self._extract_context = self.context_provider.get_extract_context()
         if self._extract_context is None:
             raise ValueError("Failed to get ExtractContext from provider")
-        for schema in schemas:
-            self._expected_fields.append(schema.memory_type)
 
         # 预计算 operations_model
-        self._operations_model = self.schema_model_generator.create_structured_operations_model()
+        role_scope = self._isolation_handler.get_read_scope() if self._isolation_handler else None
 
-        # Reset read files tracking for this run
-        self._read_files.clear()
+        self._operations_model = self.schema_model_generator.create_structured_operations_model(
+            role_scope
+        )
+
+        output_format = getattr(config.memory, "extraction_output_format", "python")
+        self._output_protocol = create_extraction_output_protocol(output_format)
+        self._output_context = ExtractionOutputContext(
+            operations_model=self._operations_model,
+            schemas=tuple(schemas),
+            page_id_map=self._extract_context.page_id_map,
+            read_file_contents=self.context_provider.read_file_contents,
+            link_enabled=self._link_enabled,
+            role_scope=role_scope,
+            available_tools=tuple(allowed_tools),
+            template_context={"language": output_language},
+        )
+        tracer.set("memory.extraction.output_format", output_format)
 
         # Build initial messages from provider
-        import json
-
-        schema_str = json.dumps(self._json_schema, ensure_ascii=False)
-
         messages = []
-        # instruction() 返回字符串，需要包装成 message 格式
-        messages.append(
-            {
-                "role": "system",
-                "content": self.context_provider.instruction(),
-            }
+        reference_rules = self._output_protocol.render_reference_rules(self._output_context)
+        provider_instruction = self._output_protocol.normalize_provider_instruction(
+            self.context_provider.instruction()
         )
+        output_contract = self._output_protocol.render_contract(self._output_context)
+        context_rules = self._output_protocol.render_context_rules(self._output_context)
         messages.append(
             {
                 "role": "system",
                 "content": f"""
-## Output Format
-The final output of the model must strictly follow the JSON Schema format shown below:
-```json
-{schema_str}
-```
+{provider_instruction}
+{reference_rules}
+{context_rules}
+{output_contract}
         """,
             }
         )
 
-        await self._mark_cache_breakpoint(messages)
         # Pre-fetch context via provider
-        tool_call_messages = await self.context_provider.prefetch(
-            ctx=self.ctx,
-            viking_fs=self.viking_fs,
-            transaction_handle=self._transaction_handle,
-            vlm=self.vlm,
+        tool_call_messages = await self.context_provider.prefetch()
+        prefetch_messages = self._output_protocol.render_prefetch_messages(
+            tool_call_messages, self._output_context
         )
-        messages.extend(tool_call_messages)
+        messages.extend(prefetch_messages)
 
-        # Track prefetched files in _read_files to avoid unnecessary refetch
-        for msg in tool_call_messages:
-            if msg.get("role") == "user" and "tool_call_name" in msg.get("content", ""):
-                import json
-                try:
-                    content = json.loads(msg.get("content", "{}"))
-                    if content.get("tool_call_name") == "read":
-                        uri = content.get("args", {}).get("uri")
-                        if uri:
-                            self._read_files.add(uri)
-                except (json.JSONDecodeError, AttributeError):
-                    pass
+        for uri in self.context_provider.read_file_contents:
+            self._extract_context.page_id_map.get_page_id(uri)
 
         while iteration < max_iterations:
             iteration += 1
@@ -196,16 +308,14 @@ The final output of the model must strictly follow the JSON Schema format shown 
                 messages.append(
                     {
                         "role": "user",
-                        "content": "You have reached the maximum number of tool call iterations. Do not call any more tools - return your final result directly now.",
+                        "content": self._build_final_operations_instruction(),
                     }
                 )
 
-            # Call LLM with tools - model decides: tool calls OR final operations
-            pretty_print_messages(messages)
-
-            tool_calls, operations = await self._call_llm(
-                messages
-            )
+            # Call LLM with tools - model decides: tool calls OR final operations.
+            # The VLM backend traces the (human-readable) input and output, so we do
+            # not re-dump them here (avoids duplicate, oversized span events).
+            tool_calls, operations = await self._call_llm(messages)
 
             if tool_calls:
                 has_unknown_tool = await self._execute_tool_calls(messages, tool_calls, tools_used)
@@ -222,31 +332,131 @@ The final output of the model must strictly follow the JSON Schema format shown 
 
             # If model returned final operations, check if refetch is needed
             if operations is not None:
+                if pending_resolution_repair is not None:
+                    operations = self._event_resolution_repair_subset(
+                        operations,
+                        pending_resolution_repair[0],
+                    )
+                candidate_operations, candidate_links = await self.resolve_operations(operations)
+                if pending_resolution_repair is not None:
+                    base_operations, base_links = pending_resolution_repair
+                    final_operations = self._merge_event_resolution_repair(
+                        base_operations,
+                        candidate_operations,
+                    )
+                    raw_links = base_links
+                    pending_resolution_repair = None
+                else:
+                    final_operations = candidate_operations
+                    raw_links = candidate_links
+                resolution_issues = self._retryable_resolution_issues(final_operations)
+                if resolution_issues and resolution_repair_count == 0:
+                    resolution_repair_count += 1
+                    pending_resolution_repair = (final_operations, raw_links)
+                    max_iterations += 1
+                    self._disable_tools_for_iteration = True
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": self._build_resolution_repair_instruction(resolution_issues),
+                        }
+                    )
+                    tracer.info(
+                        "Extended max_iterations to "
+                        f"{max_iterations} for retry memory target resolution",
+                        console=True,
+                    )
+                    continue
                 # Check if any write_uris target existing files that weren't read
-                refetch_uris = await self._check_unread_existing_files(operations)
+                refetch_uris = await self._check_unread_existing_files(final_operations)
                 if refetch_uris:
                     tracer.info(f"Found unread existing files: {refetch_uris}, refetching...")
                     # Add refetch results to messages and continue loop
                     await self._add_refetch_results_to_messages(messages, refetch_uris)
+                    # A valid program started a new generation phase with richer context.
+                    # Give that regenerated response its own format-repair opportunity.
+                    self._format_retry_count = 0
                     # Allow one extra iteration for refetch
                     if iteration >= max_iterations:
                         max_iterations += 1
                         tracer.info(f"Extended max_iterations to {max_iterations} for refetch")
 
                     continue
-
-                final_operations = operations
+                patch_errors = await self._validate_patch_operations(final_operations)
+                if patch_errors and patch_repair_count == 0:
+                    patch_repair_count += 1
+                    max_iterations += 1
+                    self._disable_tools_for_iteration = True
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": self._build_patch_repair_instruction(patch_errors),
+                        }
+                    )
+                    tracer.info(
+                        f"Extended max_iterations to {max_iterations} for retry patch repair"
+                    )
+                    continue
                 break
             # If no tool calls either, continue to next iteration (don't break!)
-            logger.warning(
-                f"LLM returned neither tool calls nor operations (iteration {iteration}/{max_iterations})"
+            failure_kind = self._last_llm_failure_kind or "unknown"
+            failure_preview = _preview_text(self._last_llm_failure_content)
+            parse_error = self._last_parse_error
+            # Add format error message if parse failed (max 1 retry). This may raise
+            # max_iterations, granting one more attempt after this failure.
+            if failure_kind == "budget_exhausted":
+                # Truncation is not an ordinary format mistake: a same-cap format
+                # retry would only hit the budget again, and replaying the
+                # truncated output just grows the prompt. Fail fast with the
+                # dedicated error recorded by _call_llm().
+                raise RuntimeError(f"Memory extraction aborted: {parse_error or failure_kind}")
+
+            if self._format_retry_count == 0:
+                self._format_retry_count += 1
+                max_iterations += 1
+                retry_reason = "refusal_text" if failure_kind == "refusal_text" else "format_retry"
+                tracer.info(f"Extended max_iterations to {max_iterations} for {retry_reason}")
+                self._add_format_error_message(messages)
+
+            # A failure is only terminal when no retry attempt remains after it.
+            retry_remaining = iteration < max_iterations
+            failure_message = (
+                "Failed to parse memory operations "
+                f"(iteration {iteration}/{max_iterations}) "
+                f"failure_kind={failure_kind} error={parse_error} "
+                f"response_preview={failure_preview!r}"
             )
-            # If it's the last iteration, use empty operations
-            if is_last_iteration:
-                final_operations = self._operations_model()
-                break
-            # Otherwise disable_tools and try again
-            self._disable_tools_for_iteration = True
+            if retry_remaining:
+                # Recoverable: another attempt will run. Keep it in the trace only,
+                # not the console/log stream.
+                tracer.info(failure_message)
+            else:
+                # ERROR: no attempt remains to repair the invalid response.
+                tracer.error(failure_message)
+
+            # Preserve a valid first pass when only its resolution repair failed.
+            # Otherwise propagate failure so the archive is not marked completed.
+            if not retry_remaining:
+                if pending_resolution_repair is not None:
+                    final_operations, raw_links = pending_resolution_repair
+                    pending_resolution_repair = None
+                    tracer.info(
+                        "Event resolution repair response could not be parsed; "
+                        "keeping the first-pass operations",
+                        console=True,
+                    )
+                    break
+                raise RuntimeError(
+                    "Final response could not be parsed as operations "
+                    f"after {max_iterations} iterations "
+                    f"(failure_kind={failure_kind})"
+                )
+
+            self._disable_tools_for_iteration = (
+                not self._output_protocol.keep_tools_enabled_after_parse_error(
+                    self._last_parse_error
+                )
+            )
             continue
 
         if final_operations is None:
@@ -257,7 +467,681 @@ The final output of the model must strictly follow the JSON Schema format shown 
 
         tracer.info(f"final_operations={final_operations.model_dump_json(indent=4)}")
 
+        # Resolve links after the loop completes using the URIs already bound in resolve_operations().
+        await self.finalize_operations(final_operations, raw_links)
+
         return final_operations, tools_used
+
+    def _resolve_effective_max_output_tokens(self) -> None:
+        """Resolve the extraction output cap.
+
+        Priority: explicit per-loop value > resolved VLM max_tokens >
+        _DEFAULT_EXTRACTION_MAX_OUTPUT_TOKENS. The default is a functional floor
+        that suits the primary Doubao models; a model with a lower max output
+        (e.g. gpt-4o-mini) must set vlm.max_tokens in ov.conf to override it.
+        """
+        if self.max_output_tokens is not None:
+            self._effective_max_output_tokens = self.max_output_tokens
+            return
+        configured = getattr(self.vlm, "max_tokens", None)
+        self._effective_max_output_tokens = (
+            configured if configured is not None else _DEFAULT_EXTRACTION_MAX_OUTPUT_TOKENS
+        )
+
+    def _budget_exhausted_error(self, response: Any, content: str) -> str:
+        """Build the dedicated, actionable error for a truncated response.
+
+        Truncation is detected only from the backend's explicit
+        ``finish_reason == "length"``; token counters are never used to infer it.
+        """
+        usage = getattr(response, "usage", None)
+        completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+        details = f"finish_reason='length', output cap={self._effective_max_output_tokens} tokens"
+        if completion_tokens:
+            details += f", completion_tokens={completion_tokens}"
+        return (
+            "Response was cut off by the output-token budget "
+            f"({details}), response_preview={_preview_text(content)!r}. "
+            "Raise vlm.max_tokens in ov.conf or reduce the memory context before retrying."
+        )
+
+    def _retryable_resolution_issues(self, operations: ResolvedOperations) -> List[Dict[str, Any]]:
+        issues: List[Dict[str, Any]] = []
+        for operation in operations.upsert_operations:
+            resolution_skip = operation.resolution_skip
+            if (
+                operation.uris
+                or operation.memory_type != "events"
+                or resolution_skip is None
+                or resolution_skip.reason_code not in _EVENT_RETRYABLE_RESOLUTION_SKIP_CODES
+            ):
+                continue
+            if resolution_skip.reason_code == MemoryOperationSkipCode.NO_WRITABLE_TARGET:
+                if not self.ctx or not self.ctx.user:
+                    continue
+                if not self._has_writable_message_target():
+                    continue
+            issue = {
+                "memory_type": operation.memory_type,
+                "page_id": operation.page_id,
+                "reason_code": resolution_skip.reason_code.value,
+                "reason": resolution_skip.reason,
+                "operation": operation.memory_fields,
+            }
+            issues.append(issue)
+        return issues
+
+    def _has_writable_message_target(self) -> bool:
+        """Preserve legacy retries if the isolation handler cannot answer the check."""
+        handler = self._isolation_handler
+        has_writable_target = getattr(handler, "has_writable_message_target", None)
+        if not callable(has_writable_target):
+            return True
+        try:
+            return bool(has_writable_target())
+        except Exception:
+            logger.warning(
+                "Unable to determine writable message targets; preserving resolution repair",
+                exc_info=True,
+            )
+            return True
+
+    def _build_resolution_repair_instruction(self, issues: List[Dict[str, Any]]) -> str:
+        return self._output_protocol.render_resolution_repair(issues)
+
+    def _uri_belongs_to_schema(self, uri: str, schema: Any) -> Optional[bool]:
+        """Return a path-based ownership result without trusting file metadata."""
+        render_directories = getattr(self._isolation_handler, "render_schema_directories", None)
+        if not callable(render_directories):
+            return None
+        try:
+            directories = render_directories(schema)
+        except Exception:
+            return None
+        if not isinstance(directories, (list, tuple, set)):
+            return None
+        directories = [
+            directory.rstrip("/") for directory in directories if isinstance(directory, str)
+        ]
+        if not directories:
+            return None
+        filename_template = str(getattr(schema, "filename_template", "") or "").lstrip("/")
+        if not filename_template:
+            return None
+        if schema.filename_has_variables():
+            return any(uri.startswith(f"{directory}/") for directory in directories)
+        return any(uri == f"{directory}/{filename_template}" for directory in directories)
+
+    def _memory_type_for_uri(self, uri: str) -> Optional[str]:
+        matches = [
+            schema.memory_type
+            for schema in self.context_provider.get_memory_schemas(self.ctx)
+            if self._uri_belongs_to_schema(uri, schema) is True
+        ]
+        unique_matches = list(dict.fromkeys(matches))
+        return unique_matches[0] if len(unique_matches) == 1 else None
+
+    @staticmethod
+    def _is_retryable_event_operation(operation: ResolvedOperation) -> bool:
+        return bool(
+            operation.memory_type == "events"
+            and not operation.uris
+            and operation.resolution_skip is not None
+            and operation.resolution_skip.reason_code in _EVENT_RETRYABLE_RESOLUTION_SKIP_CODES
+        )
+
+    @classmethod
+    def _event_resolution_repair_subset(
+        cls,
+        operations: Any,
+        original: ResolvedOperations,
+    ) -> _EventRepairOperations:
+        """Keep only one range repair for each failed Event and preserve its original fields."""
+        failed_events = {
+            operation.page_id: operation
+            for operation in original.upsert_operations
+            if cls._is_retryable_event_operation(operation) and operation.page_id is not None
+        }
+        candidates: Dict[int, List[Dict[str, Any]]] = {}
+        for item in getattr(operations, "events", None) or []:
+            item_dict = dict(item)
+            page_id = item_dict.get("page_id")
+            if page_id in failed_events:
+                candidates.setdefault(page_id, []).append(item_dict)
+
+        repaired_items: List[Dict[str, Any]] = []
+        for page_id, failed_operation in failed_events.items():
+            page_candidates = candidates.get(page_id, [])
+            if len(page_candidates) != 1:
+                if page_candidates:
+                    logger.warning(
+                        "Ignoring ambiguous Event repair response for page_id=%s: count=%s",
+                        page_id,
+                        len(page_candidates),
+                    )
+                continue
+
+            candidate = page_candidates[0]
+            expected_name = failed_operation.memory_fields.get("event_name")
+            if candidate.get("event_name") != expected_name or candidate.get("ranges") is None:
+                logger.warning(
+                    "Ignoring mismatched Event repair response for page_id=%s",
+                    page_id,
+                )
+                continue
+
+            repaired_item = {
+                key: value
+                for key, value in failed_operation.memory_fields.items()
+                if key not in {"memory_type", "user_id"}
+            }
+            repaired_item["ranges"] = candidate["ranges"]
+            repaired_item["page_id"] = page_id
+            repaired_items.append(repaired_item)
+
+        return _EventRepairOperations(events=repaired_items)
+
+    @classmethod
+    def _merge_event_resolution_repair(
+        cls,
+        original: ResolvedOperations,
+        repair: ResolvedOperations,
+    ) -> ResolvedOperations:
+        """Replace only failed Events; preserve every other first-pass operation."""
+        failed_page_ids = {
+            operation.page_id
+            for operation in original.upsert_operations
+            if cls._is_retryable_event_operation(operation)
+        }
+        failed_event_names = {
+            operation.page_id: operation.memory_fields.get("event_name")
+            for operation in original.upsert_operations
+            if cls._is_retryable_event_operation(operation)
+        }
+        repaired_events: Dict[int, ResolvedOperation] = {}
+        duplicate_page_ids = set()
+        for operation in repair.upsert_operations:
+            if (
+                operation.memory_type != "events"
+                or operation.page_id not in failed_page_ids
+                or operation.memory_fields.get("event_name")
+                != failed_event_names.get(operation.page_id)
+            ):
+                continue
+            if operation.page_id in repaired_events:
+                duplicate_page_ids.add(operation.page_id)
+                continue
+            repaired_events[operation.page_id] = operation
+        for page_id in duplicate_page_ids:
+            repaired_events.pop(page_id, None)
+
+        merged_operations: List[ResolvedOperation] = []
+        for operation in original.upsert_operations:
+            if cls._is_retryable_event_operation(operation):
+                repaired_operation = repaired_events.get(operation.page_id)
+                merged_operations.append(repaired_operation or operation)
+                continue
+            merged_operations.append(operation)
+
+        return original.model_copy(
+            update={
+                "upsert_operations": merged_operations,
+            }
+        )
+
+    @staticmethod
+    def _normalize_page_id_reference(
+        raw_page_id: Optional[int],
+        page_id_assignments: Dict[int, List[int]],
+        page_id_map: Any,
+    ) -> Tuple[Optional[int], bool]:
+        """Return the normalized response ID and whether the reference is ambiguous."""
+        if raw_page_id is None:
+            return None, False
+        assigned_ids = page_id_assignments.get(raw_page_id, [])
+        if not assigned_ids:
+            return raw_page_id, False
+
+        unique_ids = list(dict.fromkeys(assigned_ids))
+        existing_uri = page_id_map.resolve(raw_page_id) if page_id_map else None
+        if len(unique_ids) != 1 or (existing_uri is not None and unique_ids[0] != raw_page_id):
+            return None, True
+        return unique_ids[0], False
+
+    @classmethod
+    def _normalize_operation_links(
+        cls,
+        raw_links: List[WikiLink],
+        page_id_assignments: Dict[int, List[int]],
+        page_id_map: Any,
+    ) -> List[WikiLink]:
+        if not raw_links or not page_id_assignments:
+            return raw_links
+
+        normalized_links: List[WikiLink] = []
+        for link in raw_links:
+            updates: Dict[str, int] = {}
+            ambiguous = False
+            for field_name in ("f", "t"):
+                raw_page_id = getattr(link, field_name, None)
+                normalized_page_id, is_ambiguous = cls._normalize_page_id_reference(
+                    raw_page_id,
+                    page_id_assignments,
+                    page_id_map,
+                )
+                if is_ambiguous:
+                    ambiguous = True
+                    break
+                if normalized_page_id != raw_page_id:
+                    updates[field_name] = normalized_page_id
+            if ambiguous:
+                logger.warning(
+                    "Skipping ambiguous memory link after page_id normalization: f=%s, t=%s",
+                    link.f,
+                    link.t,
+                )
+                continue
+            normalized_links.append(link.model_copy(update=updates) if updates else link)
+        return normalized_links
+
+    def _assign_response_page_ids(
+        self,
+        operations: Any,
+        schemas: List[Any],
+        page_id_map: Any,
+    ) -> Tuple[Dict[Tuple[int, int], int], Dict[int, List[int]]]:
+        """Assign unique IDs to new logical operations within one candidate response."""
+        entries: List[Tuple[int, int, Optional[int], bool]] = []
+        for schema_index, schema in enumerate(schemas):
+            value = getattr(operations, schema.memory_type, None)
+            if value is None:
+                continue
+            items = value if isinstance(value, list) else [value]
+            is_add_only = getattr(schema, "operation_mode", "upsert") == "add_only"
+            for item_index, item in enumerate(items):
+                requested_page_id = dict(item).get("page_id")
+                entries.append((schema_index, item_index, requested_page_id, is_add_only))
+
+        assigned_page_ids: Dict[Tuple[int, int], int] = {}
+        page_id_assignments: Dict[int, List[int]] = {}
+        page_id_allocator = None
+
+        # Keep upsert IDs stable before allocating IDs for add_only operations.
+        entries.sort(key=lambda entry: entry[3])
+        for schema_index, item_index, requested_page_id, is_add_only in entries:
+            existing_uri = None
+            if not is_add_only and requested_page_id is not None and page_id_map is not None:
+                existing_uri = page_id_map.resolve(requested_page_id)
+            if existing_uri is not None:
+                page_id = requested_page_id
+            else:
+                if page_id_allocator is None:
+                    allocator_factory = getattr(
+                        page_id_map,
+                        "new_page_id_allocator",
+                        None,
+                    )
+                    page_id_allocator = (
+                        allocator_factory()
+                        if callable(allocator_factory)
+                        else ResponsePageIdAllocator()
+                    )
+                page_id = page_id_allocator.allocate(requested_page_id)
+
+            assigned_page_ids[(schema_index, item_index)] = page_id
+            if requested_page_id is not None:
+                page_id_assignments.setdefault(requested_page_id, []).append(page_id)
+
+        return assigned_page_ids, page_id_assignments
+
+    async def resolve_operations(self, operations) -> tuple[ResolvedOperations, List]:
+        tracer.info(f"operations={JsonUtils.dumps(operations)}")
+        upsert_operations: List[ResolvedOperation] = []
+        delete_file_contents: List[MemoryFile] = []
+        errors: List[str] = []
+        invalid_reference_page_ids: set[int] = set()
+
+        role_scope = self._isolation_handler.get_read_scope()
+        page_id_map = getattr(self._extract_context, "page_id_map", None)
+        schemas = list(self.context_provider.get_memory_schemas(self.ctx))
+        assigned_page_ids, page_id_assignments = self._assign_response_page_ids(
+            operations,
+            schemas,
+            page_id_map,
+        )
+
+        for schema_index, schema in enumerate(schemas):
+            memory_type = schema.memory_type
+            is_add_only = getattr(schema, "operation_mode", "upsert") == "add_only"
+            value = getattr(operations, memory_type, None)
+            if value is None:
+                continue
+
+            items = value if isinstance(value, list) else [value]
+
+            for item_index, item in enumerate(items):
+                item_dict = dict(item)
+                item_dict["memory_type"] = memory_type
+                identity_resolution_skip = None
+                classify_identity_fields = getattr(
+                    self._isolation_handler,
+                    "_classify_identity_fields",
+                    None,
+                )
+                if callable(classify_identity_fields):
+                    identity_resolution_skip = classify_identity_fields(
+                        item_dict,
+                        memory_type_schema=schema,
+                    )
+                try:
+                    self._isolation_handler.fill_identity_fields(
+                        item_dict,
+                        role_scope=role_scope,
+                        memory_type_schema=schema,
+                    )
+                except TypeError as exc:
+                    # Some tests and older custom isolation handlers implement
+                    # the pre-schema signature ``fill_identity_fields(item,
+                    # role_scope=None)``.  Keep that extension point working
+                    # while the real handler can still use schema peer settings.
+                    if "memory_type_schema" not in str(exc):
+                        raise
+                    self._isolation_handler.fill_identity_fields(
+                        item_dict,
+                        role_scope=role_scope,
+                    )
+                if not isinstance(identity_resolution_skip, MemoryOperationSkip):
+                    identity_resolution_skip = None
+
+                requested_page_id = item_dict.pop("page_id", None)
+                page_id = assigned_page_ids[(schema_index, item_index)]
+                resolved_op = ResolvedOperation(
+                    old_memory_file_content=None,
+                    memory_fields=item_dict,
+                    memory_type=memory_type,
+                    uris=[],
+                    page_id=page_id,
+                    resolution_skip=identity_resolution_skip,
+                )
+
+                try:
+                    resolved_uri = None
+                    if (
+                        not is_add_only
+                        and requested_page_id is not None
+                        and page_id_map is not None
+                    ):
+                        resolved_uri = page_id_map.resolve(requested_page_id)
+                    if resolved_uri:
+                        old_content = self.context_provider.read_file_contents.get(resolved_uri)
+                        belongs_to_schema = self._uri_belongs_to_schema(resolved_uri, schema)
+                        if belongs_to_schema is False:
+                            invalid_reference_page_ids.add(requested_page_id)
+                            existing_memory_type = self._memory_type_for_uri(resolved_uri)
+                            resolved_op.resolution_skip = MemoryOperationSkip(
+                                reason_code=MemoryOperationSkipCode.PAGE_ID_TYPE_MISMATCH,
+                                reason=(
+                                    f"page_id {page_id} belongs to memory type "
+                                    f"{existing_memory_type or 'another schema'}, not {memory_type}"
+                                ),
+                            )
+                        else:
+                            resolved_op.uris = [resolved_uri]
+                            # Existing page IDs retain their historical precedence over
+                            # an invalid peer hint. Keep the hint runtime-only and do
+                            # not persist it into memory metadata.
+                            resolved_op.resolution_skip = None
+                        if old_content is not None and resolved_op.uris:
+                            resolved_op.old_memory_file_content = old_content
+                            immutable_fields = {
+                                field.name
+                                for field in schema.fields
+                                if field.merge_op == MergeOp.IMMUTABLE
+                            }
+                            preserved_fields = set(immutable_fields)
+                            preserved_fields.update(schema.identity_fields(include_peer_id=False))
+                            for field_name in preserved_fields:
+                                old_value = old_content.extra_fields.get(field_name)
+                                if not ImmutableOp.is_set(old_value):
+                                    continue
+                                new_value = resolved_op.memory_fields.get(field_name)
+                                if field_name in immutable_fields or not ImmutableOp.is_set(
+                                    new_value
+                                ):
+                                    resolved_op.memory_fields[field_name] = old_value
+                            target_uri = await self._updated_uri_for_existing_operation(
+                                resolved_op,
+                                schema=schema,
+                                source_uri=resolved_uri,
+                            )
+                            if target_uri != resolved_uri:
+                                resolved_op.uris = [target_uri]
+                    else:
+                        resolved_op.uris = self._isolation_handler.calculate_memory_uris(
+                            memory_type_schema=schema,
+                            operation=resolved_op,
+                            extract_context=self._extract_context,
+                        )
+                except ValueError as exc:
+                    resolved_op.uris = []
+                    resolved_op.resolution_skip = MemoryOperationSkip(
+                        reason_code=MemoryOperationSkipCode.INVALID_URI_TEMPLATE_VARS,
+                        reason=str(exc),
+                    )
+                    logger.warning(
+                        "Skipping memory operation with unrenderable URI: "
+                        "memory_type=%s page_id=%s error=%s",
+                        memory_type,
+                        page_id,
+                        exc,
+                    )
+
+                upsert_operations.append(resolved_op)
+
+        delete_replacements: dict[str, str] = {}
+        delete_ids = self._normalize_delete_ids(getattr(operations, "delete_ids", []) or [])
+        for delete_id in delete_ids:
+            if delete_id.delete_page_id is None or page_id_map is None:
+                continue
+            delete_uri = page_id_map.resolve(delete_id.delete_page_id)
+            if not delete_uri:
+                continue
+            old_content = self.context_provider.read_file_contents.get(delete_uri)
+            if not old_content:
+                continue
+            replacement_page_id = delete_id.replacement_page_id
+            replacement_uri = None
+            if replacement_page_id is not None:
+                if replacement_page_id in invalid_reference_page_ids:
+                    logger.warning(
+                        "Skipping delete with type-mismatched replacement page_id: "
+                        "delete_page_id=%s, replacement_page_id=%s",
+                        delete_id.delete_page_id,
+                        delete_id.replacement_page_id,
+                    )
+                    continue
+                replacement_page_id, ambiguous = self._normalize_page_id_reference(
+                    replacement_page_id,
+                    page_id_assignments,
+                    page_id_map,
+                )
+                if ambiguous:
+                    logger.warning(
+                        "Skipping delete with ambiguous replacement page_id: "
+                        "delete_page_id=%s, replacement_page_id=%s",
+                        delete_id.delete_page_id,
+                        delete_id.replacement_page_id,
+                    )
+                    continue
+                replacement_uri = next(
+                    (
+                        op.uris[0]
+                        for op in upsert_operations
+                        if op.page_id == replacement_page_id and op.uris
+                    ),
+                    None,
+                )
+                if not replacement_uri:
+                    replacement_uri = page_id_map.resolve(replacement_page_id)
+
+            if all(file.uri != old_content.uri for file in delete_file_contents):
+                delete_file_contents.append(old_content)
+            if replacement_uri and replacement_uri != delete_uri:
+                delete_replacements[delete_uri] = replacement_uri
+
+        raw_links = getattr(operations, "links", None) or []
+        if invalid_reference_page_ids:
+            raw_links = [
+                link
+                for link in raw_links
+                if link.f not in invalid_reference_page_ids
+                and link.t not in invalid_reference_page_ids
+            ]
+        raw_links = self._normalize_operation_links(
+            raw_links,
+            page_id_assignments,
+            page_id_map,
+        )
+        resolved = ResolvedOperations(
+            upsert_operations=upsert_operations,
+            delete_file_contents=delete_file_contents,
+            errors=errors,
+            delete_replacements=delete_replacements,
+        )
+
+        for op in upsert_operations:
+            for uri in op.uris:
+                old_content = self.context_provider.read_file_contents.get(uri)
+                if old_content and op.old_memory_file_content is None:
+                    op.old_memory_file_content = old_content
+                    break
+
+        return resolved, raw_links
+
+    async def _updated_uri_for_existing_operation(
+        self,
+        operation: ResolvedOperation,
+        *,
+        schema: Any,
+        source_uri: str,
+    ) -> str:
+        """Recompute an existing object's URI after mutable identity-field updates."""
+        old_content = operation.old_memory_file_content
+        if old_content is None:
+            return source_uri
+
+        uri_fields = dict(old_content.extra_fields or {})
+        schema_fields = {field.name: field for field in schema.fields}
+        identity_field_changed = False
+        for field_name in schema.identity_fields(include_peer_id=False):
+            field = schema_fields.get(field_name)
+            if field is None or field_name not in operation.memory_fields:
+                continue
+            current_value = (
+                old_content.plain_content()
+                if field_name == "content"
+                else old_content.extra_fields.get(field_name)
+            )
+            try:
+                new_value = await MergeOpFactory.from_field(field).apply(
+                    current_value,
+                    operation.memory_fields[field_name],
+                )
+            except Exception:
+                new_value = current_value
+            if new_value != current_value:
+                identity_field_changed = True
+            uri_fields[field_name] = new_value
+        if not identity_field_changed:
+            return source_uri
+
+        prefix = "viking://user/"
+        namespace, separator, _ = source_uri.partition("/memories/")
+        if not separator or not namespace.startswith(prefix):
+            return source_uri
+        user_space = namespace.removeprefix(prefix)
+        candidate_uri = generate_uri(
+            memory_type=schema,
+            fields=uri_fields,
+            user_space=user_space,
+            extract_context=self._extract_context,
+        )
+        return candidate_uri if candidate_uri != source_uri else source_uri
+
+    def _normalize_delete_ids(self, raw_delete_ids: List[Any]) -> List[DeleteId]:
+        delete_ids: List[DeleteId] = []
+        for raw in raw_delete_ids:
+            try:
+                delete_ids.append(DeleteId.model_validate(raw))
+            except Exception as e:
+                tracer.info(f"Skipping invalid delete_ids item: {raw}, error={e}")
+        return delete_ids
+
+    async def finalize_operations(self, operations: ResolvedOperations, raw_links: List) -> None:
+        """Register new page_ids and resolve links after refetch is complete.
+
+        Must be called after resolve_operations() and any refetch rounds,
+        so that existing files discovered by refetch get 1-99 page_ids
+        instead of 100+ IDs from register_new_page_id.
+        """
+        if not self._link_enabled:
+            return
+
+        upsert_operations = operations.upsert_operations
+
+        # URIs are already bound in resolve_operations() before any refetch rounds.
+        # finalize_operations only consumes them to register new page_ids and resolve links.
+        page_id_map = self._extract_context.page_id_map
+
+        # Register new page_ids (100+) after URI resolution, using LLM-declared page_id
+        for op in upsert_operations:
+            if op.page_id is not None and op.page_id >= 100:
+                for uri in op.uris:
+                    page_id_map.register_new_page_id(uri, op.page_id)
+
+        # Resolve links from WikiLink (page_ids) to StoredLink (URIs)
+        resolved_links = self._resolve_links(raw_links, upsert_operations)
+
+        operations.resolved_links = resolved_links
+
+    def _resolve_links(self, raw_links: List, upsert_operations: List = None) -> List[StoredLink]:
+        """Resolve WikiLinks with page_ids to StoredLinks with URIs.
+
+        Returns a flat list of StoredLink objects. Each link is stored once.
+        Links go into from_uri's "links" field; backlinks go into to_uri's "backlinks" field.
+        The routing is handled by memory_updater based on which file each link belongs to.
+        """
+        if not raw_links:
+            return []
+
+        op_page_map = {}
+        if upsert_operations:
+            for op in upsert_operations:
+                if op.page_id is None or not op.uris:
+                    continue
+                op_page_map.setdefault(op.page_id, [])
+                for uri in op.uris:
+                    if uri not in op_page_map[op.page_id]:
+                        op_page_map[op.page_id].append(uri)
+
+        page_id_map = self._extract_context.page_id_map
+
+        if not page_id_map._id_to_uri and not op_page_map:
+            return []
+        page_uri_map = {page_id: list(uris) for page_id, uris in op_page_map.items()}
+        for link in raw_links:
+            for page_id in (link.f, link.t):
+                if page_id is None:
+                    continue
+                uri = page_id_map.resolve(page_id)
+                if uri and page_id not in op_page_map:
+                    page_uri_map.setdefault(page_id, [])
+                    if uri not in page_uri_map[page_id]:
+                        page_uri_map[page_id].insert(0, uri)
+
+        from openviking.session.memory.utils.link_resolver import resolve_wiki_links
+
+        return resolve_wiki_links(raw_links, page_uri_map)
 
     @tracer("extract_loop.execute_tool_calls")
     async def _execute_tool_calls(self, messages, tool_calls, tools_used) -> bool:
@@ -268,16 +1152,17 @@ The final output of the model must strictly follow the JSON Schema format shown 
             True if any tool call returned "Unknown tool" error, indicating
             the model should not receive tools in the next iteration.
         """
+
         # Execute all tool calls in parallel
         async def execute_single_tool_call(idx: int, tool_call):
             """Execute a single tool call."""
-            result = await self._execute_tool(tool_call)
+            result = await self.context_provider.execute_tool(tool_call)
             return idx, tool_call, result
 
         action_tasks = [
             execute_single_tool_call(idx, tool_call) for idx, tool_call in enumerate(tool_calls)
         ]
-        results = await self._execute_in_parallel(action_tasks)
+        results = await asyncio.gather(*action_tasks)
 
         has_unknown_tool = False
 
@@ -288,7 +1173,7 @@ The final output of the model must strictly follow the JSON Schema format shown 
                 has_unknown_tool = True
             # Skip if arguments is None
             if tool_call.arguments is None:
-                logger.warning(f"Tool call {tool_call.name} has no arguments, skipping")
+                tracer.error(f"Tool call {tool_call.name} has no arguments, skipping")
                 continue
 
             tools_used.append(
@@ -299,55 +1184,21 @@ The final output of the model must strictly follow the JSON Schema format shown 
                 }
             )
 
-            # Track read tool calls for refetch detection
-            if tool_call.name == "read" and tool_call.arguments.get("uri"):
-                uri = tool_call.arguments["uri"]
-                self._read_files.add(uri)
-
-            add_tool_call_pair_to_messages(
-                messages,
-                call_id=tool_call.id,
-                tool_name=tool_call.name,
-                params=tool_call.arguments,
-                result=result,
+            messages.extend(
+                self._output_protocol.render_tool_result_messages(
+                    self._output_context,
+                    call_id=tool_call.id,
+                    tool_name=tool_call.name,
+                    params=tool_call.arguments,
+                    result=result,
+                    source="tool call",
+                )
             )
 
         return has_unknown_tool
 
-    def _validate_operations(self, operations: Any) -> None:
-        """
-        Validate that all operations have allowed URIs.
-
-        Args:
-            operations: The operations to validate
-
-        Raises:
-            ValueError: If any operation has a disallowed URI
-        """
-        # Get registry from provider (internal method)
-        registry = self.context_provider._get_registry()
-        schemas = self.context_provider.get_memory_schemas(self.ctx)
-
-        # Use pre-initialized extract_context
-        if not hasattr(self, "_extract_context") or self._extract_context is None:
-            raise ValueError("ExtractContext not initialized")
-
-        is_valid, errors = validate_operations_uris(
-            operations,
-            schemas,
-            registry,
-            user_space=self.ctx.user.user_space_name(),
-            agent_space=self.ctx.user.agent_space_name(),
-            extract_context=self._extract_context,
-        )
-        if not is_valid:
-            error_msg = "Invalid memory operations:\n" + "\n".join(f"  - {err}" for err in errors)
-            logger.error(error_msg)
-            raise ValueError(error_msg)
-
     async def _call_llm(
-        self,
-        messages: List[Dict[str, Any]]
+        self, messages: List[Dict[str, Any]]
     ) -> Tuple[Optional[List], Optional[Any]]:
         """
         Call LLM with tools. Returns either tool calls OR final operations.
@@ -359,21 +1210,26 @@ The final output of the model must strictly follow the JSON Schema format shown 
         Returns:
             Tuple of (tool_calls, operations) - one will be None, the other set
         """
-        # 标记 cache breakpoint
-        await self._mark_cache_breakpoint(messages)
-
-        # Call LLM with tools - use tools from strategy
-        tools = None
+        # Call LLM with tools - use tools from strategy. Pass tools=[] (not None)
+        # when tools are disabled so backends following the OpenAI backend's
+        # `tools is not None` convention still return a VLMResponse carrying
+        # finish_reason and usage instead of a bare string.
+        tools: Optional[List[Dict[str, Any]]] = []
         tool_choice = None
-        if not self._disable_tools_for_iteration:
+        if not self._disable_tools_for_iteration and self._tool_schemas:
             tools = self._tool_schemas
             tool_choice = "auto"
-        response = await self.vlm.get_completion_async(
-            messages=messages,
-            tools=tools,
-            tool_choice=tool_choice,
-        )
-        tracer.info(f"response={response}")
+        with bind_telemetry_stage("memory_extract"):
+            response = await self.vlm.get_completion_async(
+                messages=messages,
+                tools=tools,
+                tool_choice=tool_choice,
+                thinking=self.thinking,
+                max_tokens=self._effective_max_output_tokens,
+            )
+        self._last_llm_failure_kind = None
+        self._last_llm_failure_content = ""
+        self._last_parse_error = None
         # print(f'response={response}')
         # Log cache hit info
         if hasattr(response, "usage") and response.usage:
@@ -384,6 +1240,15 @@ The final output of the model must strictly follow the JSON Schema format shown 
                 if isinstance(usage.get("prompt_tokens_details"), dict)
                 else 0
             )
+            try:
+                from openviking.metrics.datasources.cache import CacheEventDataSource
+
+                if int(cached_tokens or 0) > 0:
+                    CacheEventDataSource.record_hit("L2")
+                else:
+                    CacheEventDataSource.record_miss("L2")
+            except Exception:
+                pass
             if prompt_tokens > 0:
                 cache_hit_rate = (cached_tokens / prompt_tokens) * 100
                 tracer.info(
@@ -393,6 +1258,21 @@ The final output of the model must strictly follow the JSON Schema format shown 
                 tracer.info(
                     f"[KVCache] prompt_tokens={prompt_tokens}, cached_tokens={cached_tokens}"
                 )
+
+        # Reject explicit truncation before handling tool calls or parsing:
+        # neither a partial tool call nor a parseable program is safe to use.
+        # run() treats budget_exhausted as terminal, without a format retry.
+        if getattr(response, "finish_reason", None) == "length":
+            content = getattr(response, "content", None) or ""
+            self._last_llm_failure_kind = "budget_exhausted"
+            self._last_llm_failure_content = content
+            self._last_parse_error = self._budget_exhausted_error(response, content)
+            tracer.set("memory.extraction.parse_error", self._last_parse_error)
+            logger.debug(
+                "Response truncated by output-token budget "
+                f"failure_kind=budget_exhausted error={self._last_parse_error}"
+            )
+            return (None, None)
 
         # Case 0: Handle string response (when tools are not provided) or None
         if response is None:
@@ -411,140 +1291,200 @@ The final output of the model must strictly follow the JSON Schema format shown 
             # Case 2: VLMResponse without tool calls - get content from response
             content = response.content or ""
 
+        # No tool calls (Case 0 & 2): strip reasoning tags in the text before parsing.
+        content = VLMBase._clean_response(content)
+
         # Parse operations from content
         if content:
             try:
                 # print(f'LLM response content: {content}')
                 logger.debug(f"[assistant]\n{content}")
 
-                # Use cached operations_model and expected_fields
-                operations, error = parse_json_with_stability(
-                    content=content,
-                    model_class=self._operations_model,
-                    expected_fields=self._expected_fields,
-                )
+                operations, error = self._output_protocol.parse(content, self._output_context)
 
                 if error is not None:
-                    print(f"content={content}")
-                    logger.warning(f"Failed to parse memory operations: {error}")
+                    failure_kind = (
+                        "refusal_text" if _looks_like_canned_refusal(content) else "parse_error"
+                    )
+                    self._last_llm_failure_kind = failure_kind
+                    self._last_llm_failure_content = content
+                    self._last_parse_error = error
+                    tracer.set("memory.extraction.parse_error", error)
+                    # Diagnostic only; the run loop emits the WARNING/ERROR decision.
+                    logger.debug(
+                        "Failed to parse memory operations "
+                        f"failure_kind={failure_kind} error={error} "
+                        f"response_preview={_preview_text(content)!r}"
+                    )
                     return (None, None)
 
-                # Validate that all URIs are allowed
-                self._validate_operations(operations)
                 return (None, operations)
             except Exception as e:
-                logger.exception(f"Error parsing operations: {e}")
+                self._last_parse_error = str(e)
+                tracer.set("memory.extraction.parse_error", self._last_parse_error)
+                logger.debug(f"Error parsing operations: {e}")
 
         # Case 3: No tool calls and no parsable operations
-        print("No tool calls or operations parsed")
+        self._last_llm_failure_kind = "empty_response" if not content else "parse_error"
+        self._last_llm_failure_content = content or ""
+        if not content:
+            empty_error = self._output_protocol.describe_empty_response()
+            if empty_error:
+                self._last_parse_error = empty_error
+                tracer.set("memory.extraction.parse_error", empty_error)
+        logger.debug(
+            "No tool calls or operations parsed "
+            f"failure_kind={self._last_llm_failure_kind} "
+            f"response_preview={_preview_text(self._last_llm_failure_content)!r}"
+        )
         return (None, None)
 
-    @tracer("extract_loop.execute_tool", ignore_result=False)
-    async def _execute_tool(
-        self,
-        tool_call,
-    ) -> Any:
-        """Execute a single read action (read/search/ls/tree)."""
-        if not self.viking_fs:
-            return {"error": "VikingFS not available"}
-
-        tool = get_tool(tool_call.name)
-        if not tool:
-            return {"error": f"Unknown tool: {tool_call.name}"}
-
-        # 创建 ToolContext
-        from openviking.server.identity import ToolContext
-
-        tool_ctx = ToolContext(request_ctx=self.ctx, transaction_handle=self._transaction_handle)
-
-        try:
-            tracer.info(f"tool_call.arguments={tool_call.arguments}")
-            result = await tool.execute(self.viking_fs, tool_ctx, **tool_call.arguments)
-
-            return result
-        except Exception as e:
-            logger.error(f"Failed to execute {tool_call.name}: {e}")
-            return {"error": str(e)}
-
-    async def _execute_in_parallel(
-        self,
-        tasks: List[Any],
-    ) -> List[Any]:
-        """Execute tasks in parallel, similar to AgentLoop."""
-        return await asyncio.gather(*tasks)
-
-    async def _check_unread_existing_files(
-        self,
-        operations: Any,
-    ) -> List[str]:
-        """Check if write operations target existing files that weren't read during ReAct."""
-        memory_type_fields = getattr(operations, "_memory_type_fields", None)
-        if not memory_type_fields:
-            return []
-
-        from openviking.session.memory.utils.uri import resolve_flat_model_uri
-
-        registry = self.context_provider._get_registry()
-        refetch_uris = []
-
-        for field_name in memory_type_fields:
-            value = getattr(operations, field_name, None)
-            if value is None:
-                continue
-            items = value if isinstance(value, list) else [value]
-            for item in items:
-                # Convert to dict
-                item_dict = dict(item) if hasattr(item, "model_dump") else dict(item)
+    async def _check_unread_existing_files(self, operations: ResolvedOperations) -> Dict:
+        refetch_uris = {}
+        for operation in operations.upsert_operations:
+            for uri in operation.uris:
+                if uri in self.context_provider.read_file_contents:
+                    continue
                 try:
-                    uri = resolve_flat_model_uri(
-                        item_dict,
-                        registry,
-                        user_space=self.ctx.user.user_space_name(),
-                        agent_space=self.ctx.user.agent_space_name(),
-                        memory_type=field_name,
-                        extract_context=self._extract_context,
+                    content = await self.context_provider.execute_tool(
+                        ToolCall(id="", name="read", arguments={"uri": uri})
                     )
-                except Exception as e:
-                    logger.warning(f"Failed to resolve URI for {item}: {e}")
-                    continue
+                    # 读取出错表示文件不存在（error dict 含 "error" key）
+                    if isinstance(content, Dict) and "error" in content:
+                        continue
 
-                if uri in self._read_files:
-                    continue
-                try:
-                    await self.viking_fs.read_file(uri, ctx=self.ctx)
-                    refetch_uris.append(uri)
-                except Exception:
-                    pass
+                    # execute_tool(MemoryReadTool) 已经返回 parsed dict，直接使用
+                    refetch_uris[uri] = content
+                except Exception as e:
+                    tracer.error("read tool execute fail", e)
         return refetch_uris
+
+    def _add_format_error_message(self, messages: List[Dict[str, Any]]) -> None:
+        """Add format error guidance message to prompt."""
+        messages.append(
+            {
+                "role": "user",
+                "content": self._output_protocol.render_format_retry(self._last_parse_error),
+            }
+        )
+
+    def _build_final_operations_instruction(self) -> str:
+        """Build schema-aware final-iteration instructions for the LLM."""
+        return self._output_protocol.render_final_instruction(self._output_context)
+
+    async def _validate_patch_operations(
+        self,
+        operations: ResolvedOperations,
+    ) -> List[Dict[str, Any]]:
+        from openviking.session.memory.merge_op.base import (
+            DeleteBlock,
+            SearchReplaceBlock,
+            StrPatch,
+        )
+        from openviking.session.memory.merge_op.patch_handler import unescape_markers
+
+        def field_value(memory_file: MemoryFile, field_name: str) -> str:
+            value = (
+                memory_file.plain_content()
+                if field_name == "content"
+                else memory_file.extra_fields.get(field_name)
+            )
+            # Other memory types can use the same field name for non-string data.
+            return value if isinstance(value, str) else ""
+
+        errors = []
+        patch_op = PatchOp(FieldType.STRING)
+        read_files = self.context_provider.read_file_contents or {}
+        for operation in operations.upsert_operations:
+            if operation.old_memory_file_content is None:
+                continue
+            target_uri = (
+                operation.uris[0] if operation.uris else operation.old_memory_file_content.uri
+            )
+            for field_name, patch_value in operation.memory_fields.items():
+                blocks = []
+                if isinstance(patch_value, StrPatch):
+                    blocks = patch_value.blocks
+                elif isinstance(patch_value, dict) and "blocks" in patch_value:
+                    for raw_block in patch_value.get("blocks", []):
+                        if isinstance(raw_block, (SearchReplaceBlock, DeleteBlock)):
+                            blocks.append(raw_block)
+                        elif isinstance(raw_block, dict):
+                            blocks.extend(StrPatch.model_validate({"blocks": [raw_block]}).blocks)
+                if not blocks:
+                    continue
+                working_content = field_value(operation.old_memory_file_content, field_name)
+                for block_index, block in enumerate(blocks, start=1):
+                    search = block.search or ""
+                    if not search or search == block.replace:
+                        continue
+                    effective_search = unescape_markers(search)
+                    match_count = working_content.count(effective_search)
+                    apply_failed = False
+                    try:
+                        applied_content = await patch_op.apply(
+                            working_content,
+                            StrPatch(blocks=[block]),
+                        )
+                    except Exception:
+                        apply_failed = True
+                        applied_content = working_content
+                    if applied_content != working_content:
+                        working_content = applied_content
+                        continue
+                    if match_count > 1:
+                        reason = "non_unique"
+                    elif match_count == 0:
+                        reason = "not_found"
+                    elif apply_failed:
+                        reason = "apply_error"
+                    else:
+                        reason = "not_applied"
+                    found_in = [
+                        uri
+                        for uri, memory_file in read_files.items()
+                        if uri != target_uri and search in field_value(memory_file, field_name)
+                    ]
+                    errors.append(
+                        {
+                            "uri": target_uri,
+                            "page_id": operation.page_id,
+                            "field": field_name,
+                            "block_index": block_index,
+                            "search": search,
+                            "reason": reason,
+                            "match_count": match_count,
+                            "found_in_other_uris": found_in,
+                        }
+                    )
+                    break
+        if errors:
+            tracer.info(f"String patch validation failed before apply: {errors}")
+        return errors
+
+    def _build_patch_repair_instruction(self, patch_errors: List[Dict[str, Any]]) -> str:
+        return self._output_protocol.render_patch_repair(patch_errors)
 
     async def _add_refetch_results_to_messages(
         self,
         messages: List[Dict[str, Any]],
-        refetch_uris: List[str],
+        refetch_uris: Dict[str, Any],
     ) -> None:
         """Add existing file content as read tool results to messages."""
         # Calculate call_id based on existing tool messages
         call_id_seq = len([m for m in messages if m.get("role") == "tool"]) + 1000
-
-        for uri in refetch_uris:
-            try:
-                content = await self.viking_fs.read_file(uri, ctx=self.ctx)
-                parsed = parse_memory_file_with_fields(content)
-
-                # Add as read tool call + result
-                add_tool_call_pair_to_messages(
-                    messages=messages,
+        for uri, parsed in refetch_uris.items():
+            messages.extend(
+                self._output_protocol.render_tool_result_messages(
+                    self._output_context,
                     call_id=call_id_seq,
                     tool_name="read",
                     params={"uri": uri},
                     result=parsed,
+                    source="automatic read",
                 )
-                call_id_seq += 1
-
-                # Mark as read
-                self._read_files.add(uri)
-            except Exception as e:
-                logger.warning(f"Failed to refetch {uri}: {e}")
+            )
+            call_id_seq += 1
 
         # Add reminder message for the model
         messages.append(
@@ -553,8 +1493,3 @@ The final output of the model must strictly follow the JSON Schema format shown 
                 "content": "Note: The files above were automatically read because they exist and you didn't read them before deciding to write. Please consider the existing content when making write decisions. You can now output updated operations.",
             }
         )
-
-    async def _mark_cache_breakpoint(self, messages):
-        # 支持 dict 消息和 object 消息
-        last_msg = messages[-1]
-        last_msg["cache_control"] = {"type": "ephemeral"}

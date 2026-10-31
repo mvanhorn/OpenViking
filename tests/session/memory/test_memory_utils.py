@@ -8,21 +8,17 @@ import pytest
 
 from openviking.session.memory.dataclass import (
     MemoryField,
-    MemoryOperations,
+    MemoryFile,
     MemoryTypeSchema,
 )
-from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
 from openviking.session.memory.merge_op.base import FieldType, MergeOp
 from openviking.session.memory.utils import (
-    collect_allowed_directories,
-    collect_allowed_path_patterns,
     generate_uri,
-    is_uri_allowed,
-    is_uri_allowed_for_schema,
     parse_memory_file_with_fields,
-    resolve_all_operations,
     validate_uri_template,
 )
+from openviking.session.memory.utils.content_visibility import visible_content
+from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 
 
 class TestUriGeneration:
@@ -64,7 +60,7 @@ class TestUriGeneration:
         memory_type = MemoryTypeSchema(
             memory_type="tools",
             description="Tool usage memory",
-            directory="viking://agent/{{ agent_space }}/memories/tools",
+            directory="viking://user/{{ user_space }}/memories/tools",
             filename_template="{{ tool_name }}.md",
             fields=[
                 MemoryField(
@@ -79,10 +75,10 @@ class TestUriGeneration:
         uri = generate_uri(
             memory_type,
             {"tool_name": "web_search"},
-            agent_space="default",
+            user_space="default",
         )
 
-        assert uri == "viking://agent/default/memories/tools/web_search.md"
+        assert uri == "viking://user/default/memories/tools/web_search.md"
 
     def test_generate_uri_only_directory(self):
         """Test generating URI with only directory."""
@@ -145,6 +141,110 @@ class TestUriGeneration:
         with pytest.raises(ValueError, match="has None value"):
             generate_uri(memory_type, {"topic": None})
 
+    def test_generate_uri_normalizes_dynamic_slash_without_new_hierarchy(self):
+        memory_type = MemoryTypeSchema(
+            memory_type="events",
+            directory="viking://user/{{ user_space }}/memories/events",
+            filename_template="2026/07/30/{{ event_name }}.md",
+        )
+        fields = {"event_name": "alpha/beta"}
+
+        uri = generate_uri(memory_type, fields, user_space="default")
+
+        assert (
+            uri
+            == generate_uri(memory_type, {"event_name": "alpha_beta"}, user_space="default")
+            == "viking://user/default/memories/events/2026/07/30/alpha_beta.md"
+        )
+        assert fields == {"event_name": "alpha/beta"}
+
+    def test_generate_uri_keeps_colliding_windows_names_distinct(self):
+        memory_type = MemoryTypeSchema(
+            memory_type="scratch",
+            description="Scratch memory",
+            directory="viking://user/{{ user_space }}/memories/scratch",
+            filename_template="{{ name }}/item",
+            fields=[
+                MemoryField(
+                    name="name",
+                    field_type=FieldType.STRING,
+                    merge_op=MergeOp.IMMUTABLE,
+                )
+            ],
+        )
+
+        uris = {
+            name: generate_uri(memory_type, {"name": name})
+            for name in ("Desktop", "Desktop ", "Desktop.", "Desktop~notes", "_", "   ")
+        }
+
+        assert len(set(uris.values())) == len(uris)
+        assert uris["Desktop"].endswith("/Desktop/item")
+        assert uris["Desktop "].endswith("/Desktop~ov~02970756851a43cf/item")
+        assert uris["Desktop."].endswith("/Desktop~ov~3c65b627123c925e/item")
+        assert uris["Desktop~notes"].endswith("/Desktop~notes/item")
+        assert uris["_"].endswith("/_/item")
+        assert uris["   "].endswith("/_~ov~0aad7da77d2ed59c/item")
+
+    @pytest.mark.parametrize(
+        ("name", "expected_filename"),
+        [
+            ("CON.md", "_CON~ov~ab20d2f97c036c47.md"),
+            ("bad:name.md", "bad_name~ov~a5895459cfd9b57c.md"),
+        ],
+    )
+    def test_generate_uri_rewrites_other_windows_invalid_names_and_keeps_extension(
+        self,
+        name,
+        expected_filename,
+    ):
+        memory_type = MemoryTypeSchema(
+            memory_type="scratch",
+            description="Scratch memory",
+            directory="viking://user/{{ user_space }}/memories/scratch",
+            filename_template="{{ name }}",
+            fields=[],
+        )
+
+        uri = generate_uri(memory_type, {"name": name})
+
+        assert uri.endswith(f"/{expected_filename}")
+
+    def test_generate_uri_reserved_marker_cannot_alias_generated_name(self):
+        memory_type = MemoryTypeSchema(
+            memory_type="scratch",
+            description="Scratch memory",
+            directory="viking://user/{{ user_space }}/memories/scratch",
+            filename_template="{{ name }}/item",
+            fields=[],
+        )
+        generated_uri = generate_uri(memory_type, {"name": "Desktop "})
+        generated_name = generated_uri.rsplit("/", 2)[-2]
+
+        literal_uri = generate_uri(memory_type, {"name": generated_name})
+
+        assert literal_uri != generated_uri
+
+    def test_generate_uri_portability_applies_to_every_template_segment(self):
+        memory_type = MemoryTypeSchema(
+            memory_type="preferences",
+            description="Preference memory",
+            directory="viking://user/{{ user_space }}/memories/preferences",
+            filename_template="{{ user }}/{{ topic }}",
+            fields=[],
+        )
+        fields = {"user": "Alice ", "topic": "CON"}
+
+        first_uri = generate_uri(memory_type, fields, user_space="default")
+        second_uri = generate_uri(memory_type, fields, user_space="default")
+
+        assert first_uri == second_uri
+        assert first_uri == (
+            "viking://user/default/memories/preferences/"
+            "Alice~ov~11f75fc2e111eb7d/_CON~ov~a3dbc4b644a9a2c5"
+        )
+        assert fields == {"user": "Alice ", "topic": "CON"}
+
     def test_validate_uri_template_valid(self):
         """Test validating a valid URI template."""
         memory_type = MemoryTypeSchema(
@@ -194,263 +294,6 @@ class TestUriGeneration:
         )
 
         assert validate_uri_template(memory_type) is False
-
-
-class TestUriValidation:
-    """Tests for URI validation."""
-
-    def test_collect_allowed_directories(self):
-        """Test collecting allowed directories from schemas."""
-        schemas = [
-            MemoryTypeSchema(
-                memory_type="preferences",
-                description="Preferences",
-                directory="viking://user/{{ user_space }}/memories/preferences",
-                filename_template="{{ topic }}.md",
-                fields=[],
-            ),
-            MemoryTypeSchema(
-                memory_type="tools",
-                description="Tools",
-                directory="viking://agent/{{ agent_space }}/memories/tools",
-                filename_template="{{ tool_name }}.md",
-                fields=[],
-            ),
-            MemoryTypeSchema(
-                memory_type="disabled",
-                description="Disabled",
-                directory="viking://user/default/memories/disabled",
-                filename_template="",
-                fields=[],
-                enabled=False,
-            ),
-        ]
-
-        dirs = collect_allowed_directories(
-            [s for s in schemas if s.enabled], user_space="default", agent_space="default"
-        )
-
-        assert dirs == {
-            "viking://user/default/memories/preferences",
-            "viking://agent/default/memories/tools",
-        }
-
-    def test_collect_allowed_path_patterns(self):
-        """Test collecting allowed path patterns from schemas."""
-        schemas = [
-            MemoryTypeSchema(
-                memory_type="preferences",
-                description="Preferences",
-                directory="viking://user/{{ user_space }}/memories/preferences",
-                filename_template="{{ topic }}.md",
-                fields=[],
-            ),
-        ]
-
-        patterns = collect_allowed_path_patterns(
-            schemas, user_space="default", agent_space="default"
-        )
-
-        assert patterns == {
-            "viking://user/default/memories/preferences/{{ topic }}.md",
-        }
-
-    def test_is_uri_allowed_by_directory(self):
-        """Test URI allowed by matching directory prefix."""
-        allowed_dirs = {
-            "viking://user/default/memories/preferences",
-            "viking://agent/default/memories/tools",
-        }
-        allowed_patterns = set()
-
-        assert (
-            is_uri_allowed(
-                "viking://user/default/memories/preferences/test.md",
-                allowed_dirs,
-                allowed_patterns,
-            )
-            is True
-        )
-
-        assert (
-            is_uri_allowed(
-                "viking://user/default/memories/preferences",
-                allowed_dirs,
-                allowed_patterns,
-            )
-            is True
-        )
-
-        assert (
-            is_uri_allowed(
-                "viking://user/default/memories/preferences/subdir/test.md",
-                allowed_dirs,
-                allowed_patterns,
-            )
-            is True
-        )
-
-    def test_is_uri_allowed_by_pattern(self):
-        """Test URI allowed by matching pattern."""
-        allowed_dirs = set()
-        allowed_patterns = {
-            "viking://user/default/memories/preferences/{{ topic }}.md",
-        }
-
-        assert (
-            is_uri_allowed(
-                "viking://user/default/memories/preferences/Python code style.md",
-                allowed_dirs,
-                allowed_patterns,
-            )
-            is True
-        )
-
-    def test_is_uri_disallowed(self):
-        """Test URI not allowed."""
-        allowed_dirs = {
-            "viking://user/default/memories/preferences",
-        }
-        allowed_patterns = set()
-
-        assert (
-            is_uri_allowed(
-                "viking://user/default/memories/other/test.md",
-                allowed_dirs,
-                allowed_patterns,
-            )
-            is False
-        )
-
-        assert (
-            is_uri_allowed(
-                "viking://user/other/memories/preferences/test.md",
-                allowed_dirs,
-                allowed_patterns,
-            )
-            is False
-        )
-
-    def test_is_uri_allowed_for_schema(self):
-        """Test checking URI against schemas."""
-        schemas = [
-            MemoryTypeSchema(
-                memory_type="preferences",
-                description="Preferences",
-                directory="viking://user/{{ user_space }}/memories/preferences",
-                filename_template="{{ topic }}.md",
-                fields=[],
-            ),
-        ]
-
-        assert (
-            is_uri_allowed_for_schema(
-                "viking://user/default/memories/preferences/test.md",
-                schemas,
-            )
-            is True
-        )
-
-        assert (
-            is_uri_allowed_for_schema(
-                "viking://user/default/memories/other/test.md",
-                schemas,
-            )
-            is False
-        )
-
-
-class TestUriResolution:
-    """Tests for URI resolution methods."""
-
-    @pytest.fixture
-    def test_registry(self):
-        """Create a test registry with sample schemas."""
-        registry = MemoryTypeRegistry()
-
-        # Add preferences schema
-        registry.register(
-            MemoryTypeSchema(
-                memory_type="preferences",
-                description="User preferences",
-                directory="viking://user/{{ user_space }}/memories/preferences",
-                filename_template="{{ topic }}.md",
-                fields=[
-                    MemoryField(name="topic", field_type=FieldType.STRING, description="Topic"),
-                ],
-            )
-        )
-
-        # Add tools schema
-        registry.register(
-            MemoryTypeSchema(
-                memory_type="tools",
-                description="Tool memories",
-                directory="viking://agent/{{ agent_space }}/memories/tools",
-                filename_template="{{ tool_name }}.md",
-                fields=[
-                    MemoryField(
-                        name="tool_name", field_type=FieldType.STRING, description="Tool name"
-                    ),
-                ],
-            )
-        )
-
-        return registry
-
-    def test_resolve_all_operations(self, test_registry):
-        """Test resolving all operations at once."""
-        operations = MemoryOperations(
-            write_uris=[
-                {
-                    "memory_type": "preferences",
-                    "topic": "Write test",
-                    "content": "Write content",
-                },
-            ],
-            edit_uris=[
-                {
-                    "memory_type": "tools",
-                    "tool_name": "edit_tool",
-                    "content": "Updated",
-                },
-            ],
-            delete_uris=[
-                "viking://user/default/memories/preferences/Delete me.md",
-            ],
-        )
-
-        resolved = resolve_all_operations(operations, test_registry)
-
-        assert resolved.has_errors() is False
-        # All operations are now unified into operations list
-        assert len(resolved.operations) == 2
-        assert len(resolved.delete_operations) == 1
-
-        # Verify resolved URIs - both write and edit go to operations list
-        uris = [op.uri for op in resolved.operations]
-        assert "viking://user/default/memories/preferences/Write test.md" in uris
-        assert "viking://agent/default/memories/tools/edit_tool.md" in uris
-        assert (
-            resolved.delete_operations[0][1]
-            == "viking://user/default/memories/preferences/Delete me.md"
-        )
-
-    def test_resolve_all_operations_with_errors(self, test_registry):
-        """Test resolving operations with errors."""
-        operations = MemoryOperations(
-            write_uris=[
-                {
-                    "memory_type": "unknown",
-                },
-            ],
-        )
-
-        resolved = resolve_all_operations(operations, test_registry)
-
-        assert resolved.has_errors() is True
-        assert len(resolved.errors) == 1
-        assert "Failed to resolve" in resolved.errors[0]
 
 
 class TestParseMemoryFileWithFields:
@@ -521,3 +364,103 @@ Content"""
         assert result["tool_name"] == "test"
         assert result["value"] == 42
         assert result["content"] == "Content"
+
+    def test_write_preserves_memory_type_in_memory_fields_comment(self):
+        memory_file = MemoryFile(
+            uri="viking://user/default/memories/preferences/code_style.md",
+            memory_type="preferences",
+            content="Prefers concise responses.",
+            extra_fields={"topic": "code_style"},
+        )
+
+        written = MemoryFileUtils.write(memory_file)
+        parsed = parse_memory_file_with_fields(written)
+
+        assert parsed["memory_type"] == "preferences"
+        assert parsed["topic"] == "code_style"
+        assert parsed["version"] == 1
+        assert parsed["content"] == "Prefers concise responses."
+
+    def test_field_value_containing_comment_terminator_round_trips(self):
+        memory_file = MemoryFile(
+            uri="viking://user/default/memories/events/2026/09/14/pipeline_switch.md",
+            memory_type="events",
+            content="Moved the ETL pipeline.",
+            extra_fields={"summary": "switched kafka --> flink", "ranges": "0-1"},
+        )
+
+        written = MemoryFileUtils.write(memory_file)
+        read_back = MemoryFileUtils.read(written, uri=memory_file.uri)
+
+        assert read_back.extra_fields["summary"] == "switched kafka --> flink"
+        assert read_back.extra_fields["ranges"] == "0-1"
+        assert read_back.memory_type == "events"
+        assert read_back.content == "Moved the ETL pipeline."
+        assert visible_content(written, uri=memory_file.uri) == "Moved the ETL pipeline."
+
+    def test_write_strips_user_identity_fields_from_memory_fields_comment(self):
+        memory_file = MemoryFile(
+            uri="viking://user/alice/memories/preferences/code_style.md",
+            memory_type="preferences",
+            content="Prefers concise responses.",
+            extra_fields={
+                "topic": "code_style",
+                "user_id": "alice",
+                "user_ids": ["alice", "bob"],
+            },
+        )
+
+        written = MemoryFileUtils.write(memory_file)
+        parsed = parse_memory_file_with_fields(written)
+
+        assert "user_id" not in parsed
+        assert "user_ids" not in parsed
+        assert parsed["version"] == 1
+        assert parsed["topic"] == "code_style"
+
+    def test_read_preserves_markdown_links_in_content(self):
+        raw_content = """2023-08-22 ChatLog\n\n[Calvin]: Worked with [Frank Ocean](../../../../entities/personal/calvin.md).\n\n<!-- MEMORY_FIELDS\n{\"memory_type\": \"events\", \"links\": [{\"to_uri\": \"viking://user/Calvin/memories/entities/personal/calvin.md\", \"link_type\": \"related_to\", \"match_text\": \"Frank\"}]}\n-->"""
+
+        memory_file = MemoryFileUtils.read(
+            raw_content,
+            uri="viking://user/Calvin/memories/events/2023/08/22/collab_with_frank_ocean.md",
+        )
+
+        assert "[Frank Ocean](../../../../entities/personal/calvin.md)" in memory_file.content
+
+    def test_memory_file_plain_content_strips_markdown_links(self):
+        memory_file = MemoryFile(
+            uri="viking://user/Calvin/memories/events/2023/08/22/collab_with_frank_ocean.md",
+            content="Worked with [Frank Ocean](../../../../entities/personal/calvin.md).",
+            links=[
+                {
+                    "to_uri": "viking://user/Calvin/memories/entities/personal/calvin.md",
+                    "link_type": "related_to",
+                    "match_text": "Frank",
+                }
+            ],
+        )
+
+        assert memory_file.plain_content() == "Worked with Frank Ocean."
+
+    def test_write_does_not_put_uri_in_memory_fields_metadata(self):
+        memory_file = MemoryFile(
+            uri="viking://user/default/memories/experiences/source.md",
+            memory_type="experiences",
+            content="Source content mentions Target.",
+            extra_fields={"_uri": "viking://stale/should-not-persist"},
+            links=[
+                {
+                    "from_uri": "viking://user/default/memories/experiences/source.md",
+                    "to_uri": "viking://user/default/memories/trajectories/target.md",
+                    "link_type": "derived_from",
+                    "match_text": "Target",
+                }
+            ],
+        )
+
+        written = MemoryFileUtils.write(memory_file)
+        parsed = parse_memory_file_with_fields(written)
+
+        assert "_uri" not in parsed
+        assert "[Target](../trajectories/target.md)" in written

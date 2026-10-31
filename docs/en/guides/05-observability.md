@@ -1,40 +1,34 @@
 # Observability & Diagnostics
 
-This guide collects the current OpenViking observability entry points in one place, including:
-
-- service health and component status
-- request-level `telemetry`
-- terminal-side `ov tui`
-- web-side `OpenViking Console`
-
-If you just want to know where to look first, start with the table below.
+Choose an entry point based on the question you need to answer: service readiness, stored data, a single request, or a trend over time.
 
 ## Choose the right entry point
 
 | Entry point | Best for | Typical use case |
 | --- | --- | --- |
-| `/health`, `observer/*` | service health, queue backlog, VikingDB and VLM status | deployment validation, on-call checks |
-| `ov tui` | `viking://` trees, directory summaries, file content, vector records | development debugging, verifying that data actually landed |
-| `OpenViking Console` | web UI for browsing, search, resource import, tenants, and system state | interactive investigation without typing every command |
+| `/health`, `/ready`, `observer/*` | service health, queue backlog, VikingDB and VLM status | deployment validation, on-call checks |
+| `ov tui` | `viking://` trees, directory summaries, file content, vector records, image preview for supported image files | development debugging, verifying that data actually landed |
+| `Web Studio` (`/studio`) | same-origin web UI on the OV server: Home shows token / retrieval / context-commit trends; Resources browses URIs; Retrieval runs find; Request Logs shows audit | interactive investigation without typing every command |
 | `telemetry` | per-request duration, token usage, vector retrieval, ingestion stages | debugging one specific slow or unexpected call |
+| `/metrics` | request trends, error rates, latency distribution, queue and probe state | Prometheus scraping, Grafana dashboards, alert rules |
 
 ## Service health and component status
 
 ### Health check
 
-`/health` provides a simple liveness check and does not require authentication.
+`/health` provides a simple liveness check and does not require authentication. The following response is an excerpt. Use `/ready` for readiness checks. Model observer health alone does not verify provider credentials or request success; see [System Status](../api/07-system.md).
 
 ```bash
 curl http://localhost:1933/health
 ```
 
 ```json
-{"status": "ok"}
+{"status": "ok", "healthy": true}
 ```
 
 ### Overall system status
 
-**Python SDK (Embedded / HTTP)**
+**Python HTTP SDK (`SyncHTTPClient`)**
 
 ```python
 status = client.get_status()
@@ -56,9 +50,12 @@ curl http://localhost:1933/api/v1/observer/system \
     "is_healthy": true,
     "errors": [],
     "components": {
-      "queue": {"name": "queue", "is_healthy": true, "has_errors": false},
-      "vikingdb": {"name": "vikingdb", "is_healthy": true, "has_errors": false},
-      "vlm": {"name": "vlm", "is_healthy": true, "has_errors": false}
+      "queue": {"name": "queue", "is_healthy": true, "has_errors": false, "status": "..."},
+      "vikingdb": {"name": "vikingdb", "is_healthy": true, "has_errors": false, "status": "..."},
+      "models": {"name": "models", "is_healthy": true, "has_errors": false, "status": "..."},
+      "lock": {"name": "lock", "is_healthy": true, "has_errors": false, "status": "..."},
+      "retrieval": {"name": "retrieval", "is_healthy": true, "has_errors": false, "status": "..."},
+      "filesystem": {"name": "filesystem", "is_healthy": true, "has_errors": false, "status": "..."}
     }
   }
 }
@@ -70,7 +67,10 @@ curl http://localhost:1933/api/v1/observer/system \
 | --- | --- | --- |
 | `GET /api/v1/observer/queue` | Queue | Processing queue status |
 | `GET /api/v1/observer/vikingdb` | VikingDB | Vector database status |
-| `GET /api/v1/observer/vlm` | VLM | Vision Language Model status |
+| `GET /api/v1/observer/models` | Models | VLM, embedding, and rerank model status |
+| `GET /api/v1/observer/lock` | Lock | Lock and transaction status |
+| `GET /api/v1/observer/retrieval` | Retrieval | Retrieval counts and latency; not a relevance evaluation |
+| `GET /api/v1/observer/filesystem` | Filesystem | Filesystem operation metrics |
 
 For example:
 
@@ -81,7 +81,7 @@ curl http://localhost:1933/api/v1/observer/queue \
 
 ### Quick health check
 
-**Python SDK (Embedded / HTTP)**
+**Python HTTP SDK (`SyncHTTPClient`)**
 
 ```python
 if client.is_healthy():
@@ -101,11 +101,11 @@ curl http://localhost:1933/api/v1/debug/health \
 
 ### Response time
 
-Every API response includes an `X-Process-Time` header with the server-side processing time in seconds:
+`X-Process-Time` reports seconds from request entry to response-header emission. For streamed responses, it does not include the time needed to send the full body:
 
 ```bash
 curl -v http://localhost:1933/api/v1/fs/ls?uri=viking:// \
-  -H "X-API-Key: your-key" 2>&1 | grep X-Process-Time
+  -H "X-API-Key: your-key" 2>&1 | grep -i X-Process-Time
 # < X-Process-Time: 0.0023
 ```
 
@@ -133,7 +133,8 @@ Prerequisites:
 
 This TUI is useful for two kinds of inspection:
 
-- checking what actually exists under `viking://resources`, `viking://user`, `viking://agent`, and `viking://session`
+- checking what actually exists under `viking://resources` and `viking://user`
+  (sessions live under `viking://user/{user_id}/sessions`)
 - checking whether vector records for a URI were actually written, and how many there are
 
 Common keys:
@@ -150,52 +151,35 @@ Common keys:
 A typical debugging flow is:
 
 1. Run `ov tui viking://resources` and locate the target document or directory.
-2. Confirm the right-side panel shows `abstract`, `overview`, or file content.
+2. Confirm the right-side panel shows `abstract`, `overview`, or file content (supported image files — `png`, `jpg`, `jpeg`, `gif`, `bmp`, `webp`, `tiff`, `tif` — are rendered inline as a preview).
 3. Press `v` to inspect vector records for that URI.
 4. Press `c` to get the total count, and `n` to keep paging if needed.
 
 TUI is primarily for data-plane inspection. It helps answer "did the resource really land?" and "were vectors really written?" but it does not directly show token totals or per-stage request timing.
 
-## Use OpenViking Console for web-based investigation
+## Use Web Studio for web-based investigation
 
-The repo also contains a standalone web console. It is not wired into the main CLI and must be started separately:
-
-```bash
-python -m openviking.console.bootstrap \
-  --host 127.0.0.1 \
-  --port 8020 \
-  --openviking-url http://127.0.0.1:1933
-```
-
-Then open:
+The OV server serves the Web Studio frontend at `/studio` on its own port — no separate process to start.
 
 ```text
-http://127.0.0.1:8020/
+http://127.0.0.1:1933/studio
 ```
 
-On first use, go to `Settings` and set your `X-API-Key`.
+On first use, open the Connection dialog in the top right and set your `X-API-Key`. The base URL defaults to the current same origin (the URL you loaded `/studio` from).
 
-The most useful panels for observability are:
+The most useful pages for observability are:
 
-- `FileSystem`: browse URIs, directories, and files
-- `Find`: run retrieval requests and inspect results
-- `Add Resource`: import resources and inspect responses
-- `Add Memory`: submit content through a session commit and inspect the memory flow
-- `Tenants` / `Monitor`: inspect tenant, user, and system state
+- `Home` (`/studio`): today's token usage, retrieval counts, context-commit trends, agent access summary — backed by the `/api/v1/console/*` BFF
+- `Request Logs` (`/studio/request-logs`): audit logs filterable by account / user / agent / route, backed by `/api/v1/console/audit`
+- `Resources` (`/studio/resources`): browse URIs, view directories and files, upload resources
+- `Retrieval` (`/studio/retrieval`): run find / search / grep requests and inspect results
+- `Sessions` (`/studio/sessions`): browse session history, inspect message and memory commit flow
 
-If you need write operations such as `Add Resource`, `Add Memory`, or tenant/user administration, start the console with `--write-enabled`:
+Write operations (`Add Resource`, `Add Memory`, tenant/user administration) are gated by the API key currently signed in — there's no separate `--write-enabled` switch.
 
-```bash
-python -m openviking.console.bootstrap \
-  --host 127.0.0.1 \
-  --port 8020 \
-  --openviking-url http://127.0.0.1:1933 \
-  --write-enabled
-```
+From an observability standpoint, Studio reads dashboard summaries, token series, context commits, and audit logs through `/api/v1/console/*`. To inspect `telemetry.summary` for operations such as `find`, `add-resource`, and `session commit`, read the complete HTTP response as shown in [Operation Telemetry](07-operation-telemetry.md).
 
-From an observability standpoint, one useful detail is that the console result panel shows raw API responses. For operations such as `find`, `add-resource`, and `session commit`, the proxy layer requests `telemetry` by default, so you can usually inspect `telemetry.summary` directly in the UI.
-
-Console is best for interactive click-through debugging. If you need to feed observability data into your own logs or automation, prefer the HTTP API or SDK and request telemetry explicitly.
+Studio is best for interactive click-through debugging. If you need to feed observability data into your own logs or automation, prefer the HTTP API or SDK and request telemetry explicitly.
 
 ## Request-level telemetry
 
@@ -230,9 +214,368 @@ For the full field reference, supported operations, and more examples, see:
 
 - [Operation Telemetry Reference](07-operation-telemetry.md)
 
+## Generate a local trace and submit it for troubleshooting
+
+If `telemetry.summary` in the response is not enough to diagnose a problem, you can ask OpenViking to write OpenTelemetry traces to a local JSONL file. The user submits the JSONL file and the problematic `trace_id` to an administrator/support engineer, and the administrator uploads it to the troubleshooting environment for analysis. This is useful for offline customer environments, environments that cannot directly reach an OTLP backend, or cases where support needs the exact reproduction trace.
+
+### 1. Enable local trace output
+
+On the machine running OpenViking Server, edit `~/.openviking/ov.conf` (or the config file passed with `--config`) and add or adjust:
+
+```json
+{
+  "server": {
+    "observability": {
+      "traces": {
+        "enabled": true,
+        "protocol": "local",
+        "service_name": "openviking-server",
+        "local_path": "~/.openviking/logs/traces.jsonl",
+        "local_rotation_mb": 40,
+        "local_backup_count": 2
+      }
+    }
+  }
+}
+```
+
+Restart OpenViking Server after editing the config. The default local trace file is:
+
+```text
+~/.openviking/logs/traces.jsonl
+```
+
+When the file reaches `local_rotation_mb`, it rotates like this:
+
+```text
+~/.openviking/logs/traces.jsonl.2
+~/.openviking/logs/traces.jsonl.1
+~/.openviking/logs/traces.jsonl
+```
+
+### 2. Reproduce the issue and confirm that traces were written
+
+After restarting the server, run the operation that reproduces the issue, such as `find`, resource ingestion, `session commit`, or an agent call. When the operation finishes, wait a few seconds, or gracefully stop the server so the batch exporter can flush, then check the file:
+
+```bash
+ls -lh ~/.openviking/logs/traces.jsonl*
+tail -n 3 ~/.openviking/logs/traces.jsonl
+```
+
+If no file is created or the file is empty, check:
+
+- the server was restarted and loaded the updated `ov.conf`
+- `server.observability.traces.enabled` is `true`
+- `server.observability.traces.protocol` is `"local"`
+- the process can write to `~/.openviking/logs`
+
+### 3. Submit the trace file to an administrator
+
+This step is normally split between the **user who submits the evidence** and the **administrator/support engineer who uploads and investigates it**:
+
+1. The user does not need to upload directly to the troubleshooting backend. Submit the local JSONL file to the administrator/support engineer.
+2. If you already know the problematic `trace_id`, submit it together with the JSONL file.
+3. If you do not know the exact `trace_id`, provide the reproduction time window, steps, and related request/error logs so the administrator can locate it in the file.
+
+Submit the current file and rotated files when available:
+
+```text
+~/.openviking/logs/traces.jsonl
+~/.openviking/logs/traces.jsonl.1
+~/.openviking/logs/traces.jsonl.2
+```
+
+You can also package them first:
+
+```bash
+cd ~/.openviking/logs
+tar czf /tmp/openviking-traces.tgz traces.jsonl*
+```
+
+Include the following for the administrator/support engineer:
+
+- the `traces.jsonl*` files, or the packaged `openviking-traces.tgz`
+- the problematic `trace_id`, if known
+- the time window and steps used to reproduce the issue
+- OpenViking version/commit, startup command, and relevant config with secrets removed
+- related error logs or request IDs, if available
+
+#### Administrator upload reference
+
+From the repository root on a machine with the OpenViking source checkout and access to the remote OTLP troubleshooting environment, the administrator runs:
+
+```bash
+python tests/upload_offline_trace.py \
+  --file /path/to/traces.jsonl
+```
+
+The upload tool reads the current environment's `ov.conf` as the **upload target configuration**, so that config must use a remote OTLP trace exporter, for example:
+
+```json
+{
+  "server": {
+    "observability": {
+      "traces": {
+        "enabled": true,
+        "protocol": "grpc",
+        "tls": {
+          "insecure": true
+        },
+        "endpoint": "otel-collector:4317",
+        "service_name": "openviking-server",
+        "headers": {}
+      }
+    }
+  }
+}
+```
+
+If the current `ov.conf` is not the upload target config, prepare a separate upload config and pass it with `--config`:
+
+```bash
+python tests/upload_offline_trace.py \
+  --file /path/to/traces.jsonl \
+  --config /path/to/upload-ov.conf
+```
+
+By default, rotated files are uploaded from old to new, for example `traces.jsonl.2`, `traces.jsonl.1`, and `traces.jsonl`. To upload only the current file:
+
+```bash
+python tests/upload_offline_trace.py \
+  --file /path/to/traces.jsonl \
+  --no-include-rotated
+```
+
+After a successful upload, the tool prints the uploaded trace IDs. The administrator can continue troubleshooting with the `trace_id` submitted by the user or with the reproduction time window:
+
+```text
+Uploaded:
+  batches: 12
+  spans: 345
+  trace_ids: 3
+    0123456789abcdef0123456789abcdef
+    ...
+```
+
+## Use `/metrics` for time-series observability
+
+`/metrics` is OpenViking's time-series metrics endpoint for the Prometheus scraping model. It is well suited for questions like:
+
+- Has HTTP traffic increased abnormally over the last few minutes?
+- Is the error rate for a route or operation continuing to rise?
+- Is latency distribution getting worse?
+- Is queue backlog starting to build up?
+- Have key dependencies, probes, or model providers become unhealthy?
+
+Compared with `observer/*`, `/metrics` is better for **trends, aggregation, and alerting**. `observer/*` is better for inspecting the current point-in-time state by hand.
+
+Compared with `telemetry`, `/metrics` focuses on **aggregated time series**, while `telemetry` focuses on **what happened inside one specific request**.
+
+### Enable metrics quickly
+
+`/metrics` is disabled by default. When the metrics subsystem is not enabled, the endpoint returns `404` with the message `Prometheus metrics are disabled.`.
+
+You do not need the full configuration to get started. Enabling the master switch under the `server` section is enough.
+
+**Minimal config (recommended)**
+
+Add the following to `~/.openviking/ov.conf` (or the path passed via `--config`):
+
+```json
+{
+  "server": {
+    "observability": {
+      "metrics": {
+        "enabled": true
+      }
+    }
+  }
+}
+```
+
+Restart OpenViking Server after editing the config.
+
+### Observability config hierarchy
+
+OpenViking groups signal-level observability configuration under `server.observability`:
+
+- `server.observability.metrics`: metrics subsystem and exporters
+- `server.observability.traces`: trace export configuration
+- `server.observability.logs`: log export configuration
+- `server.observability.dump_body`: attaches HTTP request/response bodies (filtered by content-type, truncated by bytes) as attributes on the active trace span so they can be inspected in trace UIs. Off by default — bodies may contain secrets and high-cardinality content
+- `server.observability.usage_audit`: per-request usage/cost audit log, stored in SQLite. `sqlite_path` overrides the database location (use a per-instance local path for multi-instance deployments); `timezone` controls timestamp localization. Enabled by default
+
+Example:
+
+```json
+{
+  "server": {
+    "observability": {
+      "metrics": {
+        "enabled": true,
+        "exporters": {
+          "prometheus": {
+            "enabled": true
+          },
+          "otel": {
+            "enabled": true,
+            "protocol": "grpc",
+            "tls": {
+              "insecure": true
+            },
+            "endpoint": "otel-collector:4317",
+            "service_name": "openviking-server",
+            "export_interval_ms": 10000,
+            "headers": {}
+          }
+        }
+      },
+      "traces": {
+        "enabled": true,
+        "protocol": "grpc",
+        "tls": {
+          "insecure": true
+        },
+        "endpoint": "otel-collector:4317",
+        "service_name": "openviking-server",
+        "headers": {}
+      },
+      "logs": {
+        "enabled": true,
+        "protocol": "grpc",
+        "tls": {
+          "insecure": true
+        },
+        "endpoint": "otel-collector:4317",
+        "service_name": "openviking-server",
+        "headers": {}
+      },
+      "dump_body": {
+        "enabled": false,
+        "max_bytes": 4096
+      },
+      "usage_audit": {
+        "enabled": true,
+        "sqlite_path": null,
+        "timezone": "local"
+      }
+    }
+  }
+}
+```
+
+Notes:
+
+- `headers` forwards custom OTLP request headers or gRPC metadata to the exporter.
+- This is useful when an OTLP backend requires extra auth headers for direct ingestion.
+- The `headers` shape is the same across `traces`, `logs`, and `metrics.exporters.otel`.
+- When `protocol="grpc"`, `headers` are sent as gRPC metadata and keys should be lowercase, for example `x-byteapm-appkey`; this restriction does not apply to `protocol="http"`.
+
+For full fields, supported ranges, and more examples, see:
+
+- [Metrics](../concepts/12-metrics.md)
+
+### Access `/metrics` directly
+
+When enabled, `/metrics` is an unauthenticated scrape endpoint:
+
+```bash
+curl http://localhost:1933/metrics
+```
+
+If your deployment protects `/metrics` at the gateway, reverse proxy, or service discovery layer, attach auth according to the deployment environment.
+
+### Prometheus scrape example
+
+The most common setup is to let Prometheus scrape it on a schedule:
+
+```yaml
+scrape_configs:
+  - job_name: openviking
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["localhost:1933"]
+```
+
+### Import and view the dashboard in Grafana
+
+Once Prometheus is successfully scraping `/metrics`, the next common step is to import the OpenViking demo dashboard into Grafana.
+
+**Step 1: Confirm that Prometheus is already scraping `/metrics`**
+
+Before importing the dashboard, make sure the Prometheus data source can already query OpenViking metrics. The quickest checks are:
+
+- run `openviking_http_requests_total` in the Prometheus UI
+- or run `openviking_service_readiness`
+- if either query returns time series, scraping works; each dashboard panel still needs its own metric samples and matching filters
+
+If there is no data yet, go back to the Prometheus scrape configuration above and verify `targets`, `metrics_path`, and network connectivity first.
+
+**Step 2: Import the official demo dashboard into Grafana**
+
+The OpenViking repository already includes ready-to-import dashboard JSON:
+
+- [openviking_demo_dashboard.json](https://github.com/volcengine/OpenViking/blob/main/examples/grafana/openviking_demo_dashboard.json)
+- [openviking_token_demo_dashboard.json](https://github.com/volcengine/OpenViking/blob/main/examples/grafana/openviking_token_demo_dashboard.json) (Note: this dashboard depends on the `tim012432-calendarheatmap-panel` Grafana plugin. Install it before importing to ensure panels render correctly.)
+
+You can import it with the following steps:
+
+1. Sign in to Grafana.
+2. Open `Dashboards` from the left-side menu.
+3. Click `New` or `Import` in the top-right corner.
+4. Upload the JSON file, or paste the contents of the linked file.
+5. Select Prometheus as the data source on the import screen.
+6. Click `Import` to finish.
+
+If the dashboard imports but panels are empty, the first two things to verify are:
+
+- whether Grafana is bound to the correct Prometheus data source
+- whether Prometheus is actually scraping `openviking_*` metrics
+
+**Step 3: What to look at after the dashboard opens**
+
+After import, the most useful panels usually come from these metric families:
+
+- `openviking_http_*`: HTTP request volume, latency, and inflight requests
+- `openviking_operation_*`: structured operation success rates and latency
+- `openviking_queue_*`: queue throughput, backlog, and in-progress work
+- `openviking_*_readiness`: dependency and probe health state
+
+A beginner-friendly viewing order is:
+
+1. Start with readiness and health panels to confirm that the system and dependencies are generally healthy.
+2. Move to HTTP and operation panels to see whether traffic, error rates, or latency have changed.
+3. Then inspect queue panels to determine whether async work is backing up.
+4. Finally, narrow the scope with labels such as `account_id`, `route`, and `status`.
+
+**Step 4: What the final result looks like**
+
+After a successful import, you should see a dashboard centered on OpenViking requests, queues, probes, model calls, and overall system state. For a visual reference, see:
+
+- [grafana-demo-dashboard.png](/grafana-demo-dashboard.png)
+
+This screenshot helps you quickly verify whether the imported layout looks correct. If the dashboard structure matches but some panels are empty, it usually means the corresponding metrics have not produced samples yet, or the filters do not match the current traffic.
+
+### Understanding common labels
+
+The most common labels you will use while investigating dashboards are:
+
+- `account_id`: tenant dimension label. It is only enabled on controlled allowlisted metric families. Unidentified requests fall into `__unknown__`, and values beyond the active-tenant budget fall into `__overflow__`
+- `route`: HTTP route template, for example `/api/v1/search/find`
+- `status`: request or stage status, such as `200`, `ok`, or `error`
+- `valid`: whether the sample came from a successful refresh; `valid="0"` usually indicates a fallback or stale sample
+
+### When to use `/metrics` vs. other entry points
+
+- To check whether the service is healthy and which component is currently unhealthy, start with `/health` and `observer/*`
+- To verify whether resources really landed and vectors were actually written, use `ov tui`
+- To inspect why one specific request was slow, where tokens went, or which stage blocked resource processing, use `telemetry`
+- To inspect whether request volume, error rates, or latency are degrading over time, use `/metrics`
+
 ## Related Documentation
 
 - [Deployment](03-deployment.md) - server setup
 - [Authentication](04-authentication.md) - API key setup
 - [Operation Telemetry Reference](07-operation-telemetry.md) - request-level structured tracing
 - [System API](../api/07-system.md) - system and observer API reference
+- [Metrics](../concepts/12-metrics.md) - time-series metrics and configuration

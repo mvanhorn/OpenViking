@@ -6,7 +6,7 @@ Merge operation base classes and registry.
 
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Type, Union
 
 from pydantic import BaseModel, Field
 
@@ -18,6 +18,7 @@ class FieldType(str, Enum):
     INT64 = "int64"
     FLOAT32 = "float32"
     BOOL = "bool"
+    STRING_LIST = "string_list"
 
 
 # ============================================================================
@@ -29,6 +30,7 @@ _FIELD_TYPE_TO_PYTHON: Dict[FieldType, Type[Any]] = {
     FieldType.INT64: int,
     FieldType.FLOAT32: float,
     FieldType.BOOL: bool,
+    FieldType.STRING_LIST: List[str],
 }
 
 
@@ -40,7 +42,7 @@ def get_python_type_for_field(field_type: FieldType, default: Type[Any] = str) -
         default: Default type if field_type is not recognized
 
     Returns:
-        Corresponding Python type (str, int, float, or bool)
+        Corresponding Python type (str, int, float, bool, or List[str])
     """
     return _FIELD_TYPE_TO_PYTHON.get(field_type, default)
 
@@ -55,21 +57,53 @@ class SearchReplaceBlock(BaseModel):
 
     search: str = Field(
         ...,
-        description="Content to search for. ONLY include the EXACT lines you need to change - NEVER include the entire section. Example (WRONG): '## Melanie\\n- line1\\n- line2\\n[50 more lines]'. Example (CORRECT): '- Art can be in the most unlikely places, and love and acceptance really can be found everywhere'",
+        description="The text to replace. Use the smallest unique fragment - usually 2-4 adjacent lines is sufficient. Only include the exact lines that need to change, never the entire section. Preserve the exact indentation from the original. Must be unique in the file. Choose page_id first. SEARCH must be copied exactly from the read result of the file bound to that page_id. Never use SEARCH text from another memory or page. If the read result includes `line_number<TAB>` prefixes, exclude those prefixes from SEARCH. Multi-line SEARCH must be contiguous; split non-adjacent edits into separate blocks.",
     )
-    replace: str = Field(..., description="Content to replace with")
-    start_line: Optional[int] = Field(None, description="Starting line number hint")
+    replace: str = Field(
+        ...,
+        description="Replacement text (must differ from search). Use a DELETE block for complete-line deletion. Never include `line_number<TAB>` prefixes.",
+    )
+
+
+class DeleteBlock(BaseModel):
+    """Delete one or more complete, contiguous lines from a string field."""
+
+    delete: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Exact, unique text of complete, contiguous lines from the target page. Use this "
+            "when other content must remain; delete_ids deletes the whole item. Omit "
+            "`line_number<TAB>` prefixes and surrounding newlines; use separate blocks for "
+            "non-contiguous lines."
+        ),
+    )
+
+    @property
+    def search(self) -> str:
+        """Expose the text through the common patch-block interface."""
+        return self.delete
+
+    @property
+    def replace(self) -> str:
+        """A delete is a replacement with an empty string."""
+        return ""
 
 
 class StrPatch(BaseModel):
-    """String patch containing multiple SEARCH/REPLACE blocks.
+    """String patch containing SEARCH/REPLACE and DELETE blocks.
 
     All string fields with merge_op=patch use this structure.
+
+    IMPORTANT format rules for blocks:
+    - SEARCH/REPLACE: {"search": "old text", "replace": "new text"}
+    - DELETE: {"delete": "one or more complete contiguous lines"}
+    - Each matched text must occur exactly once in the file
     """
 
-    blocks: List[SearchReplaceBlock] = Field(
+    blocks: List[Union[SearchReplaceBlock, DeleteBlock]] = Field(
         default_factory=list,
-        description="List of SEARCH/REPLACE blocks to apply. PREFER direct string replacement over SEARCH/REPLACE when possible. When using SEARCH/REPLACE, only include the specific line(s) to change, never the entire section.",
+        description="SEARCH/REPLACE or DELETE blocks; use DELETE for partial line removal.",
     )
 
     def get_first_replace(self) -> Optional[str]:
@@ -90,6 +124,7 @@ class MergeOp(str, Enum):
     """Merge operation enumeration."""
 
     PATCH = "patch"
+    REPLACE = "replace"
     SUM = "sum"
     IMMUTABLE = "immutable"
 
@@ -124,7 +159,7 @@ class MergeOpBase(ABC):
         pass
 
     @abstractmethod
-    def apply(self, current_value: Any, patch_value: Any) -> Any:
+    async def apply(self, current_value: Any, patch_value: Any) -> Any:
         """Apply this merge operation.
 
         Args:

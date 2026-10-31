@@ -1,10 +1,9 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""
-Patch merge operation - SEARCH/REPLACE for strings, direct replace for others.
-"""
+"""Patch merge operation for strings, direct replacement for other field types."""
 
-from typing import TYPE_CHECKING, Any, Type
+import asyncio
+from typing import Any, Type
 
 from openviking.session.memory.merge_op.base import (
     FieldType,
@@ -15,18 +14,14 @@ from openviking.session.memory.merge_op.base import (
     get_python_type_for_field,
 )
 
-if TYPE_CHECKING:
-    from openviking.session.memory.merge_op.patch_handler import MemoryPatchHandler
-
 
 class PatchOp(MergeOpBase):
-    """Patch merge operation - SEARCH/REPLACE for strings, direct replace for others."""
+    """Apply SEARCH/REPLACE or DELETE blocks to strings."""
 
     op_type = MergeOp.PATCH
 
     def __init__(self, field_type: FieldType):
         self._field_type = field_type
-        self._patch_handler: "MemoryPatchHandler | None" = None
 
     def get_output_schema_type(self, field_type: FieldType) -> Type[Any]:
         if field_type == FieldType.STRING:
@@ -35,10 +30,13 @@ class PatchOp(MergeOpBase):
 
     def get_output_schema_description(self, field_description: str) -> str:
         if self._field_type == FieldType.STRING:
-            return f"PATCH operation for '{field_description}'. Use SEARCH/REPLACE blocks to modify content."
+            return (
+                f"PATCH operation for '{field_description}'. Follow the shared "
+                "SEARCH/REPLACE rules above. Use a DELETE block to remove complete lines."
+            )
         return f"Replace value for '{field_description}'"
 
-    def apply(self, current_value: Any, patch_value: Any) -> Any:
+    async def apply(self, current_value: Any, patch_value: Any) -> Any:
         """
         Apply patch operation.
 
@@ -68,23 +66,39 @@ class PatchOp(MergeOpBase):
 
         # Case 1: StrPatch object - apply patch
         if isinstance(patch_value, StrPatch):
-            return apply_str_patch(current_str, patch_value)
+            # Filter out empty-search blocks when there's existing content.
+            # Empty search with existing content is invalid (can't match empty string
+            # against non-empty content), so skip those blocks.
+            valid_blocks = [b for b in patch_value.blocks if b.search]
+            if valid_blocks:
+                return await asyncio.to_thread(
+                    apply_str_patch,
+                    current_str,
+                    StrPatch(blocks=valid_blocks),
+                )
+            # All blocks have empty search → no valid patches, keep original
+            return current_value
 
         # Case 2: dict form of StrPatch (from JSON parsing)
         if isinstance(patch_value, dict):
-            try:
-                if "blocks" in patch_value:
-                    blocks = []
-                    for block_dict in patch_value["blocks"]:
-                        if isinstance(block_dict, dict):
-                            blocks.append(SearchReplaceBlock(**block_dict))
-                        else:
-                            blocks.append(block_dict)
-                    patch_value = StrPatch(blocks=blocks)
-                    return apply_str_patch(current_str, patch_value)
-            except Exception:
-                # If conversion fails, treat as simple replacement
-                return str(patch_value) if patch_value is not None else ""
+            if "blocks" in patch_value:
+                try:
+                    blocks = StrPatch.model_validate(patch_value).blocks
+                    # Filter out empty-search blocks when there's existing content
+                    valid_blocks = [b for b in blocks if b.search]
+                    converted_patch = StrPatch(blocks=valid_blocks) if valid_blocks else None
+                except Exception:
+                    # If conversion fails, treat as simple replacement
+                    return str(patch_value) if patch_value is not None else ""
+
+                if converted_patch is not None:
+                    return await asyncio.to_thread(
+                        apply_str_patch,
+                        current_str,
+                        converted_patch,
+                    )
+                # All blocks have empty search → keep original
+                return current_value
 
         # Case 3: Simple full replacement
         # 空字符串和 None 都保持原值
@@ -105,21 +119,28 @@ class PatchOp(MergeOpBase):
         Returns:
             The replace content, or empty string if not available
         """
-        from openviking.session.memory.merge_op.base import StrPatch
-
-        # Case 1: StrPatch object
+        # Case 1: StrPatch object — concatenate ALL blocks' replace content.
+        # The schema instructs the model to split non-adjacent edits into
+        # separate blocks, so a new memory routinely arrives as a multi-block
+        # patch. Taking only blocks[0] would silently drop every subsequent
+        # fact/preference the model extracted.
         if isinstance(patch_value, StrPatch):
-            replace = patch_value.get_first_replace()
-            return replace if replace is not None else ""
+            replaces = [b.replace for b in patch_value.blocks if b.replace is not None]
+            return "\n".join(replaces) if replaces else ""
 
-        # Case 2: dict form
+        # Case 2: dict form (from JSON parsing) — same, collect every block.
         if isinstance(patch_value, dict) and "blocks" in patch_value:
-            blocks = patch_value.get("blocks", [])
-            if blocks:
-                first_block = blocks[0]
-                if isinstance(first_block, dict):
-                    replace = first_block.get("replace")
-                    return replace if replace is not None else ""
+            replaces = []
+            for block in patch_value.get("blocks", []):
+                if isinstance(block, SearchReplaceBlock):
+                    replace = block.replace
+                elif isinstance(block, dict):
+                    replace = block.get("replace")
+                else:
+                    replace = None
+                if replace is not None:
+                    replaces.append(replace)
+            return "\n".join(replaces) if replaces else ""
 
         # Case 3: Simple string - use as is
         if isinstance(patch_value, str):

@@ -8,8 +8,10 @@ to EmbeddingMsg objects for asynchronous vector processing.
 """
 
 from openviking.core.context import Context, ContextLevel
+from openviking.core.namespace import owner_fields_for_uri
+from openviking.storage.index_action import IndexAction
 from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
-from openviking.telemetry import get_current_telemetry
+from openviking.telemetry import get_current_telemetry, get_ingestion_source_type
 from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
@@ -19,39 +21,46 @@ class EmbeddingMsgConverter:
     """Converter for Context objects to EmbeddingMsg."""
 
     @staticmethod
-    def from_context(context: Context) -> EmbeddingMsg:
+    def from_context(
+        context: Context,
+        action: IndexAction = IndexAction.MERGE,
+        *,
+        telemetry_id: str | None = None,
+    ) -> EmbeddingMsg | None:
         """
         Convert a Context object to EmbeddingMsg.
+
+        Context-based producers normally carry only the fields they just
+        generated.  They therefore default to ``MERGE`` so an execution-time
+        exact read retains stored scalar state such as tags and ACLs.  Producers
+        with a fully resolved record (notably an RNFV SemanticPlan) must pass
+        ``UPSERT`` explicitly.
         """
         vectorization_text = context.get_vectorization_text()
-        if not vectorization_text:
+        vectorization_images = context.get_vectorization_images()
+        if not vectorization_text and not vectorization_images:
             return None
 
         context_data = context.to_dict()
 
-        # Backfill tenant fields for legacy writers that only set user/uri.
-        if not context_data.get("account_id"):
-            user = context_data.get("user") or {}
-            context_data["account_id"] = user.get("account_id", "default")
-        if not context_data.get("owner_space"):
-            user = context_data.get("user") or {}
-            uri = context_data.get("uri", "")
-            account = user.get("account_id", "default")
-            user_id = user.get("user_id", "default")
-            agent_id = user.get("agent_id", "default")
-            from openviking_cli.session.user_id import UserIdentifier
-
-            owner_user = UserIdentifier(account, user_id, agent_id)
-            if uri.startswith("viking://agent/"):
-                context_data["owner_space"] = owner_user.agent_space_name()
-            elif uri.startswith("viking://user/") or uri.startswith("viking://session/"):
-                context_data["owner_space"] = owner_user.user_space_name()
-            else:
-                context_data["owner_space"] = ""
-
-        # Derive level field for hierarchical retrieval.
+        # Account identity is required at the queue boundary. Do not silently
+        # route a malformed or legacy message to the default Account.
+        if not isinstance(context_data.get("account_id"), str) or not context_data[
+            "account_id"
+        ].strip():
+            raise ValueError("Embedding context requires account_id")
         uri = context_data.get("uri", "")
-        context_level = getattr(context, "level", None)
+        owner_fields = None
+        if uri:
+            owner_fields = owner_fields_for_uri(uri)
+            context_data["uri"] = owner_fields["uri"]
+        if context_data.get("owner_user_id") is None:
+            if owner_fields is not None:
+                context_data["owner_user_id"] = owner_fields["owner_user_id"]
+
+        # Derive the level field used by retrieval filters.
+        uri = context_data.get("uri", "")
+        context_level = context.level
         if context_level is not None:
             resolved_level = context_level
         elif context_data.get("level") is not None:
@@ -69,9 +78,28 @@ class EmbeddingMsgConverter:
             resolved_level = int(resolved_level.value)
         context_data["level"] = int(resolved_level)
 
-        embedding_msg = EmbeddingMsg(
-            message=vectorization_text,
+        if vectorization_images:
+            # Multimodal message: combine text (if any) and image references into the
+            # multimodal embedding input format. Image-aware embedders consume this list;
+            # text-only embedders fall back to the text part.
+            parts = []
+            if vectorization_text:
+                parts.append({"type": "text", "text": vectorization_text})
+            for image_ref in vectorization_images:
+                parts.append({"type": "image_url", "image_url": {"url": image_ref}})
+            message = parts
+        else:
+            message = vectorization_text
+
+        source_type = get_ingestion_source_type()
+
+        embedding_msg = EmbeddingMsg.for_embed(
+            message=message,
             context_data=context_data,
-            telemetry_id=get_current_telemetry().telemetry_id,
+            telemetry_id=(
+                get_current_telemetry().telemetry_id if telemetry_id is None else telemetry_id
+            ),
+            action=action,
+            source_type=source_type or "",
         )
         return embedding_msg

@@ -4,8 +4,8 @@ import asyncio
 import io
 import json
 import re
-import tempfile
 import threading
+import time
 from collections import OrderedDict
 from typing import Any
 
@@ -13,7 +13,7 @@ import httpx
 from loguru import logger
 
 from vikingbot.config import load_config
-from vikingbot.utils import get_data_path
+from vikingbot.utils import detect_image_format, get_data_path
 
 # Optional HTML processing libraries
 try:
@@ -31,22 +31,28 @@ except ImportError:
 from vikingbot.bus.events import OutboundMessage
 from vikingbot.bus.queue import MessageBus
 from vikingbot.channels.base import BaseChannel
-from vikingbot.config.schema import FeishuChannelConfig, BotMode
+from vikingbot.config.schema import BotMode, Config, FeishuChannelConfig
+from vikingbot.utils.image_format import sniff_image_format
+from vikingbot.utils.session_paths import workspace_name
 
 try:
     import lark_oapi as lark
+    from lark_oapi.api.contact.v3 import (
+        GetUserRequest,
+    )
     from lark_oapi.api.im.v1 import (
         CreateMessageReactionRequest,
         CreateMessageReactionRequestBody,
         CreateMessageRequest,
         CreateMessageRequestBody,
         Emoji,
+        GetChatMembersRequest,
         GetChatRequest,
         GetImageRequest,
         GetMessageResourceRequest,
         P2ImMessageReceiveV1,
         ReplyMessageRequest,
-        ReplyMessageRequestBody
+        ReplyMessageRequestBody,
     )
 
     FEISHU_AVAILABLE = True
@@ -55,6 +61,8 @@ except ImportError:
     lark = None
     Emoji = None
     GetImageRequest = None
+    GetUserRequest = None
+    GetChatMembersRequest = None
 
 # Message type display mapping
 MSG_TYPE_MAP = {
@@ -63,6 +71,9 @@ MSG_TYPE_MAP = {
     "file": "[file]",
     "sticker": "[sticker]",
 }
+
+# Pre-compiled regex patterns
+OPEN_ID_MENTION_PATTERN = re.compile(r"@ou_[a-f0-9]+")
 
 
 class FeishuChannel(BaseChannel):
@@ -89,9 +100,17 @@ class FeishuChannel(BaseChannel):
         "EatingFood",
     ]
 
-    def __init__(self, config: FeishuChannelConfig, bus: MessageBus, **kwargs):
+    def __init__(
+        self,
+        config: FeishuChannelConfig,
+        bus: MessageBus,
+        *,
+        bot_config: Config | None = None,
+        **kwargs,
+    ):
         super().__init__(config, bus, **kwargs)
         self.config: FeishuChannelConfig = config
+        self._bot_config = bot_config
         self._client: Any = None
         self._ws_client: Any = None
         self._ws_thread: threading.Thread | None = None
@@ -100,18 +119,26 @@ class FeishuChannel(BaseChannel):
         self._tenant_access_token: str | None = None
         self._token_expire_time: float = 0
         self._chat_mode_cache: dict[str, str] = {}  # 缓存群类型：group(普通群)/thread(话题群)
+        self._user_name_cache: OrderedDict[str, str] = OrderedDict()  # LRU缓存用户ID到姓名的映射
+        self._chat_member_cache: OrderedDict[str, dict[str, Any]] = (
+            OrderedDict()
+        )  # chat_id -> {members, expires_at, last_error_at}
+        self._MAX_USER_CACHE_SIZE = 1000  # 最大缓存1000个用户
+        self._CHAT_MEMBER_CACHE_TTL_SEC = 300
+        self._CHAT_MEMBER_CACHE_MAX_CHATS = 30
+        self._CHAT_MEMBER_FETCH_COOLDOWN_SEC = 60
+        self._CHAT_MEMBER_FETCH_PAGE_SIZE = 100
+        self._CHAT_MEMBER_FETCH_MAX_PAGES = 500
 
     async def _get_tenant_access_token(self) -> str:
         """Get tenant access token for Feishu API."""
-        import time
-
         now = time.time()
         if (
             self._tenant_access_token and now < self._token_expire_time - 60
         ):  # Refresh 1 min before expire
             return self._tenant_access_token
 
-        url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+        url = f"{self.config.domain}/open-apis/auth/v3/tenant_access_token/internal"
         payload = {"app_id": self.config.app_id, "app_secret": self.config.app_secret}
 
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -130,23 +157,85 @@ class FeishuChannel(BaseChannel):
         Upload image to Feishu media library and get image_key.
         """
 
+        if not image_data:
+            raise ValueError("Feishu image upload requires a non-empty image")
+
         token = await self._get_tenant_access_token()
-        url = "https://open.feishu.cn/open-apis/im/v1/images"
+        url = f"{self.config.domain}/open-apis/im/v1/images"
 
         headers = {"Authorization": f"Bearer {token}"}
-
-        # Use io.BytesIO properly
-        files = {"image": ("image.png", io.BytesIO(image_data), "image/png")}
         data = {"image_type": "message"}
 
+        async def post_image(client: httpx.AsyncClient, upload_data: bytes) -> httpx.Response:
+            image_format = detect_image_format(upload_data)
+            files = {
+                "image": (
+                    f"image.{image_format.extension}",
+                    io.BytesIO(upload_data),
+                    image_format.mime_type,
+                )
+            }
+            return await client.post(url, headers=headers, data=data, files=files)
+
         async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(url, headers=headers, data=data, files=files)
-            # logger.debug(f"Upload response status: {resp.status_code}")
-            resp.raise_for_status()
+            upload_data = image_data
+            resp = await post_image(client, upload_data)
+
+            if resp.status_code == 400:
+                normalized = self._normalize_image_for_feishu(image_data)
+                if normalized != image_data:
+                    logger.warning(
+                        "Retrying Feishu image upload after re-encoding image "
+                        f"({len(image_data)} -> {len(normalized)} bytes)"
+                    )
+                    upload_data = normalized
+                    resp = await post_image(client, upload_data)
+
+            if resp.is_error:
+                raise Exception(
+                    "Failed to upload image to Feishu: "
+                    f"status={resp.status_code}, body={resp.text}, "
+                    f"image_size={len(upload_data)}"
+                )
+
             result = resp.json()
             if result.get("code") != 0:
-                raise Exception(f"Failed to upload image: {result}")
+                raise Exception(
+                    f"Failed to upload image to Feishu: response={result}, "
+                    f"image_size={len(upload_data)}"
+                )
             return result["data"]["image_key"]
+
+    @staticmethod
+    def _normalize_image_for_feishu(image_data: bytes) -> bytes:
+        """Re-encode an image to strip metadata that Feishu may reject."""
+        try:
+            from PIL import Image, ImageOps
+        except ImportError:
+            logger.warning("Pillow is not installed; cannot normalize image for Feishu upload")
+            return image_data
+
+        try:
+            with Image.open(io.BytesIO(image_data)) as source:
+                image = ImageOps.exif_transpose(source)
+                if image.mode in ("RGBA", "LA") or (
+                    image.mode == "P" and "transparency" in image.info
+                ):
+                    rgba = image.convert("RGBA")
+                    background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+                    image = Image.alpha_composite(background, rgba).convert("RGB")
+                elif image.mode not in ("RGB", "L"):
+                    image = image.convert("RGB")
+                else:
+                    image = image.copy()
+
+            output = io.BytesIO()
+            image.save(output, format="JPEG", quality=92, optimize=True)
+            normalized = output.getvalue()
+            return normalized if normalized else image_data
+        except Exception as exc:
+            logger.warning(f"Failed to normalize image for Feishu upload: {exc}")
+            return image_data
 
     async def _download_feishu_image(self, image_key: str, message_id: str | None = None) -> bytes:
         """
@@ -173,23 +262,13 @@ class FeishuChannel(BaseChannel):
 
         # Handle failed response
         if not response.success():
-            raw_detail = getattr(getattr(response, 'raw', None), 'content', response.msg)
+            raw_detail = getattr(getattr(response, "raw", None), "content", response.msg)
             raise Exception(
                 f"Failed to download image: code={response.code}, msg={raw_detail}, log_id={response.get_log_id()}"
             )
 
         # Read the image bytes from the response file
         return response.file.read()
-
-    async def _save_image_to_temp(self, image_bytes: bytes) -> str:
-        """
-        Save image bytes to a temporary file and return the path.
-        """
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-            f.write(image_bytes)
-            temp_path = f.name
-
-        return temp_path
 
     async def _get_chat_mode(self, chat_id: str) -> str:
         """获取群类型：group(普通群)/thread(话题群)"""
@@ -200,14 +279,15 @@ class FeishuChannel(BaseChannel):
             return "group"  # 默认普通群
 
         try:
-            request: GetChatRequest = GetChatRequest.builder() \
-                .chat_id(chat_id) \
-                .user_id_type("open_id") \
-                .build()
+            request: GetChatRequest = (
+                GetChatRequest.builder().chat_id(chat_id).user_id_type("open_id").build()
+            )
             response = await self._client.im.v1.chat.aget(request)
             # 处理失败返回
             if not response.success():
-                logger.warning(f"client.im.v1.chat.get failed, code: {response.code}, msg: {response.msg}, log_id: {response.get_log_id()}")
+                logger.warning(
+                    f"client.im.v1.chat.get failed, code: {response.code}, msg: {response.msg}, log_id: {response.get_log_id()}"
+                )
                 return "group"
 
             # 处理业务结果
@@ -227,11 +307,17 @@ class FeishuChannel(BaseChannel):
 
         return "group"  # 失败默认普通群
 
+    def _is_bot_mention(self, mention) -> bool:
+        bot_id = getattr(self, "bot_open_id", None)
+        if bot_id:
+            return getattr(getattr(mention, "id", None), "open_id", None) == bot_id
+        return bool(self.config.bot_name and getattr(mention, "name", "") == self.config.bot_name)
+
     async def start(self) -> None:
         """Start the Feishu bot with WebSocket long connection."""
         if not FEISHU_AVAILABLE:
             logger.exception(
-                "Feishu SDK not installed. Install with: uv pip install 'openviking[bot-feishu]' (or uv pip install -e \".[bot-feishu]\" for local dev)"
+                "Feishu SDK not installed. Install with: uv pip install lark-oapi>=1.0.0"
             )
             return
 
@@ -247,6 +333,7 @@ class FeishuChannel(BaseChannel):
             lark.Client.builder()
             .app_id(self.config.app_id)
             .app_secret(self.config.app_secret)
+            .domain(self.config.domain)
             .log_level(lark.LogLevel.INFO)
             .build()
         )
@@ -266,6 +353,7 @@ class FeishuChannel(BaseChannel):
             self.config.app_id,
             self.config.app_secret,
             event_handler=event_handler,
+            domain=self.config.domain,
             log_level=lark.LogLevel.INFO,
         )
 
@@ -449,106 +537,45 @@ class FeishuChannel(BaseChannel):
 
         return elements or [{"tag": "markdown", "content": content}]
 
-    async def _process_content_with_images(
-        self, content: str, receive_id_type: str, chat_id: str
-    ) -> list[dict]:
-        """
-        Process content, extract and upload Markdown images, return card elements.
-
-        Returns: list of card elements (markdown + img elements)
-        """
-        # Extract images from Markdown
-        images = []
-        markdown_pattern = r"!\[([^\]]*)\]\((send://[^)\s]+\.(png|jpeg|jpg|gif|bmp|webp))\)"
-        # Find all images and upload them
-        for m in re.finditer(markdown_pattern, content):
-            alt_text = m.group(1) or ""
-            img_url = m.group(2)
-            try:
-                is_content, result = await self._parse_data_uri(img_url)
-
-                if not is_content and isinstance(result, bytes):
-                    # It's an image - upload
-                    image_key = await self._upload_image_to_feishu(result)
-                    images.append({"alt": alt_text, "img_key": image_key})
-            except Exception as e:
-                logger.exception(f"Failed to upload Markdown image {img_url[:100]}: {e}")
-        content = re.sub(markdown_pattern, "", content)
-
-        # Pattern: ![alt](url)
-        send_pattern = r"(send://[^)\s]+\.(png|jpeg|jpg|gif|bmp|webp))\)?"
-        # Find all images and upload them
-        for m in re.finditer(send_pattern, content):
-            img_url = m.group(1) or ""
-            try:
-                is_content, result = await self._parse_data_uri(img_url)
-
-                if not is_content and isinstance(result, bytes):
-                    # It's an image - upload
-                    image_key = await self._upload_image_to_feishu(result)
-                    images.append({"img_key": image_key})
-            except Exception as e:
-                logger.exception(f"Failed to upload Markdown image {img_url[:100]}: {e}")
-
-        # Remove all ![alt](url) from content
-        content_no_images = re.sub(send_pattern, "", content)
-
-        elements = []
-        if content_no_images.strip():
-            elements = self._build_card_elements(content_no_images)
-
-        # Add image elements
-        for img in images:
-            elements.append(
-                {
-                    "tag": "img",
-                    "img_key": img["img_key"],
-                    "alt": {"tag": "plain_text", "content": ""},
-                }
-            )
-
-        if not elements:
-            elements = [{"tag": "markdown", "content": content_no_images}]
-
-        return elements
-
-    async def send(self, msg: OutboundMessage) -> None:
+    async def send(self, msg: OutboundMessage) -> bool:
         """Send a message through Feishu."""
         # 先调用基类处理通用动作
         if await super().send(msg):
-            return
+            return False
 
         if not self._client:
             logger.warning("Feishu client not initialized")
-            return
+            return False
 
         # Only send normal response messages, skip thinking/tool_call/etc.
         if not msg.is_normal_message:
-            return
+            return False
 
         try:
             # logger.info(f"Sending message {msg}")
             # Determine receive_id_type based on chat_id format
             # open_id starts with "ou_", chat_id starts with "oc_"
             reply_to = msg.metadata.get("reply_to")
+            if not isinstance(reply_to, str) or not reply_to:
+                logger.warning(
+                    f"Skipping Feishu message without reply_to metadata: session={msg.session_key}"
+                )
+                return False
             if reply_to.startswith("oc_"):
                 receive_id_type = "chat_id"
             else:
                 receive_id_type = "open_id"
 
             # Process images and get cleaned content
-            cleaned_content, images = await self._extract_and_upload_images(msg.content)
+            cleaned_content, images = await self._extract_and_upload_images(msg.content, msg)
 
             content_with_mentions = cleaned_content
 
             # --- Build interactive card with markdown rendering ---
-            reply_to_message_id = None
             original_sender_id = None
             chat_type = "group"
+            reply_to_message_id = self._reply_to_message_id_from_metadata(msg.metadata)
             if msg.metadata:
-                reply_to_message_id = msg.metadata.get("reply_to_message_id") or msg.metadata.get(
-                    "message_id"
-                )
                 original_sender_id = msg.metadata.get("sender_id")
                 chat_type = msg.metadata.get("chat_type", "group")
 
@@ -592,14 +619,9 @@ class FeishuChannel(BaseChannel):
 
             if reply_to_message_id:
                 # Reply to existing message (quotes the original)
-                # Only reply in thread if the original message is in a topic (has root_id and is a thread)
-                should_reply_in_thread = False
-                if msg.metadata:
-                    root_id = msg.metadata.get("root_id")
-                    # Only use reply_in_thread=True if this is an actual topic group thread
-                    # In Feishu, topic groups have root_id set for messages in threads
-                    # root_id will be set if the message is already part of a thread
-                    should_reply_in_thread = root_id is not None and root_id != reply_to_message_id
+                should_reply_in_thread = self._should_reply_in_thread(
+                    msg.metadata, reply_to_message_id, msg.session_key.chat_id
+                )
 
                 request = (
                     ReplyMessageRequest.builder()
@@ -643,8 +665,52 @@ class FeishuChannel(BaseChannel):
                         f"msg={response.msg}, log_id={response.get_log_id()}"
                     )
 
+            return response.success()
+
         except Exception as e:
             logger.exception(f"Error sending Feishu message: {e}")
+            return False
+
+    @staticmethod
+    def _reply_to_message_id_from_metadata(metadata: dict[str, Any] | None) -> str | None:
+        """Resolve the Feishu message id to reply to, including scheduled thread delivery."""
+        if not metadata:
+            return None
+
+        for key in ("reply_to_message_id", "message_id"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value:
+                return value
+
+        root_id = metadata.get("root_id")
+        if metadata.get("chat_mode") == "thread" and isinstance(root_id, str) and root_id:
+            return root_id
+
+        return None
+
+    @staticmethod
+    def _should_reply_in_thread(
+        metadata: dict[str, Any] | None,
+        reply_to_message_id: str,
+        session_chat_id: str | None = None,
+    ) -> bool:
+        """Return whether Feishu reply API should create a topic-thread reply."""
+        if not metadata:
+            return False
+
+        if metadata.get("chat_type") != "group":
+            return False
+
+        # Normal group quoted replies can also carry root_id/parent_id. Only topic groups
+        # should use reply_in_thread, otherwise Feishu turns a normal quoted reply into a thread.
+        is_thread_chat = metadata.get("chat_mode") == "thread" or (
+            bool(session_chat_id) and "#" in session_chat_id
+        )
+        if not is_thread_chat:
+            return False
+
+        root_id = metadata.get("root_id")
+        return bool(root_id and root_id != reply_to_message_id)
 
     def _on_message_sync(self, data: "P2ImMessageReceiveV1") -> None:
         """
@@ -657,7 +723,9 @@ class FeishuChannel(BaseChannel):
     async def _download_and_save_image(self, image_key: str, message_id: str) -> str | None:
         """Download single Feishu image and save to local, return file path or None if failed."""
         try:
-            logger.info(f"Downloading Feishu image with image_key: {image_key}, message_id: {message_id}")
+            logger.info(
+                f"Downloading Feishu image with image_key: {image_key}, message_id: {message_id}"
+            )
             image_bytes = await self._download_feishu_image(image_key, message_id)
             if not image_bytes:
                 logger.warning(f"Could not download image for image_key: {image_key}")
@@ -667,6 +735,7 @@ class FeishuChannel(BaseChannel):
             media_dir.mkdir(parents=True, exist_ok=True)
 
             import uuid
+
             file_path = media_dir / f"feishu_{uuid.uuid4().hex[:16]}.png"
             file_path.write_bytes(image_bytes)
 
@@ -675,10 +744,13 @@ class FeishuChannel(BaseChannel):
         except Exception as e:
             logger.warning(f"Failed to download Feishu image {image_key}: {e}")
             import traceback
+
             logger.debug(f"Stack trace: {traceback.format_exc()}")
             return None
 
-    async def _parse_message_content(self, message: Any, msg_type: str, message_id: str) -> tuple[str, list[str]]:
+    async def _parse_message_content(
+        self, message: Any, msg_type: str, message_id: str
+    ) -> tuple[str, list[str]]:
         """Parse message content and extract media files."""
         content = ""
         media = []
@@ -722,44 +794,175 @@ class FeishuChannel(BaseChannel):
                 # Download images in parallel
                 if image_keys:
                     download_tasks = [
-                        self._download_and_save_image(img_key, message_id)
-                        for img_key in image_keys
+                        self._download_and_save_image(img_key, message_id) for img_key in image_keys
                     ]
                     results = await asyncio.gather(*download_tasks)
                     media = [path for path in results if path is not None]
 
             except Exception as e:
                 logger.warning(f"Failed to process {msg_type} message: {e}")
+        elif msg_type == "interactive":
+            content = message.content
         else:
             content = MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]")
 
         return content, media
 
-    async def _check_should_process(self, chat_type: str, chat_id: str, message: Any, is_mentioned: bool) -> bool:
+    async def _check_should_process(
+        self, chat_type: str, chat_id: str, message: Any, is_mentioned: bool
+    ) -> bool:
         """Check if message should be processed based on group/thread rules."""
         if chat_type != "group":
             return True
 
         chat_mode = await self._get_chat_mode(chat_id)
-        if chat_mode != "thread":
-            return True
 
-        # 话题群处理逻辑
-        is_topic_starter = message.root_id == message.message_id or not message.root_id
-
+        # 普通群和话题群都根据 thread_require_mention 判断
         if self.config.thread_require_mention:
-            # 模式1：所有消息都需要@才处理
+            # 模式1：所有消息都需要@才处理（普通群和话题群）
             if not is_mentioned:
-                logger.info(f"Skipping thread message: thread_require_mention is True and not mentioned")
                 return False
         else:
-            # 模式2：仅话题首条消息不需要@，后续回复需要@（DEBUG模式除外）
-            config = load_config()
-            if not is_topic_starter and not is_mentioned and config.mode != BotMode.DEBUG:
-                logger.info(f"Skipping thread message: not topic starter and not mentioned")
-                return False
+            # 模式2：话题群仅首条消息不需要@，后续回复需要@
+            if chat_mode == "thread":
+                is_topic_starter = message.root_id == message.message_id or not message.root_id
+                config = load_config()
+                if not is_topic_starter and not is_mentioned and config.mode != BotMode.DEBUG:
+                    return False
+            # 普通群不需要@，直接处理
 
         return True
+
+    def _save_user_name_cache(self, open_id: str, name: str) -> None:
+        if open_id in self._user_name_cache:
+            self._user_name_cache.pop(open_id)
+        elif len(self._user_name_cache) >= self._MAX_USER_CACHE_SIZE:
+            self._user_name_cache.popitem(last=False)
+        self._user_name_cache[open_id] = name
+
+    def _get_cached_user_name(self, open_id: str) -> str | None:
+        if open_id not in self._user_name_cache:
+            return None
+        name = self._user_name_cache.pop(open_id)
+        self._user_name_cache[open_id] = name
+        return name
+
+    def _save_chat_member_cache(
+        self, chat_id: str, members: dict[str, str], last_error_at: float = 0
+    ) -> None:
+        if chat_id in self._chat_member_cache:
+            self._chat_member_cache.pop(chat_id)
+        elif len(self._chat_member_cache) >= self._CHAT_MEMBER_CACHE_MAX_CHATS:
+            self._chat_member_cache.popitem(last=False)
+
+        ttl = (
+            self._CHAT_MEMBER_FETCH_COOLDOWN_SEC
+            if last_error_at
+            else self._CHAT_MEMBER_CACHE_TTL_SEC
+        )
+        self._chat_member_cache[chat_id] = {
+            "members": members,
+            "expires_at": time.time() + ttl,
+            "last_error_at": last_error_at,
+        }
+
+    async def _fetch_chat_members(self, chat_id: str) -> dict[str, str]:
+        if not self._client or not GetChatMembersRequest:
+            return {}
+
+        members: dict[str, str] = {}
+        page_token = ""
+
+        for _ in range(self._CHAT_MEMBER_FETCH_MAX_PAGES):
+            request_builder = (
+                GetChatMembersRequest.builder()
+                .chat_id(chat_id)
+                .member_id_type("open_id")
+                .page_size(self._CHAT_MEMBER_FETCH_PAGE_SIZE)
+            )
+            if page_token:
+                request_builder = request_builder.page_token(page_token)
+            request = request_builder.build()
+            response = await self._client.im.v1.chat_members.aget(request)
+            if not response.success():
+                raise RuntimeError(
+                    f"client.im.v1.chat_members.get failed, code: {response.code}, msg: {response.msg}, log_id: {response.get_log_id()}"
+                )
+
+            data = response.data
+            items = getattr(data, "items", []) if data else []
+            for item in items:
+                member_id = getattr(item, "member_id", "")
+                name = getattr(item, "name", "")
+                if member_id and name:
+                    members[member_id] = name
+
+            has_more = bool(getattr(data, "has_more", False)) if data else False
+            next_page_token = getattr(data, "page_token", "") if data else ""
+            if not has_more or not next_page_token:
+                break
+            page_token = next_page_token
+
+        return members
+
+    async def _get_group_member_name(self, chat_id: str, open_id: str) -> str | None:
+        now = time.time()
+        entry = self._chat_member_cache.get(chat_id)
+
+        if entry:
+            self._chat_member_cache.move_to_end(chat_id)
+            members = entry.get("members", {})
+            if entry.get("expires_at", 0) > now:
+                return members.get(open_id)
+            if (
+                now - float(entry.get("last_error_at", 0) or 0)
+                < self._CHAT_MEMBER_FETCH_COOLDOWN_SEC
+            ):
+                return members.get(open_id)
+
+        try:
+            members = await self._fetch_chat_members(chat_id)
+            self._save_chat_member_cache(chat_id, members)
+            return members.get(open_id)
+        except Exception as e:
+            logger.warning(f"Failed to get chat members for {chat_id}: {e}")
+            stale_members: dict[str, str] = {}
+            if entry:
+                stale_members = entry.get("members", {})
+            self._save_chat_member_cache(chat_id, stale_members, last_error_at=now)
+            return stale_members.get(open_id)
+
+    async def _get_user_name(self, open_id: str, chat_id: str | None = None) -> str | None:
+        """
+        Get user name from Feishu API by open_id.
+        Returns user name if found, None otherwise.
+        Uses LRU cache to avoid memory issues.
+        """
+        cached_name = self._get_cached_user_name(open_id)
+        if cached_name:
+            return cached_name
+
+        try:
+            if GetUserRequest:
+                user_request = (
+                    GetUserRequest.builder().user_id(open_id).user_id_type("open_id").build()
+                )
+                user_response = self._client.contact.v3.user.get(user_request)
+                if user_response.success() and user_response.data and user_response.data.user:
+                    name = user_response.data.user.name
+                    if name:
+                        self._save_user_name_cache(open_id, name)
+                        return name
+        except Exception as e:
+            logger.warning(f"Failed to get user name for {open_id}: {e}")
+
+        if chat_id:
+            member_name = await self._get_group_member_name(chat_id, open_id)
+            if member_name:
+                self._save_user_name_cache(open_id, member_name)
+                return member_name
+
+        return None
 
     async def _on_message(self, data: "P2ImMessageReceiveV1") -> None:
         """Handle incoming message from Feishu."""
@@ -775,7 +978,10 @@ class FeishuChannel(BaseChannel):
             self._processed_message_ids[message_id] = None
 
             # 定期清理去重缓存（每100条清理一次，减少开销）
-            if len(self._processed_message_ids) % 100 == 0 and len(self._processed_message_ids) > 1000:
+            if (
+                len(self._processed_message_ids) % 100 == 0
+                and len(self._processed_message_ids) > 1000
+            ):
                 while len(self._processed_message_ids) > 500:
                     self._processed_message_ids.popitem(last=False)
 
@@ -800,28 +1006,58 @@ class FeishuChannel(BaseChannel):
 
             # 5. 检查是否被@
             is_mentioned = False
-            bot_name = self.config.bot_name
-            if hasattr(message, 'mentions') and message.mentions and bot_name:
+            if hasattr(message, "mentions") and message.mentions:
                 for mention in message.mentions:
-                    if hasattr(mention, 'name') and mention.name == bot_name:
+                    if self._is_bot_mention(mention):
                         is_mentioned = True
                         break
 
             # 6. 检查是否需要处理该消息
-            should_process = await self._check_should_process(chat_type, chat_id, message, is_mentioned)
+            should_process = await self._check_should_process(
+                chat_type, chat_id, message, is_mentioned
+            )
 
             # 7. 添加已读表情
-            config = load_config()
-            if config.mode != BotMode.DEBUG and should_process:
-                await self._add_reaction(message_id, "MeMeMe")
+            if should_process:
+                config = load_config()
+                if config.mode != BotMode.DEBUG:
+                    await self._add_reaction(message_id, "MeMeMe")
 
-            # 8. 处理@占位符
-            mention_pattern = re.compile(r"@_user_\d+")
-            content = mention_pattern.sub(f"@{sender_id}", content)
+            # 8. 处理@占位符：从 message.mentions 中直接获取 name 和 id
+            mention_name_map = {}
+            if hasattr(message, "mentions") and message.mentions:
+                for idx, mention in enumerate(message.mentions):
+                    placeholder = f"@_user_{idx + 1}"
+                    if placeholder not in content:
+                        continue
+                    mention_name = getattr(mention, "name", "")
+                    if self._is_bot_mention(mention):
+                        content = content.replace(placeholder, "")
+                        continue
+                    if hasattr(mention, "id") and mention.id:
+                        user_id = mention.id.open_id
+                        if mention_name:
+                            mention_name_map[user_id] = mention_name
+                        content = content.replace(placeholder, f"@{user_id}")
+
+            # 8.5 群聊场景：处理用户姓名
+            user_name = ""
+            if chat_type == "group":
+                user_name = mention_name_map.get(sender_id, "")
+                if not user_name:
+                    user_name = await self._get_user_name(sender_id, chat_id=chat_id) or ""
+                if user_name:
+                    content = f"[{user_name}]: {content}"
+
+                for user_id, name in mention_name_map.items():
+                    if name and f"@{user_id}" in content:
+                        content = content.replace(f"@{user_id}", f"@{name}")
+                content = re.sub(r"\s{2,}", " ", content).strip()
 
             # 9. 构建会话ID（处理话题群）
             reply_to = chat_id if chat_type == "group" else sender_id
             final_chat_id = chat_id
+            chat_mode = None
 
             if chat_type == "group":
                 chat_mode = await self._get_chat_mode(chat_id)
@@ -831,10 +1067,18 @@ class FeishuChannel(BaseChannel):
                         message.root_id = message.message_id
                     final_chat_id = f"{reply_to}#{message.root_id}"
 
+            topic_title = ""
+            if chat_mode == "thread" and message.root_id == message_id and msg_type == "post":
+                try:
+                    topic_title = json.loads(message.content).get("title", "")
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
             # 10. 转发到消息总线
             logger.info(f"Received message from Feishu: {content}")
             await self._handle_message(
                 sender_id=sender_id,
+                sender_name=user_name,
                 chat_id=final_chat_id,
                 content=content,
                 media=media if media else None,
@@ -845,6 +1089,8 @@ class FeishuChannel(BaseChannel):
                     "reply_to": reply_to,
                     "msg_type": msg_type,
                     "root_id": message.root_id,
+                    "chat_mode": chat_mode,
+                    "topic_title": topic_title if isinstance(topic_title, str) else "",
                     "sender_id": sender_id,
                 },
             )
@@ -852,41 +1098,88 @@ class FeishuChannel(BaseChannel):
         except Exception:
             logger.exception("Error processing Feishu message")
 
-    async def _extract_and_upload_images(self, content: str) -> tuple[str, list[dict]]:
-        """Extract images from markdown content, upload to Feishu, and return cleaned content."""
-        images = []
-        cleaned_content = content
+    async def _download_viking_image(self, uri: str, msg: OutboundMessage | None) -> bytes:
+        """Read an image with the same sender scope used by OpenViking tools."""
+        from openviking.utils.media_limits import MAX_INLINE_TOOL_RESULT_MEDIA_BYTES
+        from vikingbot.openviking_mount.ov_server import VikingClient
 
-        # Pattern 1: ![alt](send://...)
-        markdown_pattern = r"!\[([^\]]*)\]\((send://[^)\s]+\.(png|jpeg|jpg|gif|bmp|webp))\)"
-        for m in re.finditer(markdown_pattern, content):
-            img_url = m.group(2)
-            try:
-                is_content, result = await self._parse_data_uri(img_url)
+        sender_id = msg.metadata.get("sender_id") if msg else None
+        if not isinstance(sender_id, str) or not sender_id.strip():
+            raise ValueError("OpenViking image delivery requires the original sender identity")
 
-                if not is_content and isinstance(result, bytes):
+        config = self._bot_config or load_config()
+        client = await VikingClient.create(
+            workspace_name(msg.session_key, config.sandbox.mode, portable=False),
+            actor_peer_id=sender_id,
+            config=config,
+        )
+        try:
+            stat = await client.stat(uri)
+            size = stat.get("size")
+            if (
+                isinstance(size, bool)
+                or not isinstance(size, int)
+                or not 0 < size <= MAX_INLINE_TOOL_RESULT_MEDIA_BYTES
+            ):
+                raise ValueError(
+                    "OpenViking image size is unavailable or exceeds the delivery limit"
+                )
+            data = await client.download_bytes(uri)
+            if len(data) > size or sniff_image_format(data) is None:
+                raise ValueError("OpenViking image changed size or has an unsupported format")
+            return data
+        finally:
+            await client.close()
+
+    async def _extract_and_upload_images(
+        self, content: str, msg: OutboundMessage | None = None
+    ) -> tuple[str, list[dict]]:
+        """Upload explicit images, preserving URI citations and Markdown examples."""
+        # Viking URIs also appear in listings and citations: only image Markdown
+        # requests delivery. Keep bare send:// support for the image generation tool.
+        # Consume code spans/blocks first so syntax examples never send an image.
+        path = r"(?:[^\s()<>]|\([^()\n]*\))"
+        uri = rf"send://{path}+?\.(?:png|jpe?g|gif|bmp|webp)(?:[?#][^\s<>)]*)?"
+        image_uri = rf"(?:<(?:send|viking)://[^<>\n]+>|(?:send|viking)://{path}+?)"
+        pattern = re.compile(
+            r"(?P<literal>^[ \t]{0,3}(?P<fence>`{3,}|~{3,})[^\n]*(?:\n|$)"
+            r"[\s\S]*?(?:^[ \t]{0,3}(?P=fence)[`~]*[ \t]*(?:\n|$)|\Z)"
+            r"|(?P<ticks>`+)(?!`)[\s\S]*?(?<!`)(?P=ticks)(?!`)"
+            r"|\\.)"
+            rf"|!\[[^\]]*\]\(\s*(?P<image>{image_uri})"
+            r"(?:\s+[\"'][^\n]*?[\"'])?\s*\)"
+            rf"|(?P<bare>{uri})(?=$|[\s<>`\[\](){{}},;.!?。，；！：])",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        images: list[dict] = []
+        replacements: dict[str, str] = {}
+        parts: list[str] = []
+        last_end = 0
+        for match in pattern.finditer(content):
+            if match.group("literal") is not None:
+                continue
+            img_url = match.group("image") or match.group("bare")
+            img_url = img_url.removeprefix("<").removesuffix(">")
+            scheme, location = img_url.split("://", 1)
+            img_url = f"{scheme.lower()}://{location}"
+            if img_url not in replacements:
+                try:
+                    if img_url.lower().startswith("viking://"):
+                        result = await asyncio.wait_for(
+                            self._download_viking_image(img_url, msg), timeout=60.0
+                        )
+                    else:
+                        is_content, result = await self._parse_data_uri(img_url)
+                        if is_content or not isinstance(result, bytes):
+                            raise ValueError("Image reference did not resolve to image bytes")
                     image_key = await self._upload_image_to_feishu(result)
                     images.append({"image_key": image_key})
-            except Exception as e:
-                logger.exception(f"Failed to upload Markdown image {img_url[:100]}: {e}")
-
-        # Remove markdown image syntax
-        cleaned_content = re.sub(markdown_pattern, "", cleaned_content)
-
-        # Pattern 2: send://... (without alt text)
-        send_pattern = r"(send://[^)\s]+\.(png|jpeg|jpg|gif|bmp|webp))\)?"
-        for m in re.finditer(send_pattern, content):
-            img_url = m.group(1) or ""
-            try:
-                is_content, result = await self._parse_data_uri(img_url)
-
-                if not is_content and isinstance(result, bytes):
-                    image_key = await self._upload_image_to_feishu(result)
-                    images.append({"image_key": image_key})
-            except Exception as e:
-                logger.exception(f"Failed to upload Markdown image {img_url[:100]}: {e}")
-
-        # Remove standalone send:// URLs
-        cleaned_content = re.sub(send_pattern, "", cleaned_content)
-
-        return cleaned_content.strip(), images
+                    replacements[img_url] = ""
+                except Exception as exc:
+                    logger.warning(f"Failed to send image {img_url[:100]}: {exc}")
+                    replacements[img_url] = "[图片发送失败]"
+            parts.append(content[last_end : match.start()])
+            parts.append(replacements[img_url])
+            last_end = match.end()
+        parts.append(content[last_end:])
+        return "".join(parts).strip(), images

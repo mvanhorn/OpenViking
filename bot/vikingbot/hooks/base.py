@@ -1,16 +1,9 @@
 from abc import ABC, abstractmethod
-from enum import Enum
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
 from datetime import datetime
+from typing import Any, Dict, Optional
 
 from vikingbot.config.schema import SessionKey
-
-
-# class HookType(Enum):
-#     SYNC = "sync"
-#     ASYNC = "async"
-#     BLOCKING = "blocking"
 
 
 @dataclass
@@ -22,6 +15,8 @@ class HookContext:
     session_key: SessionKey = None
     metadata: Dict[str, Any] = None
     timestamp: datetime = None
+    config: Any = None
+    openviking_connection: Dict[str, Any] | None = None
 
     def __post_init__(self):
         if self.metadata is None:

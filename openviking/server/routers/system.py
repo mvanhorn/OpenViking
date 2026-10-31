@@ -2,22 +2,47 @@
 # SPDX-License-Identifier: AGPL-3.0
 """System endpoints for OpenViking HTTP Server."""
 
-from typing import Optional
-
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Body, Depends, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from openviking.server.auth import get_request_context, resolve_identity
+from openviking.core.path_variables import resolve_path_variables
+from openviking.core.uri_validation import validate_request_viking_uri
+from openviking.server.auth import get_request_context
 from openviking.server.dependencies import get_service
-from openviking.server.identity import RequestContext
+from openviking.server.identity import AuthMode, RequestContext
 from openviking.server.models import Response
 from openviking.storage.viking_fs import get_viking_fs
+from openviking_cli.exceptions import UnauthenticatedError
 from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
 
 router = APIRouter()
+
+
+def _is_ready_check_ok(value) -> bool:
+    """Return whether one readiness check value represents a healthy state."""
+    if isinstance(value, dict):
+        status = value.get("status")
+        if status not in ("ok", "not_configured", "not_supported"):
+            return False
+        nested = value.get("checks")
+        if nested is None:
+            return True
+        return all(_is_ready_check_ok(item) for item in nested.values())
+    return value in ("ok", "not_configured", "not_supported")
+
+
+async def _probe_agfs_readiness() -> dict[str, object]:
+    """Return structured AGFS filesystem readiness."""
+    viking_fs = get_viking_fs()
+    checks: dict[str, object] = {}
+
+    await viking_fs.ls("viking://", ctx=None)
+    checks["filesystem"] = "ok"
+
+    return {"status": "ok", "checks": checks}
 
 
 @router.get("/health", tags=["system"])
@@ -27,35 +52,43 @@ async def health_check(request: Request):
 
     result = {"status": "ok", "healthy": True, "version": __version__}
 
-    # Try to get user identity if auth headers are present
     try:
-        # Extract headers manually
+        config = getattr(request.app.state, "config", None)
+        effective_auth_mode = AuthMode.API_KEY.value
+        if config is not None and hasattr(config, "get_effective_auth_mode"):
+            effective_auth_mode = config.get_effective_auth_mode()
+        result["auth_mode"] = effective_auth_mode
+        if effective_auth_mode == AuthMode.TRUSTED.value:
+            result["root_api_key_required"] = True
+
         x_api_key = request.headers.get("X-API-Key")
         authorization = request.headers.get("Authorization")
-        x_openviking_user = request.headers.get("X-OpenViking-User")
+        account = request.headers.get("X-OpenViking-Account")
+        user = request.headers.get("X-OpenViking-User")
+        trusted_identity = effective_auth_mode == AuthMode.TRUSTED.value and account and user
 
-        # Check if we have auth or in dev mode
-        api_key_manager = getattr(request.app.state, "api_key_manager", None)
-        if api_key_manager is None:
-            # Dev mode - use default user
-            result["user_id"] = x_openviking_user or "default"
-        elif x_api_key or authorization:
-            # Try to resolve identity
+        if x_api_key or authorization or trusted_identity:
             try:
+                from openviking.server.auth import resolve_identity
+
                 identity = await resolve_identity(
                     request,
                     x_api_key=x_api_key,
                     authorization=authorization,
-                    x_openviking_account=request.headers.get("X-OpenViking-Account"),
-                    x_openviking_user=x_openviking_user,
-                    x_openviking_agent=request.headers.get("X-OpenViking-Agent"),
+                    x_openviking_account=account,
+                    x_openviking_user=user,
                 )
-                if identity and identity.user_id:
-                    result["user_id"] = identity.user_id
-            except Exception:
-                pass
-    except Exception:
-        pass
+                result["account_id"] = str(identity.account_id)
+                result["user_id"] = str(identity.user_id)
+                result["role"] = str(identity.role)
+            except UnauthenticatedError:
+                raise
+            except Exception as e:
+                logger.warning(f"Failed to resolve identity: {e}")
+    except UnauthenticatedError:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get health check: {e}")
 
     return result
 
@@ -67,15 +100,28 @@ async def readiness_check(request: Request):
     Returns 200 when all subsystems are operational, 503 otherwise.
     No authentication required (designed for K8s probes).
     """
+    # If service is still initializing, return 503 immediately
+    try:
+        service = get_service()
+        if not service._initialized:
+            return JSONResponse(
+                status_code=503,
+                content={"status": "not_ready", "reason": "initializing"},
+            )
+    except RuntimeError:
+        # get_service() raises RuntimeError when service not yet set
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "reason": "initializing"},
+        )
+
     checks = {}
 
-    # 1. AGFS: try to list root
+    # 1. AGFS: probe filesystem access
     try:
-        viking_fs = get_viking_fs()
-        await viking_fs.ls("viking://", ctx=None)
-        checks["agfs"] = "ok"
+        checks["agfs"] = await _probe_agfs_readiness()
     except Exception as e:
-        checks["agfs"] = f"error: {e}"
+        checks["agfs"] = {"status": "error", "checks": {"filesystem": f"error: {e}"}}
 
     # 2. VectorDB: health_check()
     try:
@@ -99,7 +145,33 @@ async def readiness_check(request: Request):
     except Exception as e:
         checks["api_key_manager"] = f"error: {e}"
 
-    all_ok = all(v in ("ok", "not_configured") for v in checks.values())
+    # 4. Embedding: the provider is initialized by the service startup path.
+    # There is no Account context on an unauthenticated readiness probe, so do
+    # not create or probe a Cluster-scoped embedder here.
+    try:
+        embedding_provider = getattr(service, "embedding_provider", None)
+        checks["embedding"] = "ok" if embedding_provider is not None else "not_initialized"
+    except Exception as e:
+        checks["embedding"] = f"error: {e}"
+
+    # 5. Ollama: connectivity check if configured
+    try:
+        from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
+        from openviking_cli.utils.ollama import check_ollama_running, detect_ollama_in_config
+
+        ov_config = OpenVikingConfigSingleton.get_instance()
+        uses_ollama, ollama_host, ollama_port = detect_ollama_in_config(ov_config)
+        if uses_ollama:
+            if check_ollama_running(ollama_host, ollama_port):
+                checks["ollama"] = "ok"
+            else:
+                checks["ollama"] = f"unreachable at {ollama_host}:{ollama_port}"
+        else:
+            checks["ollama"] = "not_configured"
+    except Exception as e:
+        checks["ollama"] = f"error: {e}"
+
+    all_ok = all(_is_ready_check_ok(v) for v in checks.values())
     status_code = 200 if all_ok else 503
     return JSONResponse(
         status_code=status_code,
@@ -128,17 +200,42 @@ async def system_status(
 
 
 class WaitRequest(BaseModel):
-    """Request model for wait."""
+    """Legacy wait parameters, retained for request compatibility."""
 
-    timeout: Optional[float] = None
+    timeout: float | None = Field(
+        default=None,
+        deprecated=True,
+        description="Deprecated compatibility parameter; accepted and ignored.",
+    )
+
+
+class ConsistencyRequest(BaseModel):
+    """Request model for filesystem/vector-index consistency checks."""
+
+    uri: str
 
 
 @router.post("/api/v1/system/wait", tags=["system"])
 async def wait_processed(
-    request: WaitRequest,
+    request: WaitRequest | None = Body(None),
     _ctx: RequestContext = Depends(get_request_context),
 ):
     """Wait for all processing to complete."""
     service = get_service()
-    result = await service.resources.wait_processed(timeout=request.timeout)
+    result = await service.resources.wait_processed()
+    return Response(status="ok", result=result)
+
+
+@router.post("/api/v1/system/consistency", tags=["system"])
+async def check_consistency(
+    request: ConsistencyRequest,
+    ctx: RequestContext = Depends(get_request_context),
+):
+    """Check filesystem/vector-index consistency for a URI subtree."""
+    service = get_service()
+    uri = validate_request_viking_uri(resolve_path_variables(request.uri), ctx)
+    result = await service.check_consistency(
+        uri=uri,
+        ctx=ctx,
+    )
     return Response(status="ok", result=result)
