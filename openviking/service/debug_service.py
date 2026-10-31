@@ -513,11 +513,13 @@ class ObserverService:
         get_status_table_async directly instead of double-wrapping in
         run_async."""
         observer = UsageObserver(self._vikingdb)
+        # Read the status first: has_errors() reports on the query it runs.
+        status = await observer.get_status_table_async(ctx=ctx)
         return ComponentStatus(
             name="usage",
             is_healthy=observer.is_healthy(),
             has_errors=observer.has_errors(),
-            status=await observer.get_status_table_async(ctx=ctx),
+            status=status,
         )
 
     def get_retrieval_status(self, *, format: str = "table") -> ComponentStatus:
